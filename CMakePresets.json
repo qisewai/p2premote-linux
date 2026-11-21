@@ -1,0 +1,43 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/windows-x64"
+    },
+    {
+      "name": "windows-x64-webrtc",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/windows-x64-webrtc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded",
+        "CMAKE_TRY_COMPILE_CONFIGURATION": "Release",
+        "P2PREMOTE_BUILD_WEBRTC_PROBE": "ON",
+        "P2PREMOTE_BUILD_STREAMING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64-release",
+      "configurePreset": "windows-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-x64-webrtc-release",
+      "configurePreset": "windows-x64-webrtc",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-x64-webrtc-release",
+      "configurePreset": "windows-x64-webrtc",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
