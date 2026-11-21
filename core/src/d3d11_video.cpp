@@ -1,9 +1,46 @@
 #include "d3d11_video.h"
+#include "qpc.h"
 
 #include "api/video/i420_buffer.h"
 #include "libyuv/convert.h"
 
+#include <d3dcompiler.h>
+#include <utility>
+
 namespace p2premote {
+namespace {
+
+constexpr char compare_shader[] = R"(
+Texture2D<float4> current : register(t0);
+Texture2D<float4> previous : register(t1);
+RWBuffer<uint> result : register(u0);
+groupshared uint tile_changed;
+
+[numthreads(16, 16, 1)]
+void main(uint3 thread : SV_DispatchThreadID, uint index : SV_GroupIndex) {
+    if (index == 0) tile_changed = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint width, height;
+    current.GetDimensions(width, height);
+    uint2 pixel = thread.xy * 2;
+    bool changed = false;
+    [unroll]
+    for (uint y = 0; y < 2; ++y) {
+        [unroll]
+        for (uint x = 0; x < 2; ++x) {
+            uint2 p = pixel + uint2(x, y);
+            if (p.x < width && p.y < height) {
+                changed = changed || any(current.Load(int3(p, 0)).rgb != previous.Load(int3(p, 0)).rgb);
+            }
+        }
+    }
+    if (changed) InterlockedOr(tile_changed, 1);
+    GroupMemoryBarrierWithGroupSync();
+    if (index == 0 && tile_changed != 0) InterlockedAdd(result[0], 1);
+}
+)";
+
+} // namespace
 
 Nv12Frame::Nv12Frame(winrt::com_ptr<ID3D11Texture2D> texture, UINT subresource, int width, int height,
     winrt::com_ptr<IUnknown> lease)
@@ -112,6 +149,81 @@ void D3d11VideoConverter::Blit(ID3D11Texture2D* source, UINT subresource, UINT s
     stream.Enable = TRUE;
     stream.pInputSurface = input.get();
     winrt::check_hresult(video_context_->VideoProcessorBlt(processor_.get(), output.get(), 0, 1, &stream));
+}
+
+D3d11FrameDifference::D3d11FrameDifference(ID3D11Device* device) {
+    device_.copy_from(device);
+    device->GetImmediateContext(context_.put());
+    winrt::com_ptr<ID3DBlob> bytecode;
+    winrt::check_hresult(D3DCompile(compare_shader, sizeof(compare_shader) - 1, nullptr, nullptr, nullptr,
+        "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, bytecode.put(), nullptr));
+    winrt::check_hresult(device_->CreateComputeShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
+        nullptr, shader_.put()));
+
+    const D3D11_BUFFER_DESC output{sizeof(UINT), D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0};
+    winrt::check_hresult(device_->CreateBuffer(&output, nullptr, result_.put()));
+    D3D11_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_R32_UINT;
+    view.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    view.Buffer.NumElements = 1;
+    winrt::check_hresult(device_->CreateUnorderedAccessView(result_.get(), &view, result_view_.put()));
+    const D3D11_BUFFER_DESC staging{sizeof(UINT), D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+    winrt::check_hresult(device_->CreateBuffer(&staging, nullptr, readback_.put()));
+}
+
+void D3d11FrameDifference::Resize(UINT width, UINT height) {
+    const D3D11_TEXTURE2D_DESC desc{width, height, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+        D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    for (auto* slot : {&current_, &previous_}) {
+        *slot = {};
+        winrt::check_hresult(device_->CreateTexture2D(&desc, nullptr, slot->texture.put()));
+        winrt::check_hresult(device_->CreateShaderResourceView(slot->texture.get(), nullptr, slot->view.put()));
+    }
+    width_ = width;
+    height_ = height;
+    has_previous_ = false;
+}
+
+UINT D3d11FrameDifference::TileCount(UINT width, UINT height) noexcept {
+    return ((width + 31) / 32) * ((height + 31) / 32);
+}
+
+std::optional<UINT> D3d11FrameDifference::ChangedTiles(ID3D11Texture2D* source, UINT width, UINT height) {
+    const auto deadline = QpcNow() + QpcFrequency() * 2 / 1000;
+    if (width_ != width || height_ != height) Resize(width, height);
+    const D3D11_BOX content{0, 0, 0, width, height, 1};
+    context_->CopySubresourceRegion(current_.texture.get(), 0, 0, 0, 0, source, 0, &content);
+    std::swap(current_, previous_);
+    if (!std::exchange(has_previous_, true)) return TileCount(width, height);
+
+    const UINT zero[4]{};
+    context_->ClearUnorderedAccessViewUint(result_view_.get(), zero);
+    ID3D11ShaderResourceView* inputs[]{previous_.view.get(), current_.view.get()};
+    ID3D11UnorderedAccessView* output = result_view_.get();
+    context_->CSSetShader(shader_.get(), nullptr, 0);
+    context_->CSSetShaderResources(0, 2, inputs);
+    context_->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+    context_->Dispatch((width + 31) / 32, (height + 31) / 32, 1);
+    ID3D11ShaderResourceView* no_inputs[2]{};
+    output = nullptr;
+    context_->CSSetShaderResources(0, 2, no_inputs);
+    context_->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+    context_->CSSetShader(nullptr, nullptr, 0);
+    context_->CopyResource(readback_.get(), result_.get());
+    context_->Flush();
+
+    // Send the current frame if a busy GPU cannot answer in time.
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    auto status = context_->Map(readback_.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    while (status == DXGI_ERROR_WAS_STILL_DRAWING && QpcNow() < deadline) {
+        YieldProcessor();
+        status = context_->Map(readback_.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    }
+    if (status == DXGI_ERROR_WAS_STILL_DRAWING) return std::nullopt;
+    winrt::check_hresult(status);
+    const auto changed = *static_cast<const UINT*>(mapped.pData);
+    context_->Unmap(readback_.get(), 0);
+    return changed;
 }
 
 } // namespace p2premote

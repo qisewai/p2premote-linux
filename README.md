@@ -144,6 +144,10 @@ Viewer 状态栏显示「直写上屏」时，GPU 在一次视频处理操作里
 
 Host 可以用 `--capture-dxgi` 对照 DXGI Desktop Duplication。局域网 Viewer 启用本地光标后，Host 状态栏显示实际使用的采集方式。画面同步光标使用 WGC。DXGI 无法采集所选屏幕或无法分离光标时回退 WGC。[CrossDesk 的 Windows 采集策略](https://github.com/kunkundi/crossdesk/blob/ff369cd023b7b0481ee94a54570fb9793bb24079/apps/desktop/src/platform/windows/screen_capturer/capture_backend_policy.h)
 
+局域网直连会根据采集画面的变化发送视频。Host 在 GPU 上比较相邻采集帧，变化后的首帧立即进入编码，大幅变化后最多再提交 6 张重复帧以细化画质。画面静止时约每秒刷新一次，Viewer 会保留最近一帧。Host 的 `--fixed-cadence` 可恢复原先的提交策略和 H.264 GOP 配置，用于对照。
+
+使用 `--latency-trace` 时，`h264_gop` 记录驱动接受的 GOP 帧数，`h264_encoded` 的位 0 表示实际 IDR、位 1 表示 WebRTC 请求了关键帧。Viewer 的 `h264_decode_input` 与 `frame_present_submitted` 使用同一个 RTP 时间戳，可对齐关键帧和呈现时间。进行静止画质对照时，让全屏静态图覆盖被控端的状态栏、系统时钟和其他会更新的界面。
+
 排查实时性时，给两端加 `--latency-trace <目录>`，或使用测试包的 Diagnostics 启动脚本。正常断开后，CSV 记录本机单调时钟上的输入序号、视频 RTP 序号及大小、带宽估计、编码目标码率、解码和提交呈现事件。两端的输入序号和 RTP 标识可用于匹配，跨机时间仍需先对齐。日志到达容量上限后会统计省略事件数。
 
 编译工作区中的 `codec_probe.exe` 可以单机验证 H.264 编解码、GPU 纹理和 720p 至 1080p 的尺寸切换。探针报告的是媒体转换耗时。键鼠到画面回显的延迟需要用串流连接测试。

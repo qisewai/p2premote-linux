@@ -15,6 +15,8 @@
 #include <iostream>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
+#include <thread>
 
 namespace {
 
@@ -65,9 +67,41 @@ void CheckPixels(ID3D11Device* device, ID3D11Texture2D* texture) {
         && ((right >> 16) & 255) < 65, "GPU conversion or codec changed RGB bars");
 }
 
+void CheckFrameDifference(ID3D11Device* device, ID3D11Texture2D* source, UINT width, UINT height) {
+    p2premote::D3d11FrameDifference comparison(device);
+    Check(comparison.ChangedTiles(source, width, height).value_or(0) > 0, "First desktop frame must be sent");
+    unsigned duplicate_count = 0;
+    double elapsed_ms = 0;
+    for (int i = 0; i < 60; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        if (comparison.ChangedTiles(source, width, height).value_or(1) == 0) ++duplicate_count;
+        elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
+    }
+    std::cout << "Static frames detected " << duplicate_count << "/60, "
+        << elapsed_ms / 60 << " ms per comparison\n";
+    Check(duplicate_count >= 54, "GPU comparison failed to recognize most identical frames");
+
+    winrt::com_ptr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(context.put());
+    const D3D11_BOX corner{width - 1, height - 1, 0, width, height, 1};
+    for (unsigned i = 0; i < 10; ++i) {
+        const uint32_t pixel = i % 2 ? 0xff000000 : 0xffffffff;
+        context->UpdateSubresource(source, 0, &corner, &pixel, sizeof(pixel), 0);
+        if (const auto tiles = comparison.ChangedTiles(source, width, height)) {
+            Check(*tiles == 1, "A single changed edge pixel must be sent");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    throw std::runtime_error("GPU comparison did not finish for a changed edge pixel");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool cadence_probe = argc == 2 && std::string_view(argv[1]) == "--cadence";
+    const bool fixed_probe = argc == 2 && std::string_view(argv[1]) == "--fixed-cadence";
     static ErrorLog log;
     webrtc::LogMessage::AddLogToStream(&log, webrtc::LS_ERROR);
     try {
@@ -75,7 +109,7 @@ int main() {
         webrtc::LogMessage::LogToDebug(webrtc::LS_ERROR);
         auto device = p2premote::CreateD3d11Device(true);
         auto active = std::make_shared<std::atomic_bool>(false);
-        auto encode_factory = p2premote::CreateVideoEncoderFactory(device.get(), active);
+        auto encode_factory = p2premote::CreateVideoEncoderFactory(device.get(), active, cadence_probe);
         auto decode_factory = p2premote::CreateVideoDecoderFactory(device.get());
         const auto encode_formats = encode_factory->GetSupportedFormats();
         const auto decode_formats = decode_factory->GetSupportedFormats();
@@ -112,21 +146,32 @@ int main() {
         D3D11_SUBRESOURCE_DATA initial{pixels.data(), source_width * 4, 0};
         winrt::com_ptr<ID3D11Texture2D> source;
         winrt::check_hresult(device->CreateTexture2D(&desc, &initial, source.put()));
+        if (cadence_probe) CheckFrameDifference(device.get(), source.get(), source_width, source_height);
         p2premote::D3d11VideoConverter to_nv12(device.get());
         p2premote::D3d11VideoConverter to_bgra(device.get());
         int sequence = 0;
         for (const auto& [width, height] : {std::pair{1280, 720}, std::pair{1920, 1080}}) {
             const auto start = std::chrono::steady_clock::now();
+            const int frame_count = (cadence_probe || fixed_probe) && width == 1920 ? 300 : 24;
             int rendered = 0;
-            for (int i = 0; i < 24; ++i) {
+            int keyframes = 0;
+            for (int i = 0; i < frame_count; ++i) {
                 auto nv12 = to_nv12.Convert(source.get(), 0, source_width, source_height, width, height, DXGI_FORMAT_NV12);
                 auto video = webrtc::VideoFrame::Builder()
                     .set_video_frame_buffer(webrtc::make_ref_counted<p2premote::Nv12Frame>(std::move(nv12), 0, width, height))
                     .set_timestamp_us(static_cast<int64_t>(++sequence) * 16'667)
                     .set_timestamp_rtp(static_cast<uint32_t>(sequence) * 1500).build();
-                const std::vector types{i == 0 ? webrtc::VideoFrameType::kVideoFrameKey : webrtc::VideoFrameType::kVideoFrameDelta};
+                const auto requested = i == 0 || ((cadence_probe || fixed_probe) && i == frame_count - 1);
+                const std::vector types{requested ? webrtc::VideoFrameType::kVideoFrameKey : webrtc::VideoFrameType::kVideoFrameDelta};
                 encoded.data.reset();
                 Check(encoder->Encode(video, &types) == WEBRTC_VIDEO_CODEC_OK && encoded.data.has_value(), "Hardware encode failed");
+                const bool key = encoded.data->FrameType() == webrtc::VideoFrameType::kVideoFrameKey;
+                if (key) ++keyframes;
+                if (key && (cadence_probe || fixed_probe)) {
+                    std::cout << width << "x" << height << " IDR frame " << i + 1
+                        << (requested ? " requested" : " periodic") << ", " << encoded.data->size() << " bytes\n";
+                }
+                if (cadence_probe) Check(key == requested, "H.264 emitted an unexpected IDR or missed a requested IDR");
                 decoded.data = nullptr;
                 Check(decoder->Decode(*encoded.data, 0) >= 0, "DXVA decode failed");
                 if (!decoded.data) continue;
@@ -138,10 +183,10 @@ int main() {
                 if (!rendered) CheckPixels(device.get(), bgra.get());
                 ++rendered;
             }
-            Check(rendered >= 23, "Decoder delayed more than one frame");
+            Check(rendered >= frame_count - 1, "Decoder delayed more than one frame");
             const std::chrono::duration<double, std::milli> time = std::chrono::steady_clock::now() - start;
-            std::cout << width << "x" << height << " " << rendered << "/24 GPU frames, "
-                << time.count() / 24 << " ms/frame (transform submission and one sample readback)" << '\n';
+            std::cout << width << "x" << height << " " << rendered << "/" << frame_count << " GPU frames, "
+                << keyframes << " IDRs, " << time.count() / frame_count << " ms/frame\n";
         }
         Check(decoder->GetDecoderInfo().is_hardware_accelerated, "Hardware decode inactive");
         encoder->Release();

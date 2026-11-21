@@ -306,8 +306,10 @@ RtcCall::RtcCall(bool host, std::shared_ptr<StreamEvents> events, const Connecti
     }
     dependencies.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
     dependencies.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-    dependencies.video_encoder_factory = CreateVideoEncoderFactory(host ? video_device : nullptr, hardware_encoder_);
-    dependencies.video_decoder_factory = CreateVideoDecoderFactory(host ? nullptr : video_device);
+    const bool dynamic_cadence = options.mode == ConnectionMode::lan_direct && !options.fixed_cadence;
+    dependencies.video_encoder_factory = CreateVideoEncoderFactory(host ? video_device : nullptr, hardware_encoder_,
+        dynamic_cadence, events_->Trace());
+    dependencies.video_decoder_factory = CreateVideoDecoderFactory(host ? nullptr : video_device, events_->Trace());
     webrtc::EnableMedia(dependencies);
     factory_ = webrtc::CreateModularPeerConnectionFactory(std::move(dependencies));
     if (!factory_) {

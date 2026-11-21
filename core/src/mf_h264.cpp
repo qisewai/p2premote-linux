@@ -1,6 +1,7 @@
 #include "mf_h264.h"
 
 #include "d3d11_video.h"
+#include "latency_trace.h"
 #include "webrtc_vp8.h"
 
 #include "api/make_ref_counted.h"
@@ -14,6 +15,8 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
+
+#include <limits>
 
 #include <codecapi.h>
 #include <dxgi.h>
@@ -217,7 +220,9 @@ winrt::com_ptr<ID3D11Texture2D> UploadNv12(ID3D11Device* device, const webrtc::I
 
 class MfEncoder final : public webrtc::VideoEncoder {
 public:
-    MfEncoder(ID3D11Device* device, std::shared_ptr<std::atomic_bool> active) : active_(std::move(active)) {
+    MfEncoder(ID3D11Device* device, std::shared_ptr<std::atomic_bool> active, bool dynamic_cadence,
+        std::shared_ptr<LatencyTrace> trace)
+        : active_(std::move(active)), trace_(std::move(trace)), dynamic_cadence_(dynamic_cadence) {
         device_.copy_from(device);
     }
     ~MfEncoder() override { Release(); }
@@ -258,8 +263,11 @@ public:
         try {
             if (frame.width() != width_ || frame.height() != height_) Open(frame.width(), frame.height());
             const auto started = webrtc::TimeMillis();
-            if (types && std::find(types->begin(), types->end(), webrtc::VideoFrameType::kVideoFrameKey) != types->end()) {
-                SetNumber(api_.get(), CODECAPI_AVEncVideoForceKeyFrame, 1);
+            const bool requested = types && std::find(types->begin(), types->end(),
+                webrtc::VideoFrameType::kVideoFrameKey) != types->end();
+            if (requested && !SetNumber(api_.get(), CODECAPI_AVEncVideoForceKeyFrame, 1) && dynamic_cadence_) {
+                // A new stream starts with an IDR if the driver cannot force one in place.
+                Open(frame.width(), frame.height());
             }
             const auto buffer = frame.video_frame_buffer();
             winrt::com_ptr<ID3D11Texture2D> uploaded;
@@ -320,6 +328,8 @@ public:
             metadata.codecSpecific.H264.packetization_mode = webrtc::H264PacketizationMode::NonInterleaved;
             metadata.codecSpecific.H264.temporal_idx = webrtc::kNoTemporalIdx;
             metadata.codecSpecific.H264.idr_frame = idr;
+            if (trace_) trace_->Record("h264_encoded", frame.rtp_timestamp(), 0, length,
+                (idr ? 1u : 0u) | (requested ? 2u : 0u));
             callback_->OnEncodedImage(encoded, &metadata);
             return WEBRTC_VIDEO_CODEC_OK;
         } catch (const winrt::hresult_error& error) {
@@ -372,7 +382,18 @@ private:
         }
         SetNumber(api_.get(), CODECAPI_AVEncCommonBufferSize, bitrate_ / (8 * fps_));
         SetNumber(api_.get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-        SetNumber(api_.get(), CODECAPI_AVEncMPVGOPSize, fps_ * 4);
+        // Keep receiver-requested IDRs, even when the driver accepts a very long GOP.
+        ULONG gop = 0;
+        if (dynamic_cadence_) {
+            for (const ULONG size : {std::numeric_limits<ULONG>::max(), static_cast<ULONG>(fps_ * 30)}) {
+                if (SetNumber(api_.get(), CODECAPI_AVEncMPVGOPSize, size)) {
+                    gop = size;
+                    break;
+                }
+            }
+        }
+        if (!gop && SetNumber(api_.get(), CODECAPI_AVEncMPVGOPSize, fps_ * 4)) gop = fps_ * 4;
+        if (trace_) trace_->Record("h264_gop", gop, fps_);
         auto h264 = MediaType(MFVideoFormat_H264, width, height, fps_);
         winrt::check_hresult(h264->SetUINT32(MF_MT_AVG_BITRATE, bitrate_));
         winrt::check_hresult(h264->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base));
@@ -399,6 +420,8 @@ private:
 
     winrt::com_ptr<ID3D11Device> device_;
     std::shared_ptr<std::atomic_bool> active_;
+    std::shared_ptr<LatencyTrace> trace_;
+    bool dynamic_cadence_{};
     std::unique_ptr<Transform> transform_;
     winrt::com_ptr<IMFMediaEventGenerator> generator_;
     winrt::com_ptr<ICodecAPI> api_;
@@ -414,7 +437,9 @@ private:
 
 class MfDecoder final : public webrtc::VideoDecoder {
 public:
-    explicit MfDecoder(ID3D11Device* device) { device_.copy_from(device); }
+    MfDecoder(ID3D11Device* device, std::shared_ptr<LatencyTrace> trace) : trace_(std::move(trace)) {
+        device_.copy_from(device);
+    }
 
     bool Configure(const Settings&) override {
         Apartment apartment;
@@ -457,6 +482,8 @@ public:
     int32_t Decode(const webrtc::EncodedImage& encoded, int64_t render_time_ms) override {
         if (!transform_ || !callback_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
         if (!encoded.size() || encoded.size() > 8 * 1024 * 1024) return WEBRTC_VIDEO_CODEC_ERROR;
+        if (trace_) trace_->Record("h264_decode_input", encoded.RtpTimestamp(), 0, encoded.size(),
+            encoded.FrameType() == webrtc::VideoFrameType::kVideoFrameKey ? 1u : 0u);
         Apartment apartment;
         try {
             if (frames_.size() >= 16) winrt::throw_hresult(MF_E_INVALID_STREAM_DATA);
@@ -577,6 +604,7 @@ private:
 
     winrt::com_ptr<ID3D11Device> device_;
     std::unique_ptr<Transform> transform_;
+    std::shared_ptr<LatencyTrace> trace_;
     webrtc::DecodedImageCallback* callback_{};
     std::deque<FrameTime> frames_;
     LONGLONG next_sample_time_{};
@@ -586,52 +614,62 @@ private:
 
 class EncoderFactory final : public webrtc::VideoEncoderFactory {
 public:
-    EncoderFactory(ID3D11Device* device, std::shared_ptr<std::atomic_bool> active) : active_(std::move(active)) {
+    EncoderFactory(ID3D11Device* device, std::shared_ptr<std::atomic_bool> active, bool dynamic_cadence,
+        std::shared_ptr<LatencyTrace> trace)
+        : active_(std::move(active)), trace_(std::move(trace)), dynamic_cadence_(dynamic_cadence) {
         device_.copy_from(device);
     }
     std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
         return {H264Format(), webrtc::SdpVideoFormat("VP8")};
     }
     std::unique_ptr<webrtc::VideoEncoder> Create(const webrtc::Environment& env, const webrtc::SdpVideoFormat& format) override {
-        if (format.name == "H264") return std::make_unique<MfEncoder>(device_.get(), active_);
+        if (format.name == "H264") return std::make_unique<MfEncoder>(device_.get(), active_, dynamic_cadence_, trace_);
         return vp8_.Create(env, format);
     }
 private:
     winrt::com_ptr<ID3D11Device> device_;
     std::shared_ptr<std::atomic_bool> active_;
+    std::shared_ptr<LatencyTrace> trace_;
+    bool dynamic_cadence_{};
     Vp8EncoderFactory vp8_;
 };
 
 class DecoderFactory final : public webrtc::VideoDecoderFactory {
 public:
-    explicit DecoderFactory(ID3D11Device* device) { device_.copy_from(device); }
+    DecoderFactory(ID3D11Device* device, std::shared_ptr<LatencyTrace> trace) : trace_(std::move(trace)) {
+        device_.copy_from(device);
+    }
     std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
         return {H264Format(), webrtc::SdpVideoFormat("VP8")};
     }
     std::unique_ptr<webrtc::VideoDecoder> Create(const webrtc::Environment& env, const webrtc::SdpVideoFormat& format) override {
-        if (format.name == "H264") return std::make_unique<MfDecoder>(device_.get());
+        if (format.name == "H264") return std::make_unique<MfDecoder>(device_.get(), trace_);
         return vp8_.Create(env, format);
     }
 private:
     winrt::com_ptr<ID3D11Device> device_;
+    std::shared_ptr<LatencyTrace> trace_;
     Vp8DecoderFactory vp8_;
 };
 
 } // namespace
 
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateVideoEncoderFactory(ID3D11Device* device,
-    std::shared_ptr<std::atomic_bool> active) {
+    std::shared_ptr<std::atomic_bool> active, bool dynamic_cadence, std::shared_ptr<LatencyTrace> trace) {
     try {
         if (device && MediaFoundationAvailable() && EncoderActivation(device)) {
-            return std::make_unique<EncoderFactory>(device, std::move(active));
+            return std::make_unique<EncoderFactory>(device, std::move(active), dynamic_cadence, std::move(trace));
         }
     } catch (const winrt::hresult_error&) {
     }
     return std::make_unique<Vp8EncoderFactory>();
 }
 
-std::unique_ptr<webrtc::VideoDecoderFactory> CreateVideoDecoderFactory(ID3D11Device* device) {
-    if (device && MediaFoundationAvailable() && DecoderAvailable(device)) return std::make_unique<DecoderFactory>(device);
+std::unique_ptr<webrtc::VideoDecoderFactory> CreateVideoDecoderFactory(ID3D11Device* device,
+    std::shared_ptr<LatencyTrace> trace) {
+    if (device && MediaFoundationAvailable() && DecoderAvailable(device)) {
+        return std::make_unique<DecoderFactory>(device, std::move(trace));
+    }
     return std::make_unique<Vp8DecoderFactory>();
 }
 

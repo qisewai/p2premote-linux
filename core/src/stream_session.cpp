@@ -125,6 +125,14 @@ struct ActiveStream {
     winrt::com_ptr<ID3D11Device> device;
     std::unique_ptr<IVideoCapturer> capture;
     std::unique_ptr<CapturePixels> pixels;
+    std::unique_ptr<D3d11FrameDifference> frame_difference;
+    std::optional<webrtc::VideoFrame> last_video;
+    StreamQuality last_video_quality{};
+    std::int64_t last_submit_qpc{};
+    std::int64_t last_change_qpc{};
+    unsigned refinement_left{};
+    std::uint64_t idle_repeats{};
+    bool dynamic_cadence{};
     std::unique_ptr<D3d11VideoConverter> converter;
     bool gpu_conversion_failed{};
     bool gpu_backbuffer_failed{};
@@ -158,6 +166,42 @@ struct ActiveStream {
     std::uint32_t outgoing_input_sequence{};
     InputReceiveState input_state;
     std::vector<InputPacket> input;
+
+    void StartFrameComparison() {
+        if (!dynamic_cadence) return;
+        try {
+            frame_difference = std::make_unique<D3d11FrameDifference>(device.get());
+        } catch (const winrt::hresult_error& error) {
+            if (const auto& trace = events->Trace()) {
+                trace->Record("frame_comparison_unavailable", static_cast<std::uint32_t>(error.code().value));
+            }
+        }
+    }
+
+    bool ShouldSubmit(const CapturedFrame& frame) {
+        if (!frame_difference) return true;
+        const auto width = frame.metadata.width;
+        const auto height = frame.metadata.height;
+        std::optional<UINT> changed;
+        try {
+            changed = frame_difference->ChangedTiles(frame.texture.get(), width, height);
+        } catch (const winrt::hresult_error& error) {
+            frame_difference.reset();
+            if (const auto& trace = events->Trace()) {
+                trace->Record("frame_comparison_unavailable", static_cast<std::uint32_t>(error.code().value));
+            }
+        }
+        if (!last_video || last_video_quality != quality
+            || (changed && *changed * 20 >= D3d11FrameDifference::TileCount(width, height))) {
+            refinement_left = 6;
+            last_change_qpc = QpcNow();
+            return true;
+        }
+        if (!changed || *changed) return true;
+        if (!refinement_left || QpcNow() - last_change_qpc > QpcFrequency() / 4) return false;
+        --refinement_left;
+        return true;
+    }
 
     const wchar_t* SharingStatus() const {
         return dxgi_capture ? L"正在共享所选显示器 · DXGI 桌面复制" : L"正在共享所选显示器 · WGC";
@@ -266,6 +310,7 @@ void StreamSession::Start(HMONITOR monitor, HWND surface, const std::wstring& co
     auto active = std::make_unique<ActiveStream>(std::move(trace));
     active->monitor = monitor;
     active->surface = surface;
+    active->dynamic_cadence = impl_->host && connection.mode == ConnectionMode::lan_direct && !connection.fixed_cadence;
     const auto target_fps = static_cast<unsigned>(frame_rate);
     active->capture_interval = impl_->host && NeedsCaptureRateLimit(monitor, target_fps) ? QpcFrequency() / target_fps : 0;
     active->signal = std::make_unique<SignalSocket>(active->events, connection.signal_url,
@@ -443,6 +488,7 @@ void StreamSession::ProcessEvents() {
                 if (impl_->host) {
                     if (!active.device) active.device = CreateD3d11Device();
                     active.pixels = std::make_unique<CapturePixels>(active.device.get());
+                    active.StartFrameComparison();
                     try {
                         impl_->StartWgc(active, active.input_mode != StreamInputMode::test_pad);
                     } catch (...) {
@@ -663,6 +709,7 @@ void StreamSession::Capture() {
         }
         active.next_capture += interval;
     }
+    if (!active.ShouldSubmit(*frame)) return;
     const auto captured_at = std::min(stamp, frame->metadata.capture_qpc);
     const auto timestamp_us = std::max(active.last_frame_timestamp_us + 1,
         webrtc::TimeMicros() - static_cast<std::int64_t>(QpcMilliseconds(QpcNow() - captured_at) * 1000));
@@ -685,6 +732,11 @@ void StreamSession::Capture() {
         webrtc::ColorSpace::MatrixID::kBT709, webrtc::ColorSpace::RangeID::kLimited);
     const auto video = webrtc::VideoFrame::Builder().set_video_frame_buffer(pixels)
         .set_timestamp_us(timestamp_us).set_color_space(color).build();
+    if (active.dynamic_cadence) {
+        active.last_video = video;
+        active.last_video_quality = active.quality;
+        active.last_submit_qpc = QpcNow();
+    }
     if (trace) trace->Record("frame_submitted", frame->metadata.frame_id);
     active.rtc->Submit(video);
 
@@ -693,7 +745,7 @@ void StreamSession::Capture() {
     stats.height = static_cast<unsigned>(video.height());
     ++stats.submitted;
     impl_->capture_to_submit_total += QpcMilliseconds(QpcNow() - frame->metadata.capture_qpc);
-    stats.capture_to_submit_ms = impl_->capture_to_submit_total / static_cast<double>(stats.submitted);
+    stats.capture_to_submit_ms = impl_->capture_to_submit_total / static_cast<double>(stats.submitted - active.idle_repeats);
 }
 
 void StreamSession::Present() {
@@ -767,6 +819,18 @@ void StreamSession::Tick() {
         }
     } else if (impl_->state == StreamState::streaming) {
         auto& active = *impl_->active;
+        const auto now = QpcNow();
+        if (active.last_video && active.last_video_quality == active.quality
+            && now - active.last_submit_qpc >= QpcFrequency() * 9 / 10) {
+            auto video = *active.last_video;
+            active.last_frame_timestamp_us = std::max(active.last_frame_timestamp_us + 1, webrtc::TimeMicros());
+            video.set_timestamp_us(active.last_frame_timestamp_us);
+            active.last_submit_qpc = now;
+            ++active.idle_repeats;
+            ++impl_->stats.submitted;
+            if (const auto& trace = active.events->Trace()) trace->Record("frame_idle_repeat", active.idle_repeats);
+            active.rtc->Submit(video);
+        }
         const auto requested = impl_->requested_quality;
         if (impl_->connection.mode == ConnectionMode::lan_direct && !impl_->host && active.quality != requested
                 && SubmitInput({InputKind::set_quality, static_cast<std::uint16_t>(requested)})) {

@@ -719,6 +719,8 @@ StreamLaunchOptions ReadStreamOptions(bool host) {
             options.connection.auto_control = true;
         } else if (arg == L"--hardware-video" && !hardware_video) {
             hardware_video = true;
+        } else if (arg == L"--fixed-cadence" && host && !options.connection.fixed_cadence) {
+            options.connection.fixed_cadence = true;
         } else if (arg == L"--latency-trace" && latency_trace_dir.empty() && index + 1 < count) {
             latency_trace_dir = arguments.get()[++index];
             if (latency_trace_dir.empty()) throw std::invalid_argument("--latency-trace 需要输出目录");
@@ -747,6 +749,9 @@ StreamLaunchOptions ReadStreamOptions(bool host) {
     }
     if (options.connection.desktop_duplication && (options.connection.mode != ConnectionMode::lan_direct || !options.share)) {
         throw std::invalid_argument("--capture-dxgi 需要与 --share 和 --direct 同时使用");
+    }
+    if (options.connection.fixed_cadence && (options.connection.mode != ConnectionMode::lan_direct || !options.share)) {
+        throw std::invalid_argument("--fixed-cadence 需要与 --share 和 --direct 同时使用");
     }
     if (options.connection.video_cursor && (options.connection.mode != ConnectionMode::lan_direct || !internet_file.empty())) {
         throw std::invalid_argument("--video-cursor 需要局域网直连模式");
