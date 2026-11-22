@@ -36,13 +36,18 @@ bool ValidToken(std::wstring_view token) {
 } // namespace
 
 ConnectionOptions ReadInternetConfig(const std::filesystem::path& path) {
-    const auto text = ReadConfig(path);
+    return ParseInternetConfig(winrt::to_hstring(ReadConfig(path)), false);
+}
+
+ConnectionOptions ParseInternetConfig(std::wstring_view text, bool managed) {
     try {
-        const auto json = JsonObject::Parse(winrt::to_hstring(text));
+        const auto json = JsonObject::Parse(winrt::hstring(text));
         ConnectionOptions result;
         result.mode = ConnectionMode::internet;
+        result.managed = managed;
         const Uri endpoint(json.GetNamedString(L"signalUrl"));
-        if (endpoint.SchemeName() != L"wss" || endpoint.Host().empty() || endpoint.Path() != L"/signal"
+        const bool local = managed && endpoint.SchemeName() == L"ws" && endpoint.Host() == L"127.0.0.1";
+        if ((!local && endpoint.SchemeName() != L"wss") || endpoint.Host().empty() || endpoint.Path() != L"/signal"
             || !endpoint.UserName().empty() || !endpoint.Password().empty() || !endpoint.Query().empty()
             || !endpoint.Fragment().empty()) {
             throw std::invalid_argument("公网信令需要 wss://主机/signal 地址");

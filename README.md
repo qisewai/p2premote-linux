@@ -2,6 +2,55 @@
 
 当前实现覆盖[设计文档](windows-remote-desktop-design.md)中的实验 A，并提供实验 B 的 WebRTC 依赖验证和单机双进程串流。`core` 负责采集、渲染、WebRTC 会话和统计，`host` 和 `viewer` 提供 Win32 操作界面。
 
+## 一体化客户端与公网账号服务
+
+`p2premote.exe` 同时包含主控和被控能力。客户端默认填写 `https://remote.pipisime88.net`，可在「服务地址」中改用其他服务。两台电脑使用同一服务，第一台注册账号，后续设备登录该账号。每台电脑会自动登记名称和平台，在线后出现在「我的设备」。选中另一台可连接的电脑并点「连接设备」即可远控。本机可以同时接收远控和连接其他设备。
+
+登录后，本机在当前 Windows 桌面会话中接收同账号设备的控制请求。「停止接收」可让本机下线，同时保留主控能力。「退出登录」会关闭本机的远控会话并撤销本次登录。启动电脑后需要登录 Windows 并打开客户端。
+
+远控窗口顶部的「画质」可在会话中选择 720p、1080p 或 1440p，对应视频码率上限 4、8、16 Mbps。公网会话默认 720p。分辨率受被控屏幕尺寸约束，实际码率由 WebRTC 根据网络调整，画面下方显示实际收到的分辨率。使用新版客户端作为主控和被控即可使用该设置。
+
+公网会话和 TURN 中继都支持本地光标。用新版客户端连接并接管键鼠后，主控端本地绘制光标位置，被控端同步光标形状。窗口底部显示当前的光标模式。
+
+Viewer 会在视频右上角显示诊断浮层，包含会话时长、连接类型、呈现帧率、分辨率、上下行带宽、RTT、视频丢包率和缓冲时间。取消勾选工具栏的「诊断」可隐藏浮层。
+
+公网 NAT 直连和 TURN 中继都启用动态帧率。画面变化时立即提交新帧，静止时约每秒刷新一次。断开后可导出 CSV，查看 ICE 统计中双方的公网映射候选、UDP 直连探测请求和回应的采样峰值。CSV 不包含候选地址。
+
+排查公网直连时，两台电脑都用诊断包里的 `Start-ICE-Diagnostics.cmd` 启动客户端，再连接一次并保持约 20 秒。脚本会在程序旁创建 `ice-logs`。每次建连最多记录首分钟的 ICE 候选地址、端口、路径选择和逐对探测收发计数。主控端日志为 `viewer-ice-*.log`，被控端为 `host-ice-*.log`。请私下分享日志中的网络地址。从源码构建时，可将 `tools/Start-ICE-Diagnostics.cmd` 复制到 `p2premote.exe` 旁使用，也可运行 `p2premote.exe --ice-trace "日志目录"`。
+
+日志中的 `event=ice_connection`、`event=peer_connection` 和 `event=selected_pair` 记录 ICE 状态、整体连接状态和选路变化的时间。两端可用 `p2premote.exe --stun stun:103.236.93.69:23969 --stun-only --ice-trace ice-logs` 对照仅直连模式。该模式用于诊断，连接失败时会直接显示错误。日常启动会保留服务配置的 TURN 兜底。
+
+账号和设备保存在服务端的数据库文件中。同一 Windows 用户再次登录会沿用本机的设备标识。服务使用 HTTPS/WSS，TURN 使用与登录会话绑定的临时凭据。WebRTC 按 ICE 候选建立连接，可直连时优先直连，也可通过同一服务的 TURN 转发加密视频与键鼠数据。Viewer 面板显示「直连」或「TURN 中继」。
+
+### 部署 Go 服务
+
+Linux x64 服务器使用打包的 `p2premote-service-linux-amd64`。从源码构建可运行 `go -C signaling build -o /tmp/p2premote-service .`。下面以 HTTPS 8443 端口为例，将证书和域名换成自己的，`PUBLIC_IPV4` 填服务器对外可达的 IPv4 地址。
+
+```sh
+chmod +x ./p2premote-service-linux-amd64
+PUBLIC_IPV4='203.0.113.10'
+./p2premote-service-linux-amd64 \
+  -bind 0.0.0.0 -port 8443 -managed-db ./accounts.db \
+  -tls-cert /path/to/fullchain.pem -tls-key /path/to/privkey.pem \
+  -turn-ip "$PUBLIC_IPV4" -turn-port 3478 -relay-min 40000 -relay-max 40199
+```
+
+服务器需要开放 TCP 8443、TCP/UDP 3478 和 UDP 40000–40199。云服务器在使用公网 IPv4 映射时，这些端口都要能到达服务进程。Windows 客户端的服务地址填写证书对应的域名，如 `https://remote.example.com:8443`。数据库 `accounts.db` 应保存在持久磁盘上。
+
+使用 Nginx 提供标准 HTTPS 443 时，可给同一个 Go 服务增加 `-proxy-socket /run/p2premote-web/nginx.sock -proxy-gid <Nginx 的组 ID>`。让 Nginx 通过该 Unix socket 转发 HTTP 和 `/signal` 的 WebSocket，并将 `X-P2PRemote-Client-IP` 覆盖为 Nginx 看到的客户端地址。客户端填写 `https://remote.example.com`。限制 socket 目录和组权限，并为 STUN/TURN 保留各自的监听端口。
+
+如果 Windows 客户端登录超时，可以用 `p2premote.exe --compat-account` 启动兼容登录。兼容模式通过 libcurl 和 Windows 证书库处理账号请求，服务地址仍填写 HTTPS 根地址。
+
+### 本机运行
+
+在 Windows 解压目录中运行以下命令，然后启动同目录的 `p2premote.exe`，服务地址填写 `http://127.0.0.1:8788`。
+
+```powershell
+.\p2premote_service.exe -bind 127.0.0.1 -port 8788 -managed-db .\accounts.db -turn-ip 127.0.0.1
+```
+
+本机模式的账号接口只监听回环地址。Windows WebRTC 使用网卡地址发起 TURN 连接。单机测试中继时，将 `-turn-bind` 和 `-turn-ip` 都设为本机同一个局域网 IPv4，转发目标仍限于该地址。跨机器测试使用 HTTPS 部署方式。
+
 ## 构建与运行
 
 目标运行环境为 Windows 11 x64 的 SDR 桌面，显卡需支持 D3D11。构建需要 Visual Studio 2022 的「使用 C++ 的桌面开发」工作负载、Windows SDK 10.0.22621.0 或更新版本，以及 CMake 3.23 或更新版本。实验 A 仅依赖 Windows SDK，`vcpkg.json` 暂无待安装的包。
@@ -126,6 +175,10 @@ Start-Process .\p2premote_viewer.exe -ArgumentList '--direct --signal ws://192.1
 
 新版 Viewer 可在连接中切换 720p、1080p 和 1440p，默认 1080p。对应视频码率上限为 4、8、16 Mbps，实际分辨率受被控屏幕尺寸约束。状态栏按秒显示 WebRTC 会话上下行带宽。
 
+Viewer 的连接状态面板显示实际选中的 ICE 路径和 UDP/TCP 协议、RTT、近期视频丢包率、编解码方式和收流、解码、呈现帧率。没有有效分母的视频丢包样本显示为「—」。导出的统计 CSV 同时包含协议和累计视频包计数。
+
+已建立的局域网直连遇到信令或视频中断时，Viewer 会在约 30 秒内自动重试，Host 也会恢复监听。在 Host 使用确认模式时，重连仍需要确认。任一端主动结束会话、明确拒绝请求，或 Viewer 在重连期间点击「断开」，都会结束本轮重连。恢复后重新点击画面接管键鼠。测试自动重连时使用同一版本的 Host、Viewer 和信令程序。
+
 新版 Host 和 Viewer 在局域网整桌面控制中会协商本地光标。Host 单独传输指针形状和热点，Viewer 接管后在鼠标当前位置显示。旧版对端或无法关闭光标采集的 Windows 仍可使用画面里的光标。
 
 用 `Start-Viewer-SyncedCursor.cmd` 或给局域网 Viewer 加 `--video-cursor`，可以对照画面同步光标。Windows 将 Host 光标与桌面合到同一条视频流里，拖拽时 Viewer 看到两者一起更新。这个模式下光标响应也受视频回显延迟影响。
@@ -194,6 +247,18 @@ Host 可以用 `--capture-dxgi` 对照 DXGI Desktop Duplication。局域网 View
 ```
 
 两端通过 ICE 检查能互通的地址。画面和键鼠使用选中的点对点通道，连接失败时界面会报超时。要实测 NAT 打洞，把 Viewer 切到另一个网络再发起连接，例如手机热点。状态栏的「NAT 直连」表示选中了包含 NAT 候选的直连路径。「主机候选直连」在同一局域网测试时通常表示走的是局域网。[ICE 连接检查](https://www.rfc-editor.org/rfc/rfc8445.html) · [Cloudflare STUN 服务](https://developers.cloudflare.com/realtime/turn/)
+
+### 独立 UDP 打洞测试
+
+`p2premote_nat_probe.exe` 可以在两台 Windows 电脑上单独运行。它默认用同一个 IPv4 UDP 套接字访问西安 STUN `103.236.93.69:23969` 和原节点 `179.253.242.112:3478`，列出各节点看到的公网映射，再用同一个套接字进行双向直连探测。测试只依赖 STUN 和两台电脑之间的 UDP。
+
+1. 两端各打开同一新版程序，等待它显示 `udp1.` 开头的连接码。
+2. 交换连接码，在两端分别粘贴对方的码并按 Enter，尽量同时开始。默认探测 30 秒。
+3. 把两端的 `nat-probe-*.txt` 报告放在一起查看。程序会打印保存路径，Windows 下存放在 `%LOCALAPPDATA%\P2PRemote\NATProbe`。报告含网络地址和端口。
+
+探测先发送独立工具生成的 ICE 格式 STUN 探测，再在同一套接字上加入普通 UDP 对照。报告按格式分别统计发出的探测、收到的请求和匹配的回复。STUN 回复还带回对端看到的本机地址和端口，可以和通告值比较。两端均零接收时，报告仍无法区分 NAT 映射变化、入站过滤等原因。
+
+仅测 STUN 可运行 `p2premote_nat_probe.exe -discover-only`。用 `-stun 103.236.93.69:23969` 只测西安节点，用 `-bind 192.168.0.43:0` 绑定本机指定 IPv4 地址，用 `-duration 60s` 延长探测。使用 Go 1.23 或更新版本，在 `signaling` 目录运行 `go build -o ../out/p2premote_nat_probe.exe ./cmd/natprobe` 即可构建。
 
 ## 计时口径
 

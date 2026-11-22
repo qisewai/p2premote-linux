@@ -22,13 +22,131 @@
 #include "logging/rtc_event_log/events/rtc_event_bwe_update_loss_based.h"
 #include "logging/rtc_event_log/events/rtc_event_rtp_packet_incoming.h"
 #include "logging/rtc_event_log/events/rtc_event_rtp_packet_outgoing.h"
+#include "p2p/base/port.h"
 #include "pc/video_track_source.h"
 #include "rtc_base/ssl_adapter.h"
 
 #include <charconv>
+#include <chrono>
+#include <fstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace p2premote {
+
+class IceTrace {
+public:
+    IceTrace(const std::filesystem::path& directory, bool host) {
+        const auto role = host ? "host" : "viewer";
+        const auto name = std::string(role) + "-ice-" + std::to_string(GetCurrentProcessId())
+            + '-' + std::to_string(QpcNow()) + ".log";
+        output_.open(directory / name);
+        if (!output_) throw std::runtime_error("无法创建 ICE 诊断日志");
+        output_ << "version=1 role=" << role << " duration_seconds=60\n" << std::flush;
+    }
+
+    void Candidate(std::string_view direction, std::string_view mid, int mline_index, const webrtc::Candidate& candidate) {
+        if (!Active()) return;
+        const std::lock_guard lock(mutex_);
+        const auto& related = candidate.related_address();
+        output_ << "time_ms=" << Timestamp() << " candidate=" << direction
+            << " mid=" << Token(mid) << " mline=" << mline_index
+            << " type=" << webrtc::IceCandidateTypeToString(candidate.type())
+            << " protocol=" << Token(candidate.protocol())
+            << " address=" << candidate.address().HostAsURIString() << " port=" << candidate.address().port()
+            << " related_address=" << (related.IsNil() ? std::string("-") : related.HostAsURIString())
+            << " related_port=" << related.port()
+            << " foundation=" << Token(candidate.foundation())
+            << " network=" << Token(candidate.network_name())
+            << " network_type=" << static_cast<int>(candidate.network_type());
+        if (!candidate.url().empty()) output_ << " url=" << Token(candidate.url());
+        output_ << '\n' << std::flush;
+    }
+
+    template <typename StateType>
+    void State(std::string_view event, StateType state) {
+        if (!Active()) return;
+        const auto name = webrtc::PeerConnectionInterface::AsString(state);
+        const std::lock_guard lock(mutex_);
+        output_ << "time_ms=" << Timestamp() << " event=" << event
+            << " state=" << std::string_view(name.data(), name.size()) << '\n' << std::flush;
+    }
+
+    void SelectedPair(const webrtc::CandidatePairChangeEvent& event) {
+        if (!Active()) return;
+        const auto& local = event.selected_candidate_pair.local;
+        const auto& remote = event.selected_candidate_pair.remote;
+        const std::lock_guard lock(mutex_);
+        output_ << "time_ms=" << Timestamp() << " event=selected_pair transport=" << Token(event.transport_name)
+            << " reason=" << Token(event.reason)
+            << " local_type=" << webrtc::IceCandidateTypeToString(local.type())
+            << " local_endpoint=" << local.address().ToString()
+            << " remote_type=" << webrtc::IceCandidateTypeToString(remote.type())
+            << " remote_endpoint=" << remote.address().ToString() << '\n' << std::flush;
+    }
+
+    void Report(const webrtc::RTCStatsReport& report) {
+        if (!Active()) return;
+        const auto timestamp = Timestamp();
+        const std::lock_guard lock(mutex_);
+        for (const auto* pair : report.GetStatsOfType<webrtc::RTCIceCandidatePairStats>()) {
+            if (!pair->local_candidate_id || !pair->remote_candidate_id) continue;
+            const auto* local = report.GetAs<webrtc::RTCLocalIceCandidateStats>(*pair->local_candidate_id);
+            const auto* remote = report.GetAs<webrtc::RTCRemoteIceCandidateStats>(*pair->remote_candidate_id);
+            if (!local || !remote) continue;
+            const auto* transport = pair->transport_id
+                ? report.GetAs<webrtc::RTCTransportStats>(*pair->transport_id) : nullptr;
+            output_ << "time_ms=" << timestamp << " pair=" << pair->id()
+                << " state=" << pair->state.value_or("-")
+                << " selected=" << (transport && transport->selected_candidate_pair_id == pair->id())
+                << " nominated=" << pair->nominated.value_or(false);
+            WriteEndpoint("local", *local);
+            WriteEndpoint("remote", *remote);
+            output_ << " requests_sent=" << pair->requests_sent.value_or(0)
+                << " requests_received=" << pair->requests_received.value_or(0)
+                << " responses_sent=" << pair->responses_sent.value_or(0)
+                << " responses_received=" << pair->responses_received.value_or(0) << '\n';
+        }
+        output_ << std::flush;
+    }
+
+private:
+    static std::int64_t Timestamp() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    bool Active() const { return std::chrono::steady_clock::now() < deadline_; }
+
+    static std::string Token(std::string_view value) {
+        if (value.empty()) return "-";
+        std::string out(value);
+        for (char& ch : out) {
+            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') ch = '_';
+        }
+        return out;
+    }
+
+    void WriteEndpoint(std::string_view side, const webrtc::RTCIceCandidateStats& candidate) {
+        output_ << ' ' << side << "_type=" << candidate.candidate_type.value_or("-")
+            << ' ' << side << "_protocol=" << candidate.protocol.value_or("-")
+            << ' ' << side << "_address=" << candidate.address.value_or("-")
+            << ' ' << side << "_port=" << candidate.port.value_or(0)
+            << ' ' << side << "_raddr=" << candidate.related_address.value_or("-")
+            << ' ' << side << "_rport=" << candidate.related_port.value_or(0);
+        if (candidate.network_adapter_type) {
+            output_ << ' ' << side << "_adapter=" << Token(*candidate.network_adapter_type);
+        }
+        if (candidate.vpn) {
+            output_ << ' ' << side << "_vpn=" << (*candidate.vpn ? 1 : 0);
+        }
+    }
+
+    const std::chrono::steady_clock::time_point deadline_ = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+    std::mutex mutex_;
+    std::ofstream output_;
+};
+
 namespace {
 
 using Peer = webrtc::PeerConnectionInterface;
@@ -124,20 +242,40 @@ private:
 
 class StatsObserver : public webrtc::RTCStatsCollectorCallback {
 public:
-    StatsObserver(std::shared_ptr<StreamEvents> events, bool negotiating)
-        : events_(std::move(events)), negotiating_(negotiating) {}
+    StatsObserver(std::shared_ptr<StreamEvents> events, std::shared_ptr<IceTrace> ice_trace, bool negotiating)
+        : events_(std::move(events)), ice_trace_(std::move(ice_trace)), negotiating_(negotiating) {}
 
     void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+        if (ice_trace_) ice_trace_->Report(*report);
         RtcCounters counters;
-        if (negotiating_) {
-            auto& checks = counters.ice_checks.emplace();
-            for (const auto* pair : report->GetStatsOfType<webrtc::RTCIceCandidatePairStats>()) {
-                checks.requests_sent += pair->requests_sent.value_or(0);
-                checks.requests_received += pair->requests_received.value_or(0);
-                checks.responses_received += pair->responses_received.value_or(0);
+        auto& diagnostics = counters.ice_diagnostics;
+        for (const auto* local : report->GetStatsOfType<webrtc::RTCLocalIceCandidateStats>()) {
+            if (local->candidate_type == "srflx") ++diagnostics.local_srflx;
+        }
+        for (const auto* remote : report->GetStatsOfType<webrtc::RTCRemoteIceCandidateStats>()) {
+            if (remote->candidate_type == "srflx") ++diagnostics.remote_srflx;
+        }
+        auto* checks = negotiating_ ? &counters.ice_checks.emplace() : nullptr;
+        for (const auto* pair : report->GetStatsOfType<webrtc::RTCIceCandidatePairStats>()) {
+            if (checks) {
+                checks->requests_sent += pair->requests_sent.value_or(0);
+                checks->requests_received += pair->requests_received.value_or(0);
+                checks->responses_received += pair->responses_received.value_or(0);
             }
+            if (!pair->local_candidate_id || !pair->remote_candidate_id) continue;
+            const auto* local = report->GetAs<webrtc::RTCLocalIceCandidateStats>(*pair->local_candidate_id);
+            const auto* remote = report->GetAs<webrtc::RTCRemoteIceCandidateStats>(*pair->remote_candidate_id);
+            if (!local || !remote || local->protocol != "udp" || remote->protocol != "udp"
+                || !local->candidate_type || !remote->candidate_type
+                || local->candidate_type == "relay" || remote->candidate_type == "relay") continue;
+            ++diagnostics.direct_udp_pairs;
+            if (pair->state == "succeeded") ++diagnostics.direct_udp_succeeded;
+            diagnostics.direct_udp_requests += pair->requests_sent.value_or(0);
+            diagnostics.direct_udp_responses += pair->responses_received.value_or(0);
+        }
+        if (checks) {
             for (const auto* transport : report->GetStatsOfType<webrtc::RTCTransportStats>()) {
-                if (transport->dtls_state) checks.dtls_state = *transport->dtls_state;
+                if (transport->dtls_state) checks->dtls_state = *transport->dtls_state;
                 if (transport->selected_candidate_pair_id) break;
             }
             events_->Push({StreamEventType::stats, {}, {}, std::move(counters)});
@@ -160,6 +298,8 @@ public:
             } else {
                 counters.ice_path = IcePath::nat;
             }
+            counters.ice_protocol = local->protocol.value_or("");
+            counters.relay_protocol = local->relay_protocol.value_or("");
             if (pair->current_round_trip_time) counters.ice_rtt_ms = *pair->current_round_trip_time * 1000;
             if (trace && pair->available_outgoing_bitrate.value_or(0) > 0) {
                 trace->Record("available_outgoing_bps", static_cast<std::uint64_t>(*pair->available_outgoing_bitrate));
@@ -172,6 +312,10 @@ public:
             }
             counters.received += row->frames_received.value_or(0);
             counters.decoded += row->frames_decoded.value_or(0);
+            if (row->packets_received && row->packets_lost) {
+                counters.video_packets_received += *row->packets_received;
+                counters.video_packets_lost += *row->packets_lost;
+            }
             counters.decode_seconds += row->total_decode_time.value_or(0);
             counters.rtc_frames_dropped += row->frames_dropped.value_or(0);
             if (row->jitter_buffer_delay && row->jitter_buffer_emitted_count) {
@@ -205,6 +349,7 @@ public:
 
 private:
     std::shared_ptr<StreamEvents> events_;
+    std::shared_ptr<IceTrace> ice_trace_;
     bool negotiating_;
 };
 
@@ -268,11 +413,20 @@ private:
 class RtcSsl {
 public:
     RtcSsl() {
-        if (!webrtc::InitializeSSL()) {
+        const std::lock_guard lock(mutex_);
+        if (!users_ && !webrtc::InitializeSSL()) {
             throw std::runtime_error("无法初始化 WebRTC DTLS");
         }
+        ++users_;
     }
-    ~RtcSsl() { webrtc::CleanupSSL(); }
+    ~RtcSsl() {
+        const std::lock_guard lock(mutex_);
+        if (!--users_) webrtc::CleanupSSL();
+    }
+
+private:
+    static inline std::mutex mutex_;
+    static inline unsigned users_{};
 };
 
 class ScreenSource : public webrtc::VideoTrackSource {
@@ -290,6 +444,7 @@ private:
 RtcCall::RtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
     bool allow_input, int max_framerate, ID3D11Device* video_device)
     : host_(host), trickle_(options.mode == ConnectionMode::internet), events_(std::move(events)),
+      ice_trace_(options.ice_trace_dir.empty() ? nullptr : std::make_shared<IceTrace>(options.ice_trace_dir, host)),
       ssl_(std::make_unique<RtcSsl>()), signaling_(webrtc::Thread::Create()) {
     if (!signaling_->Start()) {
         throw std::runtime_error("无法启动 WebRTC 信令线程");
@@ -306,7 +461,7 @@ RtcCall::RtcCall(bool host, std::shared_ptr<StreamEvents> events, const Connecti
     }
     dependencies.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
     dependencies.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-    const bool dynamic_cadence = options.mode == ConnectionMode::lan_direct && !options.fixed_cadence;
+    const bool dynamic_cadence = host && options.DynamicCadenceEnabled();
     dependencies.video_encoder_factory = CreateVideoEncoderFactory(host ? video_device : nullptr, hardware_encoder_,
         dynamic_cadence, events_->Trace());
     dependencies.video_decoder_factory = CreateVideoDecoderFactory(host ? nullptr : video_device, events_->Trace());
@@ -409,6 +564,7 @@ void RtcCall::AddRemoteIce(const std::string& payload) {
     }
     auto candidate = webrtc::IceCandidate::Create(payload.substr(0, mid_end), index, payload.substr(index_end + 1));
     if (!candidate) throw std::runtime_error("无法解析远端 ICE 候选");
+    if (ice_trace_) ice_trace_->Candidate("remote_trickle", candidate->sdp_mid(), candidate->sdp_mline_index(), candidate->candidate());
     peer_->AddIceCandidate(std::move(candidate), [events = events_](webrtc::RTCError error) {
         if (!error.ok()) events->Push({StreamEventType::error, {}, "无法应用远端 ICE 候选"});
     });
@@ -436,7 +592,7 @@ bool RtcCall::SetVideoBitrate(int max_bitrate_bps) {
 }
 
 void RtcCall::RequestStats(bool negotiating) {
-    const auto observer = webrtc::make_ref_counted<StatsObserver>(events_, negotiating);
+    const auto observer = webrtc::make_ref_counted<StatsObserver>(events_, ice_trace_, negotiating);
     peer_->GetStats(observer.get());
 }
 
@@ -504,13 +660,23 @@ std::uint64_t RtcCall::ReplacedFrames() const {
 }
 
 void RtcCall::OnIceGatheringChange(Peer::IceGatheringState state) {
+    if (ice_trace_) ice_trace_->State("ice_gathering", state);
     if (state == Peer::kIceGatheringComplete) {
         events_->Push({StreamEventType::gathered, {}, {}});
     }
 }
 
+void RtcCall::OnStandardizedIceConnectionChange(Peer::IceConnectionState state) {
+    if (ice_trace_) ice_trace_->State("ice_connection", state);
+}
+
+void RtcCall::OnIceSelectedCandidatePairChanged(const webrtc::CandidatePairChangeEvent& event) {
+    if (ice_trace_) ice_trace_->SelectedPair(event);
+}
+
 void RtcCall::OnIceCandidate(const webrtc::IceCandidate* candidate) {
     if (trickle_ && candidate) {
+        if (ice_trace_) ice_trace_->Candidate("local_trickle", candidate->sdp_mid(), candidate->sdp_mline_index(), candidate->candidate());
         events_->Push({StreamEventType::ice_candidate, {}, candidate->sdp_mid() + '\n'
             + std::to_string(candidate->sdp_mline_index()) + '\n' + candidate->ToString()});
     }
@@ -531,10 +697,11 @@ void RtcCall::OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> 
 }
 
 void RtcCall::OnConnectionChange(Peer::PeerConnectionState state) {
+    if (ice_trace_) ice_trace_->State("peer_connection", state);
     if (state == Peer::PeerConnectionState::kConnected) {
         events_->Push({StreamEventType::connected, {}, {}});
     } else if (state == Peer::PeerConnectionState::kFailed || state == Peer::PeerConnectionState::kDisconnected) {
-        events_->Push({StreamEventType::error, {}, "WebRTC 连接已断开"});
+        events_->Push({StreamEventType::media_lost, {}, "WebRTC 连接已断开"});
     }
 }
 

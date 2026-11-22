@@ -15,6 +15,7 @@
 #include <bitset>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,7 +37,8 @@ using p2premote::StreamStatistics;
 
 enum ControlId {
     screen_select = 200, room_code, connect_button, allow_button,
-    stop_button, export_button, status_text, allow_input_button, low_latency_mode, quality_select
+    stop_button, export_button, status_text, allow_input_button, low_latency_mode, quality_select, status_panel,
+    overlay_toggle
 };
 constexpr std::array quality_levels{StreamQuality::p720, StreamQuality::p1080, StreamQuality::p1440};
 constexpr UINT_PTR statistics_timer = 1;
@@ -46,8 +48,64 @@ constexpr int stop_control_hotkey = 1;
 constexpr wchar_t stream_window_class[] = L"P2PRemote.Stream";
 constexpr wchar_t screen_class[] = L"P2PRemote.VideoSurface";
 constexpr wchar_t blank_class[] = L"P2PRemote.BlankSurface";
+constexpr wchar_t overlay_class[] = L"P2PRemote.Diagnostics";
 
 bool IsActive(StreamState state) { return state != StreamState::idle && state != StreamState::stopped; }
+
+const wchar_t* NetworkProtocol(std::string_view protocol) {
+    if (protocol == "udp") return L"UDP";
+    if (protocol == "tcp") return L"TCP";
+    if (protocol == "tls") return L"TLS";
+    return L"—";
+}
+
+const wchar_t* NetworkPath(IcePath path) {
+    switch (path) {
+    case IcePath::host: return L"主机候选直连";
+    case IcePath::nat: return L"NAT 直连";
+    case IcePath::relay: return L"TURN 中继";
+    default: return L"正在获取链路";
+    }
+}
+
+std::wstring Milliseconds(std::optional<double> value) {
+    return value ? std::format(L"{:.1f} ms", *value) : std::wstring(L"—");
+}
+
+LRESULT CALLBACK OverlayProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        const auto dc = BeginPaint(window, &paint);
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        const auto dpi = GetDpiForWindow(window);
+        const auto px = [dpi](int value) { return MulDiv(value, dpi, 96); };
+        const auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+        SetDCBrushColor(dc, RGB(20, 30, 43));
+        FillRect(dc, &bounds, brush);
+        const RECT accent{0, 0, bounds.right, px(2)};
+        SetDCBrushColor(dc, RGB(92, 211, 207));
+        FillRect(dc, &accent, brush);
+        const auto font = CreateFontW(-px(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        const auto original = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(242, 248, 252));
+        std::array<wchar_t, 512> text{};
+        GetWindowTextW(window, text.data(), static_cast<int>(text.size()));
+        InflateRect(&bounds, -px(11), -px(9));
+        DrawTextW(dc, text.data(), -1, &bounds, DT_LEFT | DT_TOP | DT_NOPREFIX);
+        SelectObject(dc, original);
+        if (font) DeleteObject(font);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
 
 BOOL CALLBACK AddScreen(HMONITOR monitor, HDC, LPRECT, LPARAM context) noexcept {
     try {
@@ -64,25 +122,35 @@ public:
     StreamWindow(HINSTANCE instance, bool host, StreamLaunchOptions options)
         : instance_(instance), host_(host), internet_(options.connection.mode == ConnectionMode::internet),
           quick_connect_(options.connection.mode != ConnectionMode::session_code),
-          video_cursor_(options.connection.video_cursor),
+          quality_selection_(options.connection.SupportsQualitySelection()),
+          poll_cursor_(options.connection.SupportsLocalCursor() && (host || !options.connection.video_cursor)),
+          connect_on_open_(options.connect_on_open),
+          lifetime_(options.lifetime),
           session_(host, std::move(options.connection)) {}
     ~StreamWindow() { if (window_) DestroyWindow(window_); }
 
     int Run(int show) {
-        WNDCLASSW cls{};
-        cls.lpfnWndProc = WindowProc;
-        cls.hInstance = instance_;
-        cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        cls.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
-        cls.lpszClassName = stream_window_class;
-        winrt::check_bool(RegisterClassW(&cls));
-        cls.lpfnWndProc = SurfaceProc;
-        cls.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-        cls.lpszClassName = screen_class;
-        winrt::check_bool(RegisterClassW(&cls));
-        cls.lpfnWndProc = DefWindowProcW;
-        cls.lpszClassName = blank_class;
-        winrt::check_bool(RegisterClassW(&cls));
+        static std::once_flag window_classes;
+        std::call_once(window_classes, [this] {
+            WNDCLASSW cls{};
+            cls.lpfnWndProc = WindowProc;
+            cls.hInstance = instance_;
+            cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            cls.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+            cls.lpszClassName = stream_window_class;
+            winrt::check_bool(RegisterClassW(&cls));
+            cls.lpfnWndProc = SurfaceProc;
+            cls.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            cls.lpszClassName = screen_class;
+            winrt::check_bool(RegisterClassW(&cls));
+            cls.lpfnWndProc = DefWindowProcW;
+            cls.lpszClassName = blank_class;
+            winrt::check_bool(RegisterClassW(&cls));
+            cls.lpfnWndProc = OverlayProc;
+            cls.hbrBackground = nullptr;
+            cls.lpszClassName = overlay_class;
+            winrt::check_bool(RegisterClassW(&cls));
+        });
 
         const auto dpi = GetDpiForSystem();
         const auto width = MulDiv(host_ ? 680 : 960, dpi, 96);
@@ -116,32 +184,39 @@ public:
         connect_ = Control(L"BUTTON", connect_label, BS_PUSHBUTTON | WS_TABSTOP, connect_button);
         stop_ = Control(L"BUTTON", L"断开", BS_PUSHBUTTON | WS_TABSTOP, stop_button);
         export_ = Control(L"BUTTON", L"导出 CSV", BS_PUSHBUTTON | WS_TABSTOP, export_button);
+        if (!host_) status_panel_ = Control(L"BUTTON", L"连接状态", BS_GROUPBOX, status_panel);
         status_ = Control(L"STATIC", L"", SS_LEFT, status_text);
         if (quick_connect_) {
             ShowWindow(code_label_, SW_HIDE);
             ShowWindow(code_, SW_HIDE);
         }
         if (!host_) {
-            if (quick_connect_ && !internet_) {
+            if (quality_selection_) {
                 quality_label_ = Control(L"STATIC", L"画质", SS_LEFT, 0);
                 quality_ = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, quality_select);
-                for (const auto* label : {L"省带宽 · 720p", L"清晰 · 1080p", L"超清 · 1440p"}) {
+                for (const auto* label : {L"720p · 4 Mbps", L"1080p · 8 Mbps", L"1440p · 16 Mbps"}) {
                     SendMessageW(quality_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
                 }
-                SendMessageW(quality_, CB_SETCURSEL, 1, 0);
+                SendMessageW(quality_, CB_SETCURSEL, internet_ ? 0 : 1, 0);
             }
             placeholder_ = Control(blank_class, L"", 0, 0);
             surface_ = Control(screen_class, L"", 0, 0);
             SetWindowLongPtrW(surface_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
             ShowWindow(surface_, SW_HIDE);
+            overlay_toggle_ = Control(L"BUTTON", L"诊断", BS_AUTOCHECKBOX | WS_TABSTOP, overlay_toggle);
+            SendMessageW(overlay_toggle_, BM_SETCHECK, BST_CHECKED, 0);
+            overlay_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT, overlay_class, L"",
+                WS_CHILD | WS_DISABLED, 0, 0, 0, 0, surface_, nullptr, instance_, nullptr);
+            winrt::check_pointer(overlay_);
+            winrt::check_bool(SetLayeredWindowAttributes(overlay_, 0, 226, LWA_ALPHA));
         }
 
         Layout();
         Update();
         winrt::check_bool(SetTimer(window_, statistics_timer, 1000, nullptr) != 0);
-        if (quick_connect_ && !internet_) winrt::check_bool(SetTimer(window_, cursor_timer, 33, nullptr) != 0);
+        const std::stop_callback close(lifetime_, [window = window_] { PostMessageW(window, WM_CLOSE, 0, 0); });
         ShowWindow(window_, show);
-        if (host_ && quick_connect_) Start();
+        if (!lifetime_.stop_requested() && ((host_ && quick_connect_) || connect_on_open_)) Start();
 
         for (;;) {
             MSG message{};
@@ -164,10 +239,6 @@ public:
                     const auto before = session_.State();
                     const auto previous_code = session_.Code();
                     session_.ProcessEvents();
-                    if (before != StreamState::waiting && session_.State() == StreamState::waiting) {
-                        previous_ = {};
-                        rate_text_.clear();
-                    }
                     const auto input_changed = RefreshInputReady();
                     if (!host_) RefreshLocalCursor();
                     if (input_pad_window_) {
@@ -236,6 +307,7 @@ private:
                 return 0;
             case stop_button: session_.Stop(L"已断开"); Update(); return 0;
             case export_button: Export(); return 0;
+            case overlay_toggle: UpdateOverlay(session_.Statistics()); return 0;
             }
             break;
         case WM_SIZE: Layout(); return 0;
@@ -279,6 +351,7 @@ private:
         case WM_DESTROY:
             KillTimer(hwnd, statistics_timer);
             KillTimer(hwnd, input_timer);
+            KillTimer(hwnd, cursor_timer);
             if (hotkey_) UnregisterHotKey(hwnd, stop_control_hotkey);
             session_.Stop(L"已关闭");
             PostQuitMessage(0);
@@ -452,6 +525,10 @@ private:
             if (ready) winrt::check_bool(SetTimer(window_, input_timer, p2premote::input_heartbeat_ms, nullptr) != 0);
             else KillTimer(window_, input_timer);
         }
+        if (poll_cursor_) {
+            if (ready) winrt::check_bool(SetTimer(window_, cursor_timer, 33, nullptr) != 0);
+            else KillTimer(window_, cursor_timer);
+        }
         return true;
     }
 
@@ -514,8 +591,9 @@ private:
         place(stop_, actions + connect_width + 8, 9, 65, 24);
         place(export_, actions + connect_width + 82, 9, 91, 24);
         if (quality_) {
-            place(quality_label_, 284, 13, 34, 20);
-            place(quality_, 322, 9, 155, 124);
+            const auto quality_x = actions + connect_width + 185;
+            place(quality_label_, quality_x, 13, 34, 20);
+            place(quality_, quality_x + 38, 9, 140, 124);
         }
         RECT rect{};
         GetClientRect(window_, &rect);
@@ -531,11 +609,52 @@ private:
             }
         } else {
             const auto width = std::max(0L, rect.right - px(20));
-            const auto height = std::max(0L, rect.bottom - px(150));
+            const auto height = std::max(0L, rect.bottom - px(176));
+            MoveWindow(overlay_toggle_, rect.right - px(70), px(9), px(60), px(24), TRUE);
             MoveWindow(surface_, px(10), px(42), width, height, TRUE);
             MoveWindow(placeholder_, px(10), px(42), width, height, TRUE);
-            MoveWindow(status_, px(10), px(48) + height, width, px(96), TRUE);
+            MoveWindow(status_panel_, px(10), px(46) + height, width, px(122), TRUE);
+            MoveWindow(status_, px(20), px(66) + height, std::max(0L, width - px(20)), px(96), TRUE);
             session_.Resize(width > 0 && height > 0 && !IsIconic(window_));
+            UpdateOverlay(session_.Statistics());
+        }
+    }
+
+    void UpdateOverlay(const StreamStatistics& stats) {
+        if (!overlay_) return;
+        RECT area{};
+        GetClientRect(surface_, &area);
+        const auto dpi = GetDpiForWindow(window_);
+        const auto px = [dpi](int value) { return MulDiv(value, dpi, 96); };
+        const auto margin = px(8);
+        const auto width = px(224);
+        const auto height = px(116);
+        if (session_.State() != StreamState::streaming || !stats.width || !stats.height || IsIconic(window_)
+            || SendMessageW(overlay_toggle_, BM_GETCHECK, 0, 0) != BST_CHECKED
+            || area.right < width + 2 * margin || area.bottom < height + 2 * margin) {
+            ShowWindow(overlay_, SW_HIDE);
+            return;
+        }
+        const auto viewport = p2premote::FitVideo(area.right, area.bottom, stats.width, stats.height);
+        const bool fits_video = viewport.width >= static_cast<unsigned>(width + 2 * margin)
+            && viewport.height >= static_cast<unsigned>(height + 2 * margin);
+        const auto right = fits_video ? static_cast<int>(viewport.left + viewport.width) : area.right;
+        const auto top = fits_video ? static_cast<int>(viewport.top) : 0;
+        SetWindowPos(overlay_, HWND_TOP, right - margin - width, top + margin, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+        const auto seconds = static_cast<std::uint64_t>(stats.seconds);
+        const auto fps = presented_fps_ ? std::format(L"{:.1f}", *presented_fps_) : std::wstring(L"—");
+        const auto loss = loss_rate_ ? std::format(L"{:.1f}%", *loss_rate_) : std::wstring(L"—");
+        const auto& protocol = stats.relay_protocol.empty() ? stats.ice_protocol : stats.relay_protocol;
+        auto text = std::format(L"{:02}:{:02}:{:02}\r\n{} · {}\r\n{} fps · {} × {}\r\n"
+                                L"↓ {}   ↑ {}\r\nRTT {} · 丢包 {}\r\n视频缓冲 {}",
+            seconds / 3600, seconds / 60 % 60, seconds % 60, NetworkPath(stats.ice_path), NetworkProtocol(protocol),
+            fps, stats.width, stats.height, down_rate_.empty() ? L"—" : down_rate_,
+            up_rate_.empty() ? L"—" : up_rate_, Milliseconds(stats.ice_rtt_ms), loss, Milliseconds(stats.jitter_buffer_ms));
+        if (text != visible_overlay_) {
+            SetWindowTextW(overlay_, text.c_str());
+            visible_overlay_ = std::move(text);
+            InvalidateRect(overlay_, nullptr, FALSE);
         }
     }
 
@@ -547,18 +666,27 @@ private:
         const auto rate = [interval](std::uint64_t now, std::uint64_t before) {
             return now >= before ? static_cast<double>(now - before) / interval : 0.0;
         };
+        if (!host_) presented_fps_ = rate(next.presented, previous_.presented);
         rate_text_ = host_
             ? std::format(L"采集 {:.1f} fps  |  提交 {:.1f} fps  |  编码 {:.1f} fps",
                 rate(next.captured, previous_.captured), rate(next.submitted, previous_.submitted), rate(next.encoded, previous_.encoded))
             : std::format(L"接收 {:.1f} fps  |  解码 {:.1f} fps  |  呈现 {:.1f} fps",
-                rate(next.received, previous_.received), rate(next.decoded, previous_.decoded), rate(next.presented, previous_.presented));
+                rate(next.received, previous_.received), rate(next.decoded, previous_.decoded), *presented_fps_);
         if (previous_.seconds > 0) {
             const auto bandwidth = [](double bytes_per_second) {
                 const auto kbps = bytes_per_second * 8 / 1000;
                 return kbps >= 1000 ? std::format(L"{:.2f} Mbps", kbps / 1000) : std::format(L"{:.1f} Kbps", kbps);
             };
-            rate_text_ += std::format(L"  |  上行 {}  下行 {}", bandwidth(rate(next.bytes_sent, previous_.bytes_sent)),
-                bandwidth(rate(next.bytes_received, previous_.bytes_received)));
+            up_rate_ = bandwidth(rate(next.bytes_sent, previous_.bytes_sent));
+            down_rate_ = bandwidth(rate(next.bytes_received, previous_.bytes_received));
+            rate_text_ += std::format(L"  |  上行 {}  下行 {}", up_rate_, down_rate_);
+            loss_rate_.reset();
+            if (next.video_packets_received >= previous_.video_packets_received) {
+                const auto received = next.video_packets_received - previous_.video_packets_received;
+                const auto lost = std::max<std::int64_t>(0, next.video_packets_lost - previous_.video_packets_lost);
+                const auto total = static_cast<double>(received) + static_cast<double>(lost);
+                if (total > 0) loss_rate_ = 100.0 * static_cast<double>(lost) / total;
+            }
         }
         previous_ = next;
         return true;
@@ -567,6 +695,14 @@ private:
     void Update() {
         RefreshInputReady();
         const auto state = session_.State();
+        if (state == StreamState::waiting || state == StreamState::reconnecting) {
+            previous_ = {};
+            rate_text_.clear();
+            up_rate_.clear();
+            down_rate_.clear();
+            presented_fps_.reset();
+            loss_rate_.reset();
+        }
         const auto active = IsActive(state);
         const auto stats = session_.Statistics();
         if (session_.DesktopControl() && !hotkey_) {
@@ -577,7 +713,7 @@ private:
         }
         EnableWindow(connect_, !active && (!host_ || !monitors_.empty()));
         EnableWindow(stop_, active);
-        EnableWindow(export_, !active && stats.seconds > 0);
+        EnableWindow(export_, !active && (stats.seconds > 0 || stats.ice_diagnostics.has_value()));
         if (host_) {
             auto code = session_.Code();
             if (code != visible_code_) {
@@ -597,21 +733,32 @@ private:
                 ShowWindow(placeholder_, show_video ? SW_HIDE : SW_SHOWNA);
                 video_visible_ = show_video;
             }
+            UpdateOverlay(stats);
         }
         const auto idle = internet_ ? (host_ ? L"等待公网请求" : L"点击连接公网 Host")
             : quick_connect_ ? (host_ ? L"点击等待直连" : L"点击一键直连")
                              : (host_ ? L"选择要共享的显示器并创建会话" : L"输入 Host 的会话代码");
         auto text = state == StreamState::idle ? idle : session_.Status();
-        if (stats.width) {
-            switch (stats.ice_path) {
-            case IcePath::host: text += L"  |  主机候选直连"; break;
-            case IcePath::nat: text += L"  |  NAT 直连"; break;
-            case IcePath::relay: text += L"  |  TURN 中继"; break;
-            case IcePath::unknown: break;
+        if (state == StreamState::streaming) {
+            if (!host_) text += L"\r\n";
+            if (!host_ || stats.ice_path != IcePath::unknown) {
+                if (host_) text += L"  |  ";
+                text += NetworkPath(stats.ice_path);
+            }
+            if (!stats.ice_protocol.empty()) text += std::format(L"  |  {}", NetworkProtocol(stats.ice_protocol));
+            if (!stats.relay_protocol.empty() && stats.relay_protocol != stats.ice_protocol) {
+                text += std::format(L"  |  本端到 TURN {}", NetworkProtocol(stats.relay_protocol));
             }
             if (stats.ice_rtt_ms) text += std::format(L"  |  RTT {:.1f} ms", *stats.ice_rtt_ms);
+            if (!host_) {
+                text += loss_rate_ ? std::format(L"  |  视频丢包 {:.1f}%", *loss_rate_) : L"  |  视频丢包 —";
+                text += L"\r\n";
+            }
+        }
+        if (state == StreamState::streaming && stats.width) {
             if (!stats.video_codec.empty()) {
-                text += L"  |  " + stats.video_codec + (stats.hardware_video ? L" 硬件" : L"");
+                if (host_) text += L"  |  ";
+                text += stats.video_codec + (stats.hardware_video ? L" 硬件" : L"");
                 if (stats.gpu_conversion) text += L" · GPU 转换";
                 if (stats.gpu_backbuffer) text += L" · 直写上屏";
             }
@@ -623,19 +770,21 @@ private:
                 return value ? std::format(L"{:.2f} ms", *value) : std::wstring(L"—");
             };
             text += host_ ? std::format(L"\r\n平均发送排队 {}", ms(stats.packet_send_queue_ms))
-                          : std::format(L"\r\n平均接收缓冲 {}  |  解码后等待 {}",
+                          : std::format(L"  |  缓冲 {}  |  解码后等待 {}",
                                 ms(stats.jitter_buffer_ms), ms(stats.decoded_frame_wait_ms));
         }
         if (!host_ && input_ready_) {
             HCURSOR cursor{};
             if (session_.LocalCursor(cursor)) text += L"\r\n本地光标 · 点击画面接管键鼠，按 F12 释放。";
-            else if (video_cursor_) text += L"\r\n画面同步光标 · 点击画面接管键鼠，按 F12 释放。";
-            else text += quick_connect_ ? L"\r\n点击画面接管键鼠，按 F12 释放。"
+            else text += quick_connect_ ? L"\r\n画面同步光标 · 点击画面接管键鼠，按 F12 释放。"
                                         : L"\r\n点击串流画面进入键鼠测试，按 Esc 退出。";
         }
         if (session_.DesktopControl()) text += hotkey_ ? L"\r\n本机 Ctrl+Alt+F11 停止整桌面控制。"
                                                       : L"\r\n点击断开以停止整桌面控制。";
-        SetWindowTextW(status_, text.c_str());
+        if (text != visible_status_) {
+            SetWindowTextW(status_, text.c_str());
+            visible_status_ = std::move(text);
+        }
     }
 
     void Export() {
@@ -667,7 +816,10 @@ private:
     bool host_;
     bool internet_;
     bool quick_connect_;
-    bool video_cursor_;
+    bool quality_selection_;
+    bool poll_cursor_;
+    bool connect_on_open_;
+    std::stop_token lifetime_;
     p2premote::StreamSession session_;
     HWND window_{};
     HWND screens_{};
@@ -681,9 +833,12 @@ private:
     HWND quality_{};
     HWND stop_{};
     HWND export_{};
+    HWND status_panel_{};
     HWND status_{};
     HWND surface_{};
     HWND placeholder_{};
+    HWND overlay_toggle_{};
+    HWND overlay_{};
     HWND input_pad_window_{};
     InputTestPad input_pad_;
     bool video_visible_{};
@@ -694,7 +849,13 @@ private:
     std::vector<HMONITOR> monitors_;
     StreamStatistics previous_;
     std::wstring visible_code_;
+    std::wstring visible_status_;
+    std::wstring visible_overlay_;
     std::wstring rate_text_;
+    std::wstring up_rate_;
+    std::wstring down_rate_;
+    std::optional<double> presented_fps_;
+    std::optional<double> loss_rate_;
 };
 
 } // namespace

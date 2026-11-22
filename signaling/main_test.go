@@ -83,6 +83,65 @@ func TestInternetWebSocketRoles(t *testing.T) {
 	}
 }
 
+func TestDirectWebSocketEndDistinguishesStopFromInterruption(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		closeHost func(*websocket.Conn) error
+		retryable bool
+	}{
+		{"normal close", func(c *websocket.Conn) error { return c.Close(websocket.StatusNormalClosure, "") }, false},
+		{"transport replaced", func(c *websocket.Conn) error { return c.Close(4001, "") }, true},
+		{"connection lost", func(c *websocket.Conn) error { return c.CloseNow() }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			hostIP := netip.MustParseAddr("192.168.0.32")
+			viewerIP := netip.MustParseAddr("192.168.0.43")
+			h := &hub{directHost: hostIP, directPeer: netip.PrefixFrom(viewerIP, 32)}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ip := viewerIP
+				if r.URL.Path == "/host" {
+					ip = hostIP
+				}
+				r.RemoteAddr = netip.AddrPortFrom(ip, 49500).String()
+				h.serve(w, r)
+			}))
+			defer server.Close()
+			open := func(path, command string) *websocket.Conn {
+				t.Helper()
+				url := "ws" + strings.TrimPrefix(server.URL, "http") + path
+				c, _, err := websocket.Dial(ctx, url, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = c.CloseNow() })
+				if err := write(ctx, c, message{Type: command}); err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			expect := func(c *websocket.Conn, kind string, retryable bool) {
+				t.Helper()
+				got, err := read(ctx, c)
+				if err != nil || got.Type != kind || got.Retryable != retryable {
+					t.Fatalf("expected %s retryable=%v, got %+v (%v)", kind, retryable, got, err)
+				}
+			}
+			expect(open("/viewer", "join_direct"), "error", true)
+			host := open("/host", "listen_direct")
+			expect(host, "ready", false)
+			viewer := open("/viewer", "join_direct")
+			expect(viewer, "waiting", false)
+			expect(host, "request", false)
+			if err := tc.closeHost(host); err != nil {
+				t.Fatal(err)
+			}
+			expect(viewer, "ended", tc.retryable)
+		})
+	}
+}
+
 func TestDirectConnectionRequiresConfiguredPeerAndApproval(t *testing.T) {
 	hostIP := netip.MustParseAddr("192.168.0.43")
 	viewerIP := netip.MustParseAddr("192.168.0.32")
@@ -99,7 +158,7 @@ func TestDirectConnectionRequiresConfiguredPeerAndApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer h.leave(r, host)
+	defer h.leave(r, host, false)
 	if got := <-host.out; got.Type != "ready" || r.expiration != nil {
 		t.Fatal("standby should have no pairing code or expiration")
 	}
@@ -115,13 +174,13 @@ func TestDirectConnectionRequiresConfiguredPeerAndApproval(t *testing.T) {
 	if got := <-viewer.out; got.Type != "waiting" {
 		t.Fatalf("unexpected viewer state without approval: %+v", got)
 	}
-	if h.relay(r, host, message{"offer", "premature offer"}) {
+	if h.relay(r, host, message{Type: "offer", Payload: "premature offer"}) {
 		t.Fatal("offer admitted before approval")
 	}
 	if !h.relay(r, host, message{Type: "accept"}) || (<-viewer.out).Type != "accepted" {
 		t.Fatal("could not approve viewer")
 	}
-	h.leave(r, viewer)
+	h.leave(r, viewer, false)
 	if got := <-host.out; got.Type != "ended" || h.direct != nil {
 		t.Fatal("direct connection did not clear on disconnect")
 	}
@@ -144,7 +203,7 @@ func TestDirectLANAcceptsDifferentViewersOnTheHostSubnet(t *testing.T) {
 		if _, err := h.enter(viewer, message{Type: "join_direct"}); err != nil {
 			t.Fatalf("viewer %s could not join: %v", viewer.ip, err)
 		}
-		h.leave(r, viewer)
+		h.leave(r, viewer, false)
 	}
 }
 
@@ -184,17 +243,17 @@ func TestRelayRequiresHostApproval(t *testing.T) {
 			}
 			send := func(c *websocket.Conn, kind, payload string) {
 				t.Helper()
-				if err := write(ctx, c, message{kind, payload}); err != nil {
+				if err := write(ctx, c, message{Type: kind, Payload: payload}); err != nil {
 					t.Fatal(err)
 				}
 			}
 
 			host := open(message{Type: "create"})
 			code := expect(host, "room").Payload
-			viewer := open(message{"join", code})
+			viewer := open(message{Type: "join", Payload: code})
 			expect(viewer, "waiting")
 			expect(host, "request")
-			expect(open(message{"join", code}), "error")
+			expect(open(message{Type: "join", Payload: code}), "error")
 			if !approved {
 				send(host, "offer", "premature offer")
 				expect(viewer, "ended")
@@ -212,7 +271,7 @@ func TestRelayRequiresHostApproval(t *testing.T) {
 			}
 			_ = viewer.CloseNow()
 			expect(host, "ended")
-			expect(open(message{"join", code}), "error")
+			expect(open(message{Type: "join", Payload: code}), "error")
 		})
 	}
 }

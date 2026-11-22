@@ -24,6 +24,7 @@ class StreamEvents;
 class ScreenSource;
 class RtcSsl;
 class InputChannel;
+class IceTrace;
 
 struct DecodedFrame {
     webrtc::VideoFrame video;
@@ -59,6 +60,8 @@ private:
     void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override;
     void OnIceCandidate(const webrtc::IceCandidate* candidate) override;
     void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState state) override;
+    void OnStandardizedIceConnectionChange(webrtc::PeerConnectionInterface::IceConnectionState state) override;
+    void OnIceSelectedCandidatePairChanged(const webrtc::CandidatePairChangeEvent& event) override;
     void OnConnectionChange(webrtc::PeerConnectionInterface::PeerConnectionState state) override;
     void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
     void OnFrame(const webrtc::VideoFrame& frame) override;
@@ -66,6 +69,7 @@ private:
     bool host_;
     bool trickle_;
     std::shared_ptr<StreamEvents> events_;
+    std::shared_ptr<IceTrace> ice_trace_;
     std::shared_ptr<std::atomic_bool> hardware_encoder_ = std::make_shared<std::atomic_bool>(false);
     std::unique_ptr<RtcSsl> ssl_;
     std::unique_ptr<webrtc::Thread> signaling_;

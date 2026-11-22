@@ -41,13 +41,13 @@ void Write(const DataWriter& writer, std::stop_token stop, const std::string& ki
 } // namespace
 
 SignalSocket::SignalSocket(std::shared_ptr<StreamEvents> events, std::wstring endpoint, std::string kind, std::string payload,
-                           std::wstring token)
+                           std::wstring token, bool managed)
     : events_(std::move(events)), worker_([this, endpoint = std::move(endpoint), kind = std::move(kind),
-                                          payload = std::move(payload), token = std::move(token)](std::stop_token stop) {
+                                          payload = std::move(payload), token = std::move(token), managed](std::stop_token stop) {
         try {
             winrt::init_apartment();
             try {
-                Run(stop, endpoint, kind, payload, token);
+                Run(stop, endpoint, kind, payload, token, managed);
             } catch (...) {
                 winrt::uninit_apartment();
                 throw;
@@ -55,11 +55,11 @@ SignalSocket::SignalSocket(std::shared_ptr<StreamEvents> events, std::wstring en
             winrt::uninit_apartment();
         } catch (const winrt::hresult_error& error) {
             if (!stop.stop_requested()) {
-                events_->Push({StreamEventType::error, {}, "信令连接失败 · " + winrt::to_string(error.message())});
+                events_->Push({StreamEventType::signal_lost, {}, "信令连接失败 · " + winrt::to_string(error.message())});
             }
         } catch (const std::exception& error) {
             if (!stop.stop_requested()) {
-                events_->Push({StreamEventType::error, {}, error.what()});
+                events_->Push({StreamEventType::signal_lost, {}, error.what()});
             }
         }
     }) {}
@@ -76,49 +76,64 @@ void SignalSocket::Send(std::string kind, std::string payload) {
 }
 
 void SignalSocket::Run(std::stop_token stop, const std::wstring& endpoint, const std::string& kind,
-                       const std::string& payload, const std::wstring& token) {
+                       const std::string& payload, const std::wstring& token, bool managed) {
     MessageWebSocket socket;
     const Uri address(endpoint);
     if (!token.empty()) {
-        if (address.SchemeName() != L"wss") throw std::invalid_argument("公网访问密钥只能通过 WSS 发送");
+        const bool local_account_server = managed && address.SchemeName() == L"ws" && address.Host() == L"127.0.0.1";
+        if (address.SchemeName() != L"wss" && !local_account_server) {
+            throw std::invalid_argument("公网访问密钥只能通过 WSS 发送");
+        }
         socket.SetRequestHeader(L"Authorization", L"Bearer " + token);
     }
     socket.Control().MessageType(SocketMessageType::Utf8);
     socket.Control().MaxMessageSize(256 * 1024);
     const auto received = socket.MessageReceived(winrt::auto_revoke,
         [events = events_](const MessageWebSocket&, const MessageWebSocketMessageReceivedEventArgs& args) {
+            winrt::hstring text;
             try {
                 auto reader = args.GetDataReader();
-                const auto json = JsonObject::Parse(reader.ReadString(reader.UnconsumedBufferLength()));
+                text = reader.ReadString(reader.UnconsumedBufferLength());
+            } catch (const winrt::hresult_error&) {
+                events->Push({StreamEventType::signal_lost, {}, "读取信令连接失败"});
+                return;
+            }
+            if (text.empty()) return;
+            try {
+                const auto json = JsonObject::Parse(text);
                 events->Push({StreamEventType::signal, winrt::to_string(json.GetNamedString(L"type")),
-                    winrt::to_string(json.GetNamedString(L"payload", L""))});
+                    winrt::to_string(json.GetNamedString(L"payload", L"")), {}, {},
+                    json.GetNamedBoolean(L"retryable", false)});
             } catch (...) {
                 events->Push({StreamEventType::error, {}, "收到无效的信令消息"});
             }
         });
     const auto closed = socket.Closed(winrt::auto_revoke,
         [events = events_](const IWebSocket&, const WebSocketClosedEventArgs&) {
-            events->Push({StreamEventType::closed, {}, {}});
+            events->Push({StreamEventType::signal_lost, {}, "信令连接已断开"});
         });
 
     const auto connect_timeout = token.empty() ? std::chrono::seconds(5) : std::chrono::seconds(15);
     Await(socket.ConnectAsync(address), stop, connect_timeout);
     const DataWriter writer(socket.OutputStream());
-    if (!stop.stop_requested()) {
-        Write(writer, stop, kind, payload);
-    }
-    for (;;) {
-        std::unique_lock lock(mutex_);
-        if (!changed_.wait(lock, stop, [this] { return !pending_.empty(); }) || stop.stop_requested()) {
-            break;
+    try {
+        if (!stop.stop_requested()) {
+            Write(writer, stop, kind, payload);
         }
-        auto next = std::move(pending_.front());
-        pending_.pop_front();
-        lock.unlock();
-        Write(writer, stop, next.first, next.second);
+        for (;;) {
+            std::unique_lock lock(mutex_);
+            if (!changed_.wait(lock, stop, [this] { return !pending_.empty(); }) || stop.stop_requested()) break;
+            auto next = std::move(pending_.front());
+            pending_.pop_front();
+            lock.unlock();
+            Write(writer, stop, next.first, next.second);
+        }
+    } catch (...) {
+        if (!stop.stop_requested()) throw;
     }
     writer.DetachStream();
-    socket.Close(1000, L"");
+    // The server distinguishes an explicit end from a transport being replaced.
+    socket.Close(end_session_.load() ? 1000 : 4001, L"");
 }
 
 } // namespace p2premote

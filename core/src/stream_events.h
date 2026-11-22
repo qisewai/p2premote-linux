@@ -3,8 +3,7 @@
 #include "desktop_input.h"
 #include "latency_trace.h"
 
-#include <p2premote/connection_options.h>
-#include <p2premote/input_protocol.h>
+#include <p2premote/stream_session.h>
 
 #include <windows.h>
 #include <winrt/base.h>
@@ -37,15 +36,21 @@ struct RtcCounters {
     std::uint64_t sent_packets{};
     std::uint64_t bytes_sent{};
     std::uint64_t bytes_received{};
+    std::uint64_t video_packets_received{};
+    std::int64_t video_packets_lost{};
     std::string video_codec;
     double jitter_buffer_seconds{};
     double packet_send_queue_seconds{};
     IcePath ice_path{};
+    std::string ice_protocol;
+    std::string relay_protocol;
     std::optional<double> ice_rtt_ms;
     std::optional<IceCheckStats> ice_checks;
+    IceDiagnostics ice_diagnostics;
 };
 
-enum class StreamEventType { signal, closed, error, gathered, local_set, remote_set, ice_candidate, connected, stats, input_ready, input, cursor };
+enum class StreamEventType { signal, signal_lost, media_lost, error, gathered, local_set, remote_set,
+    ice_candidate, connected, stats, input_ready, input, cursor };
 
 struct StreamEvent {
     StreamEventType type;
@@ -53,6 +58,7 @@ struct StreamEvent {
     std::string payload;
     RtcCounters counters{};
     InputPacket input{};
+    bool retryable{};
 };
 
 class StreamEvents {

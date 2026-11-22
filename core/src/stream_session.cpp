@@ -29,6 +29,9 @@
 namespace p2premote {
 namespace {
 
+constexpr ULONGLONG reconnect_window_ms = 30'000;
+constexpr ULONGLONG close_grace_ms = 1'000;
+
 struct VideoLimits {
     int width;
     int height;
@@ -130,6 +133,7 @@ struct ActiveStream {
     StreamQuality last_video_quality{};
     std::int64_t last_submit_qpc{};
     std::int64_t last_change_qpc{};
+    std::int64_t quality_refresh_due{};
     unsigned refinement_left{};
     std::uint64_t idle_repeats{};
     bool dynamic_cadence{};
@@ -148,6 +152,8 @@ struct ActiveStream {
     bool dxgi_capture{};
     bool dxgi_attempted{};
     bool redraw{};
+    bool host_registered{};
+    ULONGLONG transport_close_deadline{};
     bool sdp_sent{};
     bool remote_sdp_set{};
     std::vector<std::string> local_ice;
@@ -264,7 +270,18 @@ const char* IcePathName(IcePath path) {
 } // namespace
 
 struct StreamSession::Impl {
-    Impl(bool is_host, ConnectionOptions options) : host(is_host), connection(std::move(options)) {
+    struct Reconnect {
+        HMONITOR monitor{};
+        HWND surface{};
+        StreamFrameRate frame_rate{};
+        ULONGLONG deadline{};
+        ULONGLONG next_attempt{};
+        unsigned attempts{};
+        bool desktop{};
+    };
+
+    Impl(bool is_host, ConnectionOptions options) : host(is_host), connection(std::move(options)),
+        requested_quality(connection.mode == ConnectionMode::lan_direct ? StreamQuality::p1080 : StreamQuality::p720) {
         if (connection.signal_url.empty()) connection.signal_url = L"ws://127.0.0.1:8787/signal";
     }
 
@@ -287,8 +304,9 @@ struct StreamSession::Impl {
     HMONITOR capture_monitor{};
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item{nullptr};
     std::unique_ptr<ActiveStream> active;
+    std::optional<Reconnect> reconnect;
     StreamStatistics stats;
-    StreamQuality requested_quality{StreamQuality::p1080};
+    StreamQuality requested_quality;
     std::int64_t start{};
     double capture_to_submit_total{};
     double draw_to_present_total{};
@@ -301,20 +319,24 @@ StreamSession::StreamSession(bool host, ConnectionOptions connection)
 StreamSession::~StreamSession() = default;
 
 void StreamSession::Start(HMONITOR monitor, HWND surface, const std::wstring& code, StreamFrameRate frame_rate) {
-    if (impl_->active) {
-        return;
-    }
+    if (impl_->active) return;
+    impl_->reconnect.reset();
+    Open(monitor, surface, code, frame_rate);
+}
+
+void StreamSession::Open(HMONITOR monitor, HWND surface, const std::wstring& code, StreamFrameRate frame_rate) {
     const auto& connection = impl_->connection;
     auto trace = connection.latency_trace_dir.empty() ? nullptr
         : std::make_shared<LatencyTrace>(connection.latency_trace_dir, impl_->host);
     auto active = std::make_unique<ActiveStream>(std::move(trace));
     active->monitor = monitor;
     active->surface = surface;
-    active->dynamic_cadence = impl_->host && connection.mode == ConnectionMode::lan_direct && !connection.fixed_cadence;
+    active->dynamic_cadence = impl_->host && connection.DynamicCadenceEnabled();
     const auto target_fps = static_cast<unsigned>(frame_rate);
     active->capture_interval = impl_->host && NeedsCaptureRateLimit(monitor, target_fps) ? QpcFrequency() / target_fps : 0;
+    const auto& target = connection.managed && !impl_->host ? connection.remote_device : code;
     active->signal = std::make_unique<SignalSocket>(active->events, connection.signal_url,
-        InitialSignal(connection.mode, impl_->host), winrt::to_string(code), connection.access_token);
+        InitialSignal(connection.mode, impl_->host), winrt::to_string(target), connection.access_token, connection.managed);
     impl_->samples.clear();
     impl_->stats = {};
     impl_->stats.target_fps = impl_->host ? target_fps : 0;
@@ -351,6 +373,11 @@ void StreamSession::SetQuality(StreamQuality quality) noexcept {
 }
 
 void StreamSession::Stop(std::wstring status) {
+    impl_->reconnect.reset();
+    Close(std::move(status), true);
+}
+
+void StreamSession::Close(std::wstring status, bool intentional) {
     if (auto active = std::move(impl_->active)) {
         if (impl_->state == StreamState::negotiating && active->ice_checks) {
             const auto& checks = *active->ice_checks;
@@ -363,12 +390,33 @@ void StreamSession::Stop(std::wstring status) {
         active->desktop.reset();
         active->capture.reset();
         active->pixels.reset();
+        if (intentional) active->signal->EndSession();
         active->signal.reset();
         active->rtc.reset();
     }
     impl_->state = StreamState::stopped;
     impl_->detail = std::move(status);
     impl_->code.clear();
+}
+
+void StreamSession::Recover(std::wstring status) {
+    auto& retry = impl_->reconnect;
+    const auto& active = *impl_->active;
+    if ((impl_->connection.mode != ConnectionMode::lan_direct && !impl_->connection.managed)
+        || (!retry && impl_->state != StreamState::streaming && !active.host_registered)) {
+        Close(std::move(status), false);
+        return;
+    }
+    const auto now = GetTickCount64();
+    if (!retry) {
+        retry.emplace(Impl::Reconnect{active.monitor, active.surface,
+            impl_->host ? static_cast<StreamFrameRate>(impl_->stats.target_fps) : StreamFrameRate::fps30,
+            now + reconnect_window_ms, 0, 0, DesktopControl()});
+    }
+    const auto delay_seconds = 1u << std::min(retry->attempts, 2u);
+    retry->next_attempt = now + delay_seconds * 1'000;
+    Close(std::move(status), false);
+    impl_->state = StreamState::reconnecting;
 }
 
 void StreamSession::Resize(bool drawable) noexcept {
@@ -403,16 +451,33 @@ HANDLE StreamSession::PresentEvent() const {
 
 void StreamSession::ProcessEvents() {
     const auto mode = impl_->connection.mode;
+    const auto local_cursor = impl_->connection.SupportsLocalCursor();
     for (const auto& event : impl_->active->events->Drain()) {
         auto& active = *impl_->active;
         switch (event.type) {
-        case StreamEventType::closed:
-            Stop(L"信令连接已断开");
+        case StreamEventType::signal_lost:
+        case StreamEventType::media_lost:
+            if ((mode == ConnectionMode::lan_direct || impl_->connection.managed)
+                && impl_->state == StreamState::streaming) {
+                if (!active.transport_close_deadline) {
+                    // Stop accepting input immediately and let a pending explicit end arrive first.
+                    active.transport_close_deadline = GetTickCount64() + close_grace_ms;
+                    active.events->SetDesktopInput(nullptr);
+                    active.ResetInput();
+                    impl_->detail = winrt::to_hstring(event.payload).c_str();
+                }
+                break;
+            }
+            Recover(winrt::to_hstring(event.payload).c_str());
             return;
         case StreamEventType::error:
             Stop(winrt::to_hstring(event.payload).c_str());
             return;
         case StreamEventType::signal:
+            if (event.retryable && (event.name == "ended" || (event.name == "error" && impl_->reconnect))) {
+                Recover(winrt::to_hstring(event.payload).c_str());
+                return;
+            }
             if (event.name == "ended" && impl_->host && impl_->connection.auto_control) {
                 const auto monitor = active.monitor;
                 const auto frame_rate = static_cast<StreamFrameRate>(impl_->stats.target_fps);
@@ -425,17 +490,20 @@ void StreamSession::ProcessEvents() {
                 return;
             }
             if (impl_->host && mode != ConnectionMode::session_code && impl_->state == StreamState::waiting && event.name == "ready") {
-                impl_->detail = mode == ConnectionMode::internet ? L"等待已配置的公网主控机" : L"等待主控机直连";
+                active.host_registered = true;
+                impl_->reconnect.reset();
+                impl_->detail = impl_->connection.managed ? L"等待同账号设备连接"
+                    : mode == ConnectionMode::internet ? L"等待已配置的公网主控机" : L"等待主控机直连";
                 if (impl_->connection.auto_control) impl_->detail += L" · 自动允许整桌面控制";
             } else if (impl_->host && mode == ConnectionMode::session_code && impl_->state == StreamState::waiting && event.name == "room") {
                 impl_->code = winrt::to_hstring(event.payload).c_str();
                 impl_->detail = L"等待 Viewer 连接（代码 2 分钟内有效）";
             } else if (impl_->host && impl_->state == StreamState::waiting && event.name == "request") {
                 impl_->state = StreamState::approval;
-                if (mode == ConnectionMode::internet) impl_->detail = L"收到已认证的公网请求，请确认授权";
+                if (impl_->connection.auto_control) Approve(StreamInputMode::desktop);
+                else if (mode == ConnectionMode::internet) impl_->detail = L"收到已认证的公网请求，请确认授权";
                 else if (mode == ConnectionMode::lan_direct) {
-                    if (impl_->connection.auto_control) Approve(StreamInputMode::desktop);
-                    else impl_->detail = L"收到直连请求 · " + winrt::to_hstring(event.payload) + L" · 请确认授权";
+                    impl_->detail = L"收到直连请求 · " + winrt::to_hstring(event.payload) + L" · 请确认授权";
                 } else impl_->detail = L"收到观看请求，请确认是否共享所选显示器";
             } else if (!impl_->host && event.name == "waiting" && impl_->state == StreamState::waiting) {
                 impl_->detail = L"等待 Host 确认";
@@ -500,12 +568,24 @@ void StreamSession::ProcessEvents() {
                 }
                 impl_->start = QpcNow();
                 impl_->state = StreamState::streaming;
+                impl_->reconnect.reset();
                 if (active.input_ready) active.events->SetDesktopInput(active.desktop.get());
                 impl_->detail = impl_->host ? active.SharingStatus() : L"正在接收视频";
             }
             break;
         case StreamEventType::stats: {
             const auto& rtc = event.counters;
+            auto& stats = impl_->stats;
+            if (mode == ConnectionMode::internet) {
+                auto& peak = stats.ice_diagnostics ? *stats.ice_diagnostics : stats.ice_diagnostics.emplace();
+                const auto& sample = rtc.ice_diagnostics;
+                peak.local_srflx = std::max(peak.local_srflx, sample.local_srflx);
+                peak.remote_srflx = std::max(peak.remote_srflx, sample.remote_srflx);
+                peak.direct_udp_pairs = std::max(peak.direct_udp_pairs, sample.direct_udp_pairs);
+                peak.direct_udp_succeeded = std::max(peak.direct_udp_succeeded, sample.direct_udp_succeeded);
+                peak.direct_udp_requests = std::max(peak.direct_udp_requests, sample.direct_udp_requests);
+                peak.direct_udp_responses = std::max(peak.direct_udp_responses, sample.direct_udp_responses);
+            }
             if (rtc.ice_checks) {
                 auto& checks = active.ice_checks;
                 if (!checks) checks.emplace();
@@ -515,12 +595,13 @@ void StreamSession::ProcessEvents() {
                 if (!rtc.ice_checks->dtls_state.empty()) checks->dtls_state = rtc.ice_checks->dtls_state;
                 break;
             }
-            auto& stats = impl_->stats;
             stats.encoded = rtc.encoded;
             stats.received = rtc.received;
             stats.decoded = rtc.decoded;
             stats.bytes_sent = rtc.bytes_sent;
             stats.bytes_received = rtc.bytes_received;
+            stats.video_packets_received = rtc.video_packets_received;
+            stats.video_packets_lost = rtc.video_packets_lost;
             if (!rtc.video_codec.empty()) {
                 const auto slash = rtc.video_codec.find('/');
                 stats.video_codec = winrt::to_hstring(rtc.video_codec.substr(slash == std::string::npos ? 0 : slash + 1));
@@ -535,6 +616,8 @@ void StreamSession::ProcessEvents() {
             }
             stats.rtc_frames_dropped = rtc.rtc_frames_dropped;
             stats.ice_path = rtc.ice_path;
+            stats.ice_protocol = rtc.ice_protocol;
+            stats.relay_protocol = rtc.relay_protocol;
             stats.ice_rtt_ms = rtc.ice_rtt_ms;
             if (impl_->state == StreamState::streaming) {
                 if (!impl_->host) stats.decoded_replaced = active.rtc->ReplacedFrames();
@@ -564,7 +647,7 @@ void StreamSession::ProcessEvents() {
             }
             break;
         case StreamEventType::cursor:
-            if (!impl_->host && active.cursor_requested && mode == ConnectionMode::lan_direct) {
+            if (!impl_->host && active.cursor_requested && local_cursor) {
                 DestroyDecodedCursor(std::exchange(active.remote_cursor, DecodeCursor(event.payload)));
                 active.cursor_visible = event.payload.size() != 1;
                 active.cursor_separate = true;
@@ -576,17 +659,18 @@ void StreamSession::ProcessEvents() {
             }
             const auto& input = event.input;
             if (input.kind == InputKind::cursor_ready) {
-                if (mode == ConnectionMode::lan_direct && active.input_mode == StreamInputMode::desktop) {
+                if (local_cursor && active.input_mode == StreamInputMode::desktop) {
                     active.cursor_requested = true;
                 }
                 break;
             }
             if (input.kind == InputKind::set_quality) {
-                if (mode != ConnectionMode::lan_direct) break;
+                if (!impl_->connection.SupportsQualitySelection()) break;
                 const auto quality = static_cast<StreamQuality>(input.code);
                 if (quality != active.quality) {
                     if (active.rtc->SetVideoBitrate(LimitsFor(quality).bitrate)) {
                         active.quality = quality;
+                        if (impl_->connection.managed) active.quality_refresh_due = QpcNow() + QpcFrequency();
                         impl_->detail = active.SharingStatus();
                     } else {
                         impl_->detail = L"正在共享所选显示器 · 画质调整失败";
@@ -606,7 +690,8 @@ void StreamSession::ProcessEvents() {
 }
 
 bool StreamSession::InputReady() const noexcept {
-    return impl_->state == StreamState::streaming && impl_->active && impl_->active->input_ready;
+    return impl_->state == StreamState::streaming && impl_->active && impl_->active->input_ready
+        && !impl_->active->transport_close_deadline;
 }
 
 bool StreamSession::LocalCursor(HCURSOR& cursor) const noexcept {
@@ -618,7 +703,7 @@ bool StreamSession::LocalCursor(HCURSOR& cursor) const noexcept {
 }
 
 void StreamSession::PollCursor() {
-    if (impl_->connection.mode != ConnectionMode::lan_direct || !InputReady()) return;
+    if (!impl_->connection.SupportsLocalCursor() || !InputReady()) return;
     auto& active = *impl_->active;
     if (!impl_->host) {
         if (!impl_->connection.video_cursor && !active.cursor_requested) {
@@ -662,7 +747,8 @@ void StreamSession::PollCursor() {
 }
 
 bool StreamSession::DesktopControl() const noexcept {
-    return impl_->active && impl_->active->input_mode == StreamInputMode::desktop;
+    return (impl_->active && impl_->active->input_mode == StreamInputMode::desktop)
+        || (impl_->reconnect && impl_->reconnect->desktop);
 }
 
 bool StreamSession::SubmitInput(InputPacket input) {
@@ -737,6 +823,7 @@ void StreamSession::Capture() {
         active.last_video_quality = active.quality;
         active.last_submit_qpc = QpcNow();
     }
+    active.quality_refresh_due = 0;
     if (trace) trace->Record("frame_submitted", frame->metadata.frame_id);
     active.rtc->Submit(video);
 
@@ -756,7 +843,7 @@ void StreamSession::Present() {
     const auto buffer = frame ? frame->video.video_frame_buffer() : active.last_native;
     bool direct = false;
     if (buffer) {
-        const auto limits = LimitsFor(impl_->connection.mode == ConnectionMode::lan_direct
+        const auto limits = LimitsFor(impl_->connection.SupportsQualitySelection()
             ? StreamQuality::p1440 : StreamQuality::p720);
         const auto width = buffer->width();
         const auto height = buffer->height();
@@ -809,17 +896,44 @@ void StreamSession::Present() {
 }
 
 void StreamSession::Tick() {
+    const auto now_ms = GetTickCount64();
+    if (auto& retry = impl_->reconnect) {
+        if (now_ms >= retry->deadline) {
+            Stop(L"自动重连超时 · " + impl_->detail);
+            return;
+        }
+        if (impl_->state == StreamState::reconnecting) {
+            if (now_ms >= retry->next_attempt) {
+                ++retry->attempts;
+                Open(retry->monitor, retry->surface, {}, retry->frame_rate);
+            }
+            return;
+        }
+    }
     if (impl_->state == StreamState::negotiating) {
         const auto internet = impl_->connection.mode == ConnectionMode::internet;
         const auto timeout_seconds = internet ? 25 : 15;
         if (QpcNow() - impl_->active->negotiation_start > QpcFrequency() * timeout_seconds) {
-            Stop(L"WebRTC 建连超时");
+            Recover(L"WebRTC 建连超时");
         } else if (internet) {
             impl_->active->rtc->RequestStats(true);
         }
     } else if (impl_->state == StreamState::streaming) {
         auto& active = *impl_->active;
+        if (active.transport_close_deadline) {
+            if (now_ms >= active.transport_close_deadline) Recover(impl_->detail);
+            return;
+        }
         const auto now = QpcNow();
+        if (active.quality_refresh_due && now >= active.quality_refresh_due) {
+            active.quality_refresh_due = 0;
+            // WGC may be quiet on a static desktop. A new capture session delivers its current image.
+            try {
+                impl_->StartWgc(active, !active.cursor_separate);
+            } catch (const winrt::hresult_error&) {
+                // Keep the existing capture. Its next frame will use the new quality.
+            }
+        }
         if (active.last_video && active.last_video_quality == active.quality
             && now - active.last_submit_qpc >= QpcFrequency() * 9 / 10) {
             auto video = *active.last_video;
@@ -832,7 +946,7 @@ void StreamSession::Tick() {
             active.rtc->Submit(video);
         }
         const auto requested = impl_->requested_quality;
-        if (impl_->connection.mode == ConnectionMode::lan_direct && !impl_->host && active.quality != requested
+        if (impl_->connection.SupportsQualitySelection() && !impl_->host && active.quality != requested
                 && SubmitInput({InputKind::set_quality, static_cast<std::uint16_t>(requested)})) {
             active.quality = requested;
         }
@@ -841,7 +955,17 @@ void StreamSession::Tick() {
 }
 
 StreamState StreamSession::State() const noexcept { return impl_->state; }
-std::wstring StreamSession::Status() const { return impl_->detail; }
+std::wstring StreamSession::Status() const {
+    if (const auto& retry = impl_->reconnect) {
+        if (impl_->state == StreamState::reconnecting) {
+            const auto now = GetTickCount64();
+            const auto seconds = retry->next_attempt > now ? (retry->next_attempt - now + 999) / 1'000 : 0;
+            return L"将在 " + std::to_wstring(seconds) + L" 秒后重连 · " + impl_->detail;
+        }
+        return L"自动重连第 " + std::to_wstring(retry->attempts) + L" 次 · " + impl_->detail;
+    }
+    return impl_->detail;
+}
 std::wstring StreamSession::Code() const { return impl_->code; }
 StreamStatistics StreamSession::Statistics() const { return impl_->stats; }
 
@@ -851,9 +975,12 @@ void StreamSession::ExportCsv(const std::filesystem::path& path) const {
     csv << "seconds,width,height,captured,submitted,encoded,received,decoded,presented,"
            "capture_to_submit_mean_ms,encode_mean_ms,decode_mean_ms,draw_to_present_mean_ms,"
            "target_fps,packet_send_queue_mean_ms,jitter_buffer_mean_ms,decoded_frame_wait_mean_ms,"
-           "rtc_frames_dropped,decoded_replaced,ice_path,ice_rtt_ms\r\n";
+           "rtc_frames_dropped,decoded_replaced,ice_path,ice_rtt_ms,ice_protocol,relay_protocol,"
+           "video_packets_received,video_packets_lost,ice_local_srflx_peak,ice_remote_srflx_peak,"
+           "ice_direct_udp_pairs_peak,ice_direct_udp_succeeded_peak,ice_direct_udp_requests_peak,"
+           "ice_direct_udp_responses_peak\r\n";
     csv << std::fixed << std::setprecision(3);
-    for (const auto& row : impl_->samples) {
+    const auto write_row = [&csv](const StreamStatistics& row) {
         csv << row.seconds << ',' << row.width << ',' << row.height << ',' << row.captured << ',' << row.submitted
             << ',' << row.encoded << ',' << row.received << ',' << row.decoded << ',' << row.presented << ','
             << row.capture_to_submit_ms << ',' << row.encode_ms << ',' << row.decode_ms << ','
@@ -867,8 +994,18 @@ void StreamSession::ExportCsv(const std::filesystem::path& path) const {
         if (row.decoded_frame_wait_ms) csv << *row.decoded_frame_wait_ms;
         csv << ',' << row.rtc_frames_dropped << ',' << row.decoded_replaced << ',' << IcePathName(row.ice_path) << ',';
         if (row.ice_rtt_ms) csv << *row.ice_rtt_ms;
+        csv << ',' << row.ice_protocol << ',' << row.relay_protocol << ','
+            << row.video_packets_received << ',' << row.video_packets_lost;
+        if (const auto& ice = row.ice_diagnostics) {
+            csv << ',' << ice->local_srflx << ',' << ice->remote_srflx << ',' << ice->direct_udp_pairs
+                << ',' << ice->direct_udp_succeeded << ',' << ice->direct_udp_requests << ',' << ice->direct_udp_responses;
+        } else {
+            csv << ",,,,,,";
+        }
         csv << "\r\n";
-    }
+    };
+    for (const auto& sample : impl_->samples) write_row(sample);
+    if (impl_->samples.empty() && impl_->stats.ice_diagnostics) write_row(impl_->stats);
     csv.close();
     if (!csv) {
         throw std::runtime_error("无法写入串流统计 CSV");

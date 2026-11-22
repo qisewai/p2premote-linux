@@ -63,6 +63,12 @@ if(P2PREMOTE_BUILD_STREAMING)
     target_link_libraries(p2premote_viewer PRIVATE stream_window)
     target_compile_options(p2premote_viewer PRIVATE /W4 /permissive- /utf-8)
     list(APPEND gui_targets p2premote_viewer)
+
+    add_executable(p2premote WIN32 viewer/account_main.cpp viewer/account_api.cpp)
+    include(cmake/curl-target.cmake)
+    target_link_libraries(p2premote PRIVATE stream_window advapi32 windowsapp CURL::libcurl)
+    target_compile_options(p2premote PRIVATE /W4 /permissive- /utf-8)
+    list(APPEND gui_targets p2premote)
 endif()
 
 if(P2PREMOTE_BUILD_WEBRTC_PROBE)
