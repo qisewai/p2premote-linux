@@ -260,6 +260,30 @@ Host 可以用 `--capture-dxgi` 对照 DXGI Desktop Duplication。局域网 View
 
 仅测 STUN 可运行 `p2premote_nat_probe.exe -discover-only`。用 `-stun 103.236.93.69:23969` 只测西安节点，用 `-bind 192.168.0.43:0` 绑定本机指定 IPv4 地址，用 `-duration 60s` 延长探测。使用 Go 1.23 或更新版本，在 `signaling` 目录运行 `go build -o ../out/p2premote_nat_probe.exe ./cmd/natprobe` 即可构建。
 
+### MiniRTC 双端数据回环
+
+实验分支使用 CrossDesk v1.7.0 固定的 MiniRTC `f5b53e920db0713b456e23af6a0fe9907d94a612`。回环程序使用该版本的原生 ICE、DTLS-SRTP 和数据流 API，记录实际直连／中继路径、路径变化、匹配回复数和最低应用往返时间。
+
+从仓库根目录使用 MSVC x64 和 Xmake 3.1.1 构建。`Build.ps1` 会把源码和构建产物放在 `out`。如遇 Xmake 的 Strawberry Perl 安装问题，可以用 `-Perl` 指定便携版 Strawberry Perl 的 `perl.exe`。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/minirtc_probe/Build.ps1
+Push-Location signaling
+go build -o ../out/minirtc-probe/minirtcsignal.exe ./cmd/minirtcsignal
+Pop-Location
+```
+
+运行 `out\minirtc-probe\minirtcsignal.exe -out out\minirtc-probe`，记录输出中的 `SIGNAL` 和 `STATE_DIR`。信令只监听 `127.0.0.1`，默认向客户端下发西安 STUN。它会生成本次测试的 `host.txt`、`viewer.txt` 和 `ca.pem`。下面用 `47000` 代指 `SIGNAL` 中的端口，用 `SESSION` 代指 `STATE_DIR`。
+
+```powershell
+out\minirtc-probe\p2premote_minirtc_probe.exe host wss://127.0.0.1:47000/signal SESSION\host.txt SESSION\ca.pem direct 20
+out\minirtc-probe\p2premote_minirtc_probe.exe viewer wss://127.0.0.1:47000/signal SESSION\viewer.txt SESSION\ca.pem direct 20
+```
+
+双机时用 SSH 反向端口转发把主控端的本地 WSS 端口接到信令服务。把探测程序、`viewer.txt` 和 `ca.pem` 放到主控机，主控端使用它本机的转发端口。转发承载信令，MiniRTC 在两台电脑间自行建立数据流。程序只在自身进程中加载实验 CA 并校验信令主机名或 IP。
+
+测试自动中继时，给信令增加 `-turn-file <JSON>`，字段为 `urls`、`username`、`credential` 和 Unix 秒 `expires_at`，并把两端的 `direct` 改为 `auto`。可以用 `-stun 103.236.93.69:23969,179.253.242.112:3478` 比较两个 STUN 节点看到的映射。对照 `ROUTE`、`RESULT` 行和 `logs-host`、`logs-viewer` 下的候选对日志。结束后关闭信令并删除两份测试身份文件。分发链接 MiniRTC 的二进制时参照其 [许可和第三方声明](https://github.com/kunkundi/minirtc/blob/f5b53e920db0713b456e23af6a0fe9907d94a612/THIRD_PARTY_NOTICES.md)。
+
 ## 计时口径
 
 - `source_qpc` 保留 WGC 给出的合成帧时间。`capture_qpc` 记录应用从帧池取到帧的时间，用作应用内计时起点。`capture_ready_qpc` 标记应用拿到帧纹理。`draw_begin_qpc` 到 `submit_qpc` 包含交换链调整、GPU 纹理复制和绘制指令提交的调用耗时。[WGC 帧时间戳文档](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframe.systemrelativetime)
