@@ -9,6 +9,9 @@
 #include "rtc_call.h"
 #include "signal_socket.h"
 #include "stream_events.h"
+#ifdef P2PREMOTE_HAVE_MINIRTC
+#include "minirtc_call.h"
+#endif
 
 #include "api/video/i420_buffer.h"
 #include "api/make_ref_counted.h"
@@ -31,20 +34,29 @@ namespace {
 
 constexpr ULONGLONG reconnect_window_ms = 30'000;
 constexpr ULONGLONG close_grace_ms = 1'000;
+constexpr ULONGLONG video_settings_timeout_ms = 3'000;
 
 struct VideoLimits {
     int width;
     int height;
-    int bitrate;
 };
 
 constexpr VideoLimits LimitsFor(StreamQuality quality) {
     switch (quality) {
-    case StreamQuality::p1440: return {2560, 1440, 16'000'000};
-    case StreamQuality::p1080: return {1920, 1080, 8'000'000};
-    case StreamQuality::p720: return {1280, 720, 4'000'000};
+    case StreamQuality::p1440: return {2560, 1440};
+    case StreamQuality::p1080: return {1920, 1080};
+    case StreamQuality::p720: return {1280, 720};
     }
-    return {1280, 720, 4'000'000};
+    return {1280, 720};
+}
+
+constexpr int LegacyVideoBitrate(StreamQuality quality) {
+    switch (quality) {
+    case StreamQuality::p720: return VideoBitrateLimit(VideoBitratePreset::economy);
+    case StreamQuality::p1080: return VideoBitrateLimit(VideoBitratePreset::automatic);
+    case StreamQuality::p1440: return VideoBitrateLimit(VideoBitratePreset::detail);
+    }
+    return VideoBitrateLimit(VideoBitratePreset::economy);
 }
 
 bool NeedsCaptureRateLimit(HMONITOR monitor, unsigned target_fps) {
@@ -113,6 +125,11 @@ private:
 };
 
 struct ActiveStream {
+    struct VideoRequest {
+        InputPacket packet;
+        ULONGLONG deadline;
+        bool retried{};
+    };
     explicit ActiveStream(std::shared_ptr<LatencyTrace> trace)
         : events(std::make_shared<StreamEvents>(std::move(trace))) {}
 
@@ -123,7 +140,7 @@ struct ActiveStream {
 
     std::shared_ptr<StreamEvents> events;
     std::unique_ptr<SignalSocket> signal;
-    std::unique_ptr<RtcCall> rtc;
+    std::unique_ptr<MediaCall> rtc;
     std::unique_ptr<DesktopInput> desktop;
     winrt::com_ptr<ID3D11Device> device;
     std::unique_ptr<IVideoCapturer> capture;
@@ -156,11 +173,17 @@ struct ActiveStream {
     ULONGLONG transport_close_deadline{};
     bool sdp_sent{};
     bool remote_sdp_set{};
+    bool minirtc_supported{};
+    bool minirtc{};
     std::vector<std::string> local_ice;
     std::vector<std::string> remote_ice;
     std::optional<IceCheckStats> ice_checks;
     // Start at 720p so older Viewers can decode the stream before any quality request.
     StreamQuality quality{StreamQuality::p720};
+    ULONGLONG video_probe_deadline{};
+    bool legacy_settings_sent{};
+    std::optional<VideoRequest> video_request;
+    std::optional<std::pair<StreamQuality, VideoBitratePreset>> rejected_video_settings;
     StreamInputMode input_mode{};
     bool input_ready{};
     bool cursor_requested{};
@@ -172,6 +195,8 @@ struct ActiveStream {
     std::uint32_t outgoing_input_sequence{};
     InputReceiveState input_state;
     std::vector<InputPacket> input;
+
+    RtcCall& WebRtc() { return static_cast<RtcCall&>(*rtc); }
 
     void StartFrameComparison() {
         if (!dynamic_cadence) return;
@@ -281,7 +306,7 @@ struct StreamSession::Impl {
     };
 
     Impl(bool is_host, ConnectionOptions options) : host(is_host), connection(std::move(options)),
-        requested_quality(connection.mode == ConnectionMode::lan_direct ? StreamQuality::p1080 : StreamQuality::p720) {
+        requested_quality(connection.SupportsQualitySelection() ? StreamQuality::p1080 : StreamQuality::p720) {
         if (connection.signal_url.empty()) connection.signal_url = L"ws://127.0.0.1:8787/signal";
     }
 
@@ -293,6 +318,19 @@ struct StreamSession::Impl {
         stream.capture = StartMonitorCapture(capture_item, stream.device.get(), capture_cursor);
         stream.dxgi_capture = false;
         stream.next_capture = 0;
+    }
+
+    bool ApplyVideoSettings(ActiveStream& stream, StreamQuality resolution, int bitrate) {
+        if (stats.video_bitrate_limit_bps != bitrate) {
+            if (!stream.rtc->SetVideoBitrate(bitrate)) return false;
+            stats.video_bitrate_limit_bps = bitrate;
+        }
+        if (stream.quality != resolution) {
+            stream.quality = resolution;
+            if (!stream.dxgi_capture) stream.quality_refresh_due = QpcNow() + QpcFrequency();
+        }
+        detail = stream.SharingStatus();
+        return true;
     }
 
     bool host;
@@ -307,6 +345,7 @@ struct StreamSession::Impl {
     std::optional<Reconnect> reconnect;
     StreamStatistics stats;
     StreamQuality requested_quality;
+    VideoBitratePreset requested_bitrate{VideoBitratePreset::automatic};
     std::int64_t start{};
     double capture_to_submit_total{};
     double draw_to_present_total{};
@@ -335,8 +374,12 @@ void StreamSession::Open(HMONITOR monitor, HWND surface, const std::wstring& cod
     const auto target_fps = static_cast<unsigned>(frame_rate);
     active->capture_interval = impl_->host && NeedsCaptureRateLimit(monitor, target_fps) ? QpcFrequency() / target_fps : 0;
     const auto& target = connection.managed && !impl_->host ? connection.remote_device : code;
+#ifdef P2PREMOTE_HAVE_MINIRTC
+    active->minirtc_supported = connection.managed && MiniRtcCall::Available(connection);
+#endif
     active->signal = std::make_unique<SignalSocket>(active->events, connection.signal_url,
-        InitialSignal(connection.mode, impl_->host), winrt::to_string(target), connection.access_token, connection.managed);
+        InitialSignal(connection.mode, impl_->host), winrt::to_string(target), connection.access_token,
+        connection.managed, active->minirtc_supported);
     impl_->samples.clear();
     impl_->stats = {};
     impl_->stats.target_fps = impl_->host ? target_fps : 0;
@@ -358,18 +401,80 @@ void StreamSession::Approve(StreamInputMode input) {
     }
     active.input_mode = input;
     if (input == StreamInputMode::desktop) active.desktop = std::make_unique<DesktopInput>(active.monitor, active.events->Trace().get());
-    if (impl_->connection.hardware_video) active.device = CreateD3d11Device(true);
-    active.rtc = std::make_unique<RtcCall>(
-        true, active.events, impl_->connection, input != StreamInputMode::view_only, impl_->stats.target_fps, active.device.get());
     active.negotiation_start = QpcNow();
     impl_->state = StreamState::negotiating;
     impl_->detail = L"已授权，正在建立视频连接";
+    const bool allow_input = input != StreamInputMode::view_only;
+#ifdef P2PREMOTE_HAVE_MINIRTC
+    if (active.minirtc) {
+        active.rtc = std::make_unique<MiniRtcCall>(true, active.events, impl_->connection, allow_input,
+            impl_->stats.target_fps);
+        active.signal->Send("accept", allow_input ? "control" : "view", true);
+        return;
+    }
+#endif
+    if (impl_->connection.hardware_video) active.device = CreateD3d11Device(true);
+    active.rtc = std::make_unique<RtcCall>(
+        true, active.events, impl_->connection, allow_input, impl_->stats.target_fps, active.device.get());
     active.signal->Send("accept");
-    active.rtc->SetLocal();
+    active.WebRtc().SetLocal();
 }
 
-void StreamSession::SetQuality(StreamQuality quality) noexcept {
+void StreamSession::SetQuality(StreamQuality quality) {
     impl_->requested_quality = quality;
+    if (impl_->active) impl_->active->rejected_video_settings.reset();
+    UpdateVideoSettings();
+}
+
+void StreamSession::SetVideoBitratePreset(VideoBitratePreset preset) {
+    impl_->requested_bitrate = preset;
+    if (impl_->active) impl_->active->rejected_video_settings.reset();
+    UpdateVideoSettings();
+}
+
+void StreamSession::UpdateVideoSettings() {
+    if (impl_->host || impl_->state != StreamState::streaming || !impl_->connection.SupportsQualitySelection()) return;
+    auto& active = *impl_->active;
+    if (active.transport_close_deadline) return;
+    auto& stats = impl_->stats;
+    const auto now = GetTickCount64();
+    const auto resolution = impl_->requested_quality;
+    const auto preset = impl_->requested_bitrate;
+
+    if (stats.video_settings_mode == VideoSettingsMode::detecting) {
+        if (!active.video_probe_deadline) active.video_probe_deadline = now + video_settings_timeout_ms;
+        if (now >= active.video_probe_deadline) {
+            stats.video_settings_mode = VideoSettingsMode::legacy;
+            active.video_request.reset();
+        }
+    }
+    if (stats.video_settings_mode == VideoSettingsMode::legacy) {
+        if ((!active.legacy_settings_sent || active.quality != resolution)
+                && SubmitInput({InputKind::set_quality, static_cast<std::uint16_t>(resolution)})) {
+            active.legacy_settings_sent = true;
+            active.quality = resolution;
+        }
+        return;
+    }
+    if (active.video_request) {
+        auto& request = *active.video_request;
+        if (now < request.deadline) {
+            if (!request.retried && now + video_settings_timeout_ms / 2 >= request.deadline) {
+                request.retried = active.rtc->SendVideoSettings(request.packet);
+            }
+            return;
+        }
+        active.rejected_video_settings = std::pair{static_cast<StreamQuality>(request.packet.code),
+            static_cast<VideoBitratePreset>(request.packet.x)};
+        active.video_request.reset();
+        impl_->detail = L"画质设置未获确认";
+    }
+    if ((active.quality == resolution && stats.video_bitrate_limit_bps == VideoBitrateLimit(preset))
+            || active.rejected_video_settings == std::pair{resolution, preset}) return;
+
+    const InputPacket request{InputKind::set_video_settings, static_cast<std::uint16_t>(resolution),
+        static_cast<std::uint16_t>(preset), 0, ++active.outgoing_input_sequence, now};
+    if (active.rtc->SendVideoSettings(request)) active.video_request = ActiveStream::VideoRequest{request, now + video_settings_timeout_ms};
 }
 
 void StreamSession::Stop(std::wstring status) {
@@ -500,6 +605,7 @@ void StreamSession::ProcessEvents() {
                 impl_->detail = L"等待 Viewer 连接（代码 2 分钟内有效）";
             } else if (impl_->host && impl_->state == StreamState::waiting && event.name == "request") {
                 impl_->state = StreamState::approval;
+                active.minirtc = active.minirtc_supported && event.minirtc;
                 if (impl_->connection.auto_control) Approve(StreamInputMode::desktop);
                 else if (mode == ConnectionMode::internet) impl_->detail = L"收到已认证的公网请求，请确认授权";
                 else if (mode == ConnectionMode::lan_direct) {
@@ -511,17 +617,35 @@ void StreamSession::ProcessEvents() {
                 impl_->state = StreamState::negotiating;
                 impl_->detail = L"Host 已允许，正在建立视频连接";
                 active.negotiation_start = QpcNow();
+                if (event.minirtc && !active.minirtc_supported) {
+                    Stop(L"会话请求了不可用的 MiniRTC 模块");
+                    return;
+                }
+                active.minirtc = event.minirtc;
+#ifdef P2PREMOTE_HAVE_MINIRTC
+                if (active.minirtc) {
+                    active.rtc = std::make_unique<MiniRtcCall>(false, active.events, impl_->connection,
+                        event.payload == "control", 30);
+                    break;
+                }
+#endif
                 if (impl_->connection.hardware_video) active.device = CreateD3d11Device(true);
                 active.rtc = std::make_unique<RtcCall>(false, active.events, impl_->connection, false, 30, active.device.get());
-            } else if (mode == ConnectionMode::internet && active.rtc && event.name == "ice"
+#ifdef P2PREMOTE_HAVE_MINIRTC
+            } else if (active.minirtc && active.rtc && event.name == "minirtc" &&
+                (impl_->state == StreamState::negotiating || impl_->state == StreamState::streaming)) {
+                static_cast<MiniRtcCall&>(*active.rtc).ReceiveSignal(event.payload);
+#endif
+            } else if (!active.minirtc && mode == ConnectionMode::internet && active.rtc && event.name == "ice"
                 && (impl_->state == StreamState::negotiating || impl_->state == StreamState::streaming)) {
-                if (active.remote_sdp_set) active.rtc->AddRemoteIce(event.payload);
+                if (active.remote_sdp_set) active.WebRtc().AddRemoteIce(event.payload);
                 else {
                     if (active.remote_ice.size() >= 64) throw std::runtime_error("远端 ICE 候选过多");
                     active.remote_ice.push_back(event.payload);
                 }
-            } else if (impl_->state == StreamState::negotiating && active.rtc && event.name == (impl_->host ? "answer" : "offer")) {
-                active.rtc->SetRemote(event.payload);
+            } else if (!active.minirtc && impl_->state == StreamState::negotiating &&
+                active.rtc && event.name == (impl_->host ? "answer" : "offer")) {
+                active.WebRtc().SetRemote(event.payload);
             } else {
                 Stop(L"收到与当前会话状态不符的信令");
                 return;
@@ -529,16 +653,16 @@ void StreamSession::ProcessEvents() {
             break;
         case StreamEventType::remote_set:
             active.remote_sdp_set = true;
-            for (const auto& candidate : active.remote_ice) active.rtc->AddRemoteIce(candidate);
+            for (const auto& candidate : active.remote_ice) active.WebRtc().AddRemoteIce(candidate);
             active.remote_ice.clear();
             if (!impl_->host) {
-                active.rtc->SetLocal();
+                active.WebRtc().SetLocal();
             }
             break;
         case StreamEventType::gathered:
         case StreamEventType::local_set:
             if (!active.sdp_sent && (mode == ConnectionMode::internet) == (event.type == StreamEventType::local_set)) {
-                active.signal->Send(impl_->host ? "offer" : "answer", active.rtc->LocalSdp());
+                active.signal->Send(impl_->host ? "offer" : "answer", active.WebRtc().LocalSdp());
                 active.sdp_sent = true;
                 for (auto& candidate : active.local_ice) active.signal->Send("ice", std::move(candidate));
                 active.local_ice.clear();
@@ -551,11 +675,21 @@ void StreamSession::ProcessEvents() {
                 active.local_ice.push_back(event.payload);
             }
             break;
+        case StreamEventType::minirtc_signal:
+#ifdef P2PREMOTE_HAVE_MINIRTC
+            if (active.minirtc && MiniRtcCall::IsSessionSignal(event.payload)) {
+                active.signal->Send("minirtc", event.payload);
+            }
+#endif
+            break;
         case StreamEventType::connected:
             if (impl_->state == StreamState::negotiating) {
                 if (impl_->host) {
                     if (!active.device) active.device = CreateD3d11Device();
                     active.pixels = std::make_unique<CapturePixels>(active.device.get());
+                    if (impl_->connection.SupportsQualitySelection()) {
+                        impl_->ApplyVideoSettings(active, active.quality, LegacyVideoBitrate(active.quality));
+                    }
                     active.StartFrameComparison();
                     try {
                         impl_->StartWgc(active, active.input_mode != StreamInputMode::test_pad);
@@ -576,7 +710,7 @@ void StreamSession::ProcessEvents() {
         case StreamEventType::stats: {
             const auto& rtc = event.counters;
             auto& stats = impl_->stats;
-            if (mode == ConnectionMode::internet) {
+            if (mode == ConnectionMode::internet && !active.minirtc) {
                 auto& peak = stats.ice_diagnostics ? *stats.ice_diagnostics : stats.ice_diagnostics.emplace();
                 const auto& sample = rtc.ice_diagnostics;
                 peak.local_srflx = std::max(peak.local_srflx, sample.local_srflx);
@@ -602,6 +736,11 @@ void StreamSession::ProcessEvents() {
             stats.bytes_received = rtc.bytes_received;
             stats.video_packets_received = rtc.video_packets_received;
             stats.video_packets_lost = rtc.video_packets_lost;
+            stats.upload_bps = rtc.upload_bps;
+            stats.download_bps = rtc.download_bps;
+            stats.video_loss_fraction = rtc.video_loss_fraction;
+            stats.minirtc = active.minirtc;
+            stats.srtp_active = rtc.srtp_active;
             if (!rtc.video_codec.empty()) {
                 const auto slash = rtc.video_codec.find('/');
                 stats.video_codec = winrt::to_hstring(rtc.video_codec.substr(slash == std::string::npos ? 0 : slash + 1));
@@ -653,6 +792,36 @@ void StreamSession::ProcessEvents() {
                 active.cursor_separate = true;
             }
             break;
+        case StreamEventType::video_settings: {
+            if (impl_->state != StreamState::streaming || active.transport_close_deadline
+                    || !impl_->connection.SupportsQualitySelection()) break;
+            const auto& settings = event.input;
+            const auto resolution = static_cast<StreamQuality>(settings.code);
+            const auto preset = static_cast<VideoBitratePreset>(settings.x);
+            if (impl_->host) {
+                if (settings.kind != InputKind::set_video_settings) break;
+                auto reply = settings;
+                reply.kind = InputKind::video_settings_reply;
+                reply.y = impl_->ApplyVideoSettings(active, resolution, VideoBitrateLimit(preset)) ? 0 : 1;
+                active.rtc->SendVideoSettings(reply);
+            } else {
+                if (settings.kind != InputKind::video_settings_reply || !active.video_request) break;
+                const auto& request = active.video_request->packet;
+                if (settings.sequence != request.sequence || settings.code != request.code || settings.x != request.x) break;
+                active.video_request.reset();
+                impl_->stats.video_settings_mode = VideoSettingsMode::independent;
+                if (!settings.y) {
+                    active.quality = resolution;
+                    impl_->stats.video_bitrate_limit_bps = VideoBitrateLimit(preset);
+                    active.rejected_video_settings.reset();
+                    impl_->detail = L"正在接收视频";
+                } else {
+                    active.rejected_video_settings = std::pair{resolution, preset};
+                    impl_->detail = L"画质设置未生效";
+                }
+            }
+            break;
+        }
         case StreamEventType::input: {
             if (!impl_->host || active.input_mode == StreamInputMode::view_only || !InputReady()) {
                 break;
@@ -667,14 +836,8 @@ void StreamSession::ProcessEvents() {
             if (input.kind == InputKind::set_quality) {
                 if (!impl_->connection.SupportsQualitySelection()) break;
                 const auto quality = static_cast<StreamQuality>(input.code);
-                if (quality != active.quality) {
-                    if (active.rtc->SetVideoBitrate(LimitsFor(quality).bitrate)) {
-                        active.quality = quality;
-                        if (impl_->connection.managed) active.quality_refresh_due = QpcNow() + QpcFrequency();
-                        impl_->detail = active.SharingStatus();
-                    } else {
-                        impl_->detail = L"正在共享所选显示器 · 画质调整失败";
-                    }
+                if (!impl_->ApplyVideoSettings(active, quality, LegacyVideoBitrate(quality))) {
+                    impl_->detail = L"正在共享所选显示器 · 画质调整失败";
                 }
                 break;
             }
@@ -687,6 +850,7 @@ void StreamSession::ProcessEvents() {
         }
         }
     }
+    UpdateVideoSettings();
 }
 
 bool StreamSession::InputReady() const noexcept {
@@ -784,8 +948,12 @@ void StreamSession::Capture() {
         return;
     }
     const auto& trace = active.events->Trace();
-    if (trace) trace->Record("frame_captured", frame->metadata.frame_id,
-        0, 0, 0, frame->metadata.capture_qpc);
+    if (trace) {
+        if (frame->metadata.source_qpc) {
+            trace->Record("frame_source", frame->metadata.frame_id, 0, 0, 0, frame->metadata.source_qpc);
+        }
+        trace->Record("frame_captured", frame->metadata.frame_id, 0, 0, 0, frame->metadata.capture_qpc);
+    }
     const auto stamp = frame->metadata.source_qpc ? frame->metadata.source_qpc : frame->metadata.capture_qpc;
     if (const auto interval = active.capture_interval) {
         const auto tolerance = interval / 20;
@@ -850,8 +1018,10 @@ void StreamSession::Present() {
         if (width <= 0 || height <= 0 || width > limits.width || height > limits.height) {
             throw std::runtime_error("收到超出尺寸上限的视频帧");
         }
-        const bool hardware = buffer->type() == webrtc::VideoFrameBuffer::Type::kNative;
+        const auto format = buffer->type();
+        const bool hardware = format == webrtc::VideoFrameBuffer::Type::kNative;
         winrt::com_ptr<ID3D11Texture2D> texture;
+        bool nv12_uploaded = false;
         if (hardware) {
             const auto* native = static_cast<const Nv12Frame*>(buffer.get());
             direct = active.WriteBackBuffer(*native);
@@ -859,11 +1029,15 @@ void StreamSession::Present() {
                 texture = active.ConvertOnGpu(native->texture(), native->subresource(), width, height,
                     width, height, DXGI_FORMAT_B8G8R8A8_UNORM);
             }
+        } else if (format == webrtc::VideoFrameBuffer::Type::kNV12) {
+            const auto* nv12 = buffer->GetNV12();
+            nv12_uploaded = active.renderer->UploadNv12(nv12->DataY(), nv12->StrideY(), nv12->DataUV(),
+                nv12->StrideUV(), width, height);
         }
         active.last_native = direct ? buffer : nullptr;
         if (texture) {
             active.renderer->UploadTexture(texture.get(), width, height);
-        } else if (!direct) {
+        } else if (!direct && !nv12_uploaded) {
             const auto i420 = buffer->ToI420();
             active.bgra.resize(static_cast<std::size_t>(width) * height * 4);
             if (!i420 || libyuv::H420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(), i420->DataV(),
@@ -873,18 +1047,27 @@ void StreamSession::Present() {
             active.renderer->UploadBgra(active.bgra.data(), width * 4, width, height);
         }
         impl_->stats.hardware_video = hardware;
-        impl_->stats.gpu_conversion = direct || !!texture;
+        impl_->stats.gpu_conversion = direct || !!texture || nv12_uploaded;
         impl_->stats.gpu_backbuffer = direct;
         impl_->stats.width = static_cast<unsigned>(width);
         impl_->stats.height = static_cast<unsigned>(height);
     }
-    if (!direct) active.renderer->Draw();
-    const auto immediate = impl_->connection.mode == ConnectionMode::lan_direct || impl_->connection.test_present_immediate;
+    if (!direct) active.renderer->Draw(impl_->requested_quality == StreamQuality::p720);
+    const auto path = impl_->stats.ice_path;
+    const bool minirtc_direct_udp = active.minirtc && impl_->stats.ice_protocol == "udp"
+        && (path == IcePath::host || path == IcePath::nat);
+    const bool immediate = impl_->connection.mode == ConnectionMode::lan_direct || minirtc_direct_udp
+        || impl_->connection.test_present_immediate;
+    const auto& trace = active.events->Trace();
+    const auto present_call = frame && trace ? QpcNow() : 0;
     if (active.renderer->Present(immediate ? 0 : 1) && frame) {
         ++impl_->stats.presented;
         const auto present_return = QpcNow();
-        if (const auto& trace = active.events->Trace()) {
-            trace->Record("frame_present_submitted", frame->video.rtp_timestamp(), 0, 0, 0, present_return);
+        if (trace) {
+            const auto id = active.minirtc ? static_cast<std::uint64_t>(frame->queued_qpc) : frame->video.rtp_timestamp();
+            trace->Record("frame_present_begin", id, 0, 0, 0, begin);
+            trace->Record("frame_present_called", id, 0, 0, 0, present_call);
+            trace->Record("frame_present_submitted", id, 0, 0, 0, present_return);
         }
         impl_->draw_to_present_total += QpcMilliseconds(present_return - begin);
         impl_->stats.draw_to_present_ms = impl_->draw_to_present_total / static_cast<double>(impl_->stats.presented);
@@ -914,7 +1097,7 @@ void StreamSession::Tick() {
         const auto internet = impl_->connection.mode == ConnectionMode::internet;
         const auto timeout_seconds = internet ? 25 : 15;
         if (QpcNow() - impl_->active->negotiation_start > QpcFrequency() * timeout_seconds) {
-            Recover(L"WebRTC 建连超时");
+            Recover(impl_->active->minirtc ? L"MiniRTC 建连超时" : L"WebRTC 建连超时");
         } else if (internet) {
             impl_->active->rtc->RequestStats(true);
         }
@@ -945,11 +1128,7 @@ void StreamSession::Tick() {
             if (const auto& trace = active.events->Trace()) trace->Record("frame_idle_repeat", active.idle_repeats);
             active.rtc->Submit(video);
         }
-        const auto requested = impl_->requested_quality;
-        if (impl_->connection.SupportsQualitySelection() && !impl_->host && active.quality != requested
-                && SubmitInput({InputKind::set_quality, static_cast<std::uint16_t>(requested)})) {
-            active.quality = requested;
-        }
+        UpdateVideoSettings();
         active.rtc->RequestStats();
     }
 }
@@ -978,7 +1157,7 @@ void StreamSession::ExportCsv(const std::filesystem::path& path) const {
            "rtc_frames_dropped,decoded_replaced,ice_path,ice_rtt_ms,ice_protocol,relay_protocol,"
            "video_packets_received,video_packets_lost,ice_local_srflx_peak,ice_remote_srflx_peak,"
            "ice_direct_udp_pairs_peak,ice_direct_udp_succeeded_peak,ice_direct_udp_requests_peak,"
-           "ice_direct_udp_responses_peak\r\n";
+           "ice_direct_udp_responses_peak,upload_bps,download_bps,video_loss_fraction,srtp_active,video_bitrate_limit_bps\r\n";
     csv << std::fixed << std::setprecision(3);
     const auto write_row = [&csv](const StreamStatistics& row) {
         csv << row.seconds << ',' << row.width << ',' << row.height << ',' << row.captured << ',' << row.submitted
@@ -1002,6 +1181,16 @@ void StreamSession::ExportCsv(const std::filesystem::path& path) const {
         } else {
             csv << ",,,,,,";
         }
+        csv << ',';
+        if (row.upload_bps) csv << *row.upload_bps;
+        csv << ',';
+        if (row.download_bps) csv << *row.download_bps;
+        csv << ',';
+        if (row.video_loss_fraction) csv << *row.video_loss_fraction;
+        csv << ',';
+        if (row.minirtc) csv << row.srtp_active;
+        csv << ',';
+        if (row.video_bitrate_limit_bps) csv << *row.video_bitrate_limit_bps;
         csv << "\r\n";
     };
     for (const auto& sample : impl_->samples) write_row(sample);

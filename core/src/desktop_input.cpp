@@ -148,6 +148,8 @@ void DesktopInput::Apply(const InputPacket& input) {
     }
     case InputKind::text:
     case InputKind::set_quality:
+    case InputKind::set_video_settings:
+    case InputKind::video_settings_reply:
     case InputKind::cursor_ready:
     case InputKind::heartbeat:
         return;

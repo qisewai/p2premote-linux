@@ -152,6 +152,7 @@ namespace {
 using Peer = webrtc::PeerConnectionInterface;
 constexpr char control_label[] = "p2premote.input.v1";
 constexpr char motion_label[] = "p2premote.motion.v1";
+constexpr char video_settings_label[] = "p2premote.video-settings.v1";
 // The screenshare ALR preset takes precedence over WebRTC-Video-Pacing.
 // Keep the probing thresholds and use a higher pacing factor and a short drain target on LAN.
 constexpr char lan_screenshare_trials[] = "WebRTC-ProbingScreenshareBwe/4.0,30,80,40,-60,3/";
@@ -358,8 +359,8 @@ private:
 class InputChannel final : public webrtc::DataChannelObserver {
 public:
     InputChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel,
-                 std::shared_ptr<StreamEvents> events, bool receive, bool motion)
-        : channel_(std::move(channel)), events_(std::move(events)), receive_(receive), motion_(motion) {
+                 std::shared_ptr<StreamEvents> events, bool receive, bool motion, bool settings_only = false)
+        : channel_(std::move(channel)), events_(std::move(events)), receive_(receive), motion_(motion), settings_only_(settings_only) {
         channel_->RegisterObserver(this);
     }
 
@@ -389,6 +390,14 @@ private:
 
     void OnMessage(const webrtc::DataBuffer& buffer) override {
         if (!buffer.binary) return;
+        const auto input = DecodeInput({buffer.data.data<std::uint8_t>(), buffer.data.size()});
+        if (input && IsVideoSettingsMessage(input->kind)) {
+            if (!motion_ && input->kind == (receive_ ? InputKind::set_video_settings : InputKind::video_settings_reply)) {
+                events_->Push({StreamEventType::video_settings, {}, {}, {}, *input});
+            }
+            return;
+        }
+        if (settings_only_) return;
         if (!receive_) {
             const auto size = buffer.data.size();
             const auto* data = buffer.data.data<char>();
@@ -397,7 +406,6 @@ private:
             }
             return;
         }
-        const auto input = DecodeInput({buffer.data.data<std::uint8_t>(), buffer.data.size()});
         if (input && (input->kind == InputKind::move) == motion_) {
             if (const auto& trace = events_->Trace()) trace->Pointer("input_received", *input);
             events_->PushInput(*input);
@@ -408,6 +416,7 @@ private:
     std::shared_ptr<StreamEvents> events_;
     bool receive_;
     bool motion_;
+    bool settings_only_;
 };
 
 class RtcSsl {
@@ -521,6 +530,13 @@ RtcCall::RtcCall(bool host, std::shared_ptr<StreamEvents> events, const Connecti
                 controls_ = std::make_unique<InputChannel>(controls.MoveValue(), events_, true, false);
                 motion_ = std::make_unique<InputChannel>(motion.MoveValue(), events_, true, true);
             });
+        } else if (options.SupportsQualitySelection()) {
+            signaling_->BlockingCall([this] {
+                webrtc::DataChannelInit reliable;
+                auto settings = peer_->CreateDataChannelOrError(video_settings_label, &reliable);
+                Check(settings.error(), "无法创建视频设置通道");
+                video_settings_ = std::make_unique<InputChannel>(settings.MoveValue(), events_, true, false, true);
+            });
         }
     }
 }
@@ -530,6 +546,7 @@ RtcCall::~RtcCall() {
         input_tasks_->SetNotAlive();
         motion_.reset();
         controls_.reset();
+        video_settings_.reset();
         if (remote_track_) {
             remote_track_->RemoveSink(this);
             remote_track_ = nullptr;
@@ -623,6 +640,14 @@ bool RtcCall::SendInput(const InputPacket& input) {
     return true;
 }
 
+bool RtcCall::SendVideoSettings(const InputPacket& settings) {
+    if (settings.kind != (host_ ? InputKind::video_settings_reply : InputKind::set_video_settings)) return false;
+    return signaling_->BlockingCall([this, &settings] {
+        auto* channel = controls_ ? controls_.get() : video_settings_.get();
+        return channel && channel->Send(settings);
+    });
+}
+
 void RtcCall::DrainInput() {
     std::vector<InputPacket> batch;
     {
@@ -687,11 +712,13 @@ void RtcCall::OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> 
         return;
     }
     const auto label = channel->label();
-    if (label == control_label && !controls_ && channel->ordered() && !channel->maxRetransmitsOpt()
-            && !channel->maxPacketLifeTime()) {
+    const bool reliable = channel->ordered() && !channel->maxRetransmitsOpt() && !channel->maxPacketLifeTime();
+    if (label == control_label && !controls_ && reliable) {
         controls_ = std::make_unique<InputChannel>(std::move(channel), events_, false, false);
     } else if (label == motion_label && !motion_ && !channel->ordered() && channel->maxRetransmitsOpt() == 0) {
         motion_ = std::make_unique<InputChannel>(std::move(channel), events_, false, true);
+    } else if (label == video_settings_label && !video_settings_ && reliable) {
+        video_settings_ = std::make_unique<InputChannel>(std::move(channel), events_, false, false, true);
     }
     events_->Push({StreamEventType::input_ready, {}, {}});
 }

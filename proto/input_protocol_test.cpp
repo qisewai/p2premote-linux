@@ -38,6 +38,18 @@ int main() {
         "Could not round-trip the requested streaming quality");
     passed &= check(!DecodeInput(EncodeInput({InputKind::set_quality, 0xffff, 0, 0, 1, 1})),
         "Accepted an unsupported streaming quality");
+    const auto economy = static_cast<std::uint16_t>(p2premote::VideoBitratePreset::economy);
+    const auto request = DecodeInput(EncodeInput({InputKind::set_video_settings, hd, economy, 0, 27, 50}));
+    passed &= check(request && request->kind == InputKind::set_video_settings && request->code == hd
+        && request->x == economy && request->y == 0 && request->sequence == 27,
+        "Could not request 1080p at the economy bitrate independently");
+    const auto reply = DecodeInput(EncodeInput({InputKind::video_settings_reply, hd, economy, 1, 27, 50}));
+    passed &= check(reply && reply->kind == InputKind::video_settings_reply && reply->sequence == 27 && reply->y == 1,
+        "Could not decode a correlated video settings rejection");
+    passed &= check(!DecodeInput(EncodeInput({InputKind::set_video_settings, hd, 0, 0, 27, 50}))
+        && !DecodeInput(EncodeInput({InputKind::set_video_settings, hd, economy, 1, 27, 50}))
+        && !DecodeInput(EncodeInput({InputKind::video_settings_reply, hd, economy, 2, 27, 50})),
+        "Accepted malformed video settings");
 
     InputReceiveClock clock;
     passed &= check(clock.IsFresh(900'000, 2'010), "Rejected input from a peer with longer uptime");

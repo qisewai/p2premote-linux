@@ -8,7 +8,9 @@
 
 登录后，本机在当前 Windows 桌面会话中接收同账号设备的控制请求。「停止接收」可让本机下线，同时保留主控能力。「退出登录」会关闭本机的远控会话并撤销本次登录。启动电脑后需要登录 Windows 并打开客户端。
 
-远控窗口顶部的「画质」可在会话中选择 720p、1080p 或 1440p，对应视频码率上限 4、8、16 Mbps。公网会话默认 720p。分辨率受被控屏幕尺寸约束，实际码率由 WebRTC 根据网络调整，画面下方显示实际收到的分辨率。使用新版客户端作为主控和被控即可使用该设置。
+远控窗口顶部可分别选择 720p、1080p 或 1440p 的传输分辨率，以及省流、自动或清晰画质。默认使用 1080p、自动。三个画质档分别将视频码率上限设为 4、8、16 Mbps，实际码率随网络和画面变化调整。传输尺寸受被控屏幕大小约束。状态区显示实际收到的尺寸、带宽及被控端确认的码率上限。与旧客户端连接时，窗口会显示兼容的分辨率和码率组合档。
+
+选择 720p 时，MiniRTC 主控端对收到的画面做轻量亮度边缘增强，让放大的文字更易辨认。源桌面缩小时损失的细节取决于原始字号和画面尺寸。
 
 公网会话和 TURN 中继都支持本地光标。用新版客户端连接并接管键鼠后，主控端本地绘制光标位置，被控端同步光标形状。窗口底部显示当前的光标模式。
 
@@ -173,7 +175,7 @@ Start-Process .\p2premote_viewer.exe -ArgumentList '--direct --signal ws://192.1
 
 测试时可以用 `-direct-lan` 替换 `-direct-peer 192.168.0.32`。信令根据 `-bind` 所在网卡的 IPv4 子网放行 Viewer。与 Host 的 `--auto-control` 同时启用时，同网段内的主控机可以直接接管共享桌面。
 
-新版 Viewer 可在连接中切换 720p、1080p 和 1440p，默认 1080p。对应视频码率上限为 4、8、16 Mbps，实际分辨率受被控屏幕尺寸约束。状态栏按秒显示 WebRTC 会话上下行带宽。
+Viewer 可在连接中分别调整传输分辨率和视频码率上限，默认使用 1080p 和自动画质。状态栏按秒显示 WebRTC 会话上下行带宽。
 
 Viewer 的连接状态面板显示实际选中的 ICE 路径和 UDP/TCP 协议、RTT、近期视频丢包率、编解码方式和收流、解码、呈现帧率。没有有效分母的视频丢包样本显示为「—」。导出的统计 CSV 同时包含协议和累计视频包计数。
 
@@ -183,7 +185,7 @@ Viewer 的连接状态面板显示实际选中的 ICE 路径和 UDP/TCP 协议�
 
 用 `Start-Viewer-SyncedCursor.cmd` 或给局域网 Viewer 加 `--video-cursor`，可以对照画面同步光标。Windows 将 Host 光标与桌面合到同一条视频流里，拖拽时 Viewer 看到两者一起更新。这个模式下光标响应也受视频回显延迟影响。
 
-局域网直连的 Viewer 使用 0–30 ms 的 WebRTC 播放目标范围，并使用 DXGI 同步间隔 0 呈现。`--test-playout-delay` 可独立将播放延迟目标设为 0 ms。会话码和公网模式可用 `--test-present-immediate` 单独验证 DXGI 同步间隔 0。
+局域网直连的 Viewer 使用 0–30 ms 的 WebRTC 播放目标范围。局域网直连和选中 UDP 直连的 MiniRTC 会话都使用 DXGI 同步间隔 0。`--test-playout-delay` 可独立将 WebRTC 播放延迟目标设为 0 ms。其他模式可用 `--test-present-immediate` 验证 DXGI 同步间隔 0。
 
 局域网 Host 的 WebRTC 屏幕共享使用 6 Mbps 的初始带宽估计、更高的短时发包速率和约 30 ms 的发送队列排空目标。编码码率上限由画质档位决定，拥塞控制仍根据网络反馈调整发送预算。
 
@@ -283,6 +285,36 @@ out\minirtc-probe\p2premote_minirtc_probe.exe viewer wss://127.0.0.1:47000/signa
 双机时用 SSH 反向端口转发把主控端的本地 WSS 端口接到信令服务。把探测程序、`viewer.txt` 和 `ca.pem` 放到主控机，主控端使用它本机的转发端口。转发承载信令，MiniRTC 在两台电脑间自行建立数据流。程序只在自身进程中加载实验 CA 并校验信令主机名或 IP。
 
 测试自动中继时，给信令增加 `-turn-file <JSON>`，字段为 `urls`、`username`、`credential` 和 Unix 秒 `expires_at`，并把两端的 `direct` 改为 `auto`。可以用 `-stun 103.236.93.69:23969,179.253.242.112:3478` 比较两个 STUN 节点看到的映射。对照 `ROUTE`、`RESULT` 行和 `logs-host`、`logs-viewer` 下的候选对日志。结束后关闭信令并删除两份测试身份文件。分发链接 MiniRTC 的二进制时参照其 [许可和第三方声明](https://github.com/kunkundi/minirtc/blob/f5b53e920db0713b456e23af6a0fe9907d94a612/THIRD_PARTY_NOTICES.md)。
+
+排查公网直连时可以在启动探测程序的 PowerShell 中设置 `$env:P2PREMOTE_MINIRTC_PROBE_ICE_PACING_MS = '60'`，独立调节 libnice 收集候选地址和发送连通性检查的间隔。取值为 20–200 毫秒，默认 20 毫秒。日志中的 `Probe STUN pacing interval` 会确认探测程序采用的值。对照测试时可为每端单独设置，测试完执行 `Remove-Item Env:P2PREMOTE_MINIRTC_PROBE_ICE_PACING_MS` 恢复默认值。
+
+### MiniRTC 桌面和键鼠验证
+
+在两台机器已登录且解锁的 Windows 桌面上运行探测器，并在两端命令末尾追加 `desktop`。被控端启动后共享主显示器，通过 MiniRTC 发送 H.264。主控端窗口收到画面后可操作远端鼠标和键盘。被控端关闭共享提示窗口即可结束会话，主控端可按 F12 或关闭窗口。自动测试可以在两端统一使用 `desktop-check`。它在被控桌面显示专用色块，主控端在看到初始色块后发送鼠标移动、点击和 F8，读取实际显示的画面，确认点击和按键引起的两次颜色变化。
+
+验收看两端的 `DESKTOP=pass` 和 `RESULT=pass`。自动测试要求 `mouse_verified=1` 和 `keyboard_verified=1`。公网直连还要求 `path=direct`，加密要求 `srtp=1`。桌面模式使用实验信令和被控端的主显示器，适用于明确授权的测试会话。
+
+画质回归时，两端把末尾参数改为 `quality-check`，时长建议至少 90 秒。探测器按 60 帧目标配置发送端，以约 50 帧每秒提交 1080p 动态测试图，主控端检查预热后的实际分辨率和解码后的细线对比度。通过时输出 `QUALITY=pass`。
+
+### 账号模式使用 MiniRTC
+
+使用 x64 Visual Studio 开发终端构建库和正式客户端。把 `p2premote.exe` 和同目录生成的 `p2premote_minirtc.dll` 一起放到两台电脑。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/minirtc_probe/Build.ps1
+cmake --preset windows-x64-webrtc -DP2PREMOTE_MINIRTC_DIR=out/minirtc
+cmake --build --preset windows-x64-webrtc-release --target p2premote
+```
+
+账号服务使用当前 `signaling` 源码构建，沿用现有数据库、HTTPS 和 TURN 配置。服务端在同账号设备通过授权后协商媒体后端。带 MiniRTC 模块的两端会优先使用 MiniRTC，符合配置时同时尝试公网直连和 TURN 中继。旧客户端、旧服务和需要 TLS TURN 的配置继续使用 WebRTC。可用 `-stun-urls stun:103.236.93.69:23969` 指定西安 STUN。
+
+从设备列表发起连接后，状态区显示 `H264 (MiniRTC)` 和实际选中的路径。诊断模式 `--ice-trace <目录>` 会把 MiniRTC 的候选对和握手记录写到该目录的 `minirtc.log`。
+
+MiniRTC 主控端直接上传解码后的 NV12 两个平面，由 D3D11 执行 BT.709 转色。使用该路径时状态区显示「GPU 转换」。显卡无法初始化 NV12 纹理或着色器时，客户端使用原有的 CPU 转色路径。
+
+用 `p2premote.exe --latency-trace <目录>` 启动两端，正常断开后会写出延迟 CSV。按输入序号对齐移动、左键和滚轮事件。被控端按帧号记录采集及提交，主控端按本机帧标识对齐 `minirtc_frame_assembled`、`minirtc_decoder_complete`、`minirtc_frame_queued` 与 `frame_present_begin`、`frame_present_submitted`。这些时间戳适合计算各自主机内的耗时。跨机输入时间需对齐时钟，端到端回显也可用变色测试图在主控端计时。
+
+`minirtc_send_queue_interval` 统计该报告周期内成功发送的普通视频 RTP 包。`id` 为样本数，`aux` 为累计队列等待微秒数，`flags` 为第 95 百分位的毫秒分桶。最高桶包含 100 ms 及以上。`frame_present_called` 和 `frame_present_submitted` 分别记录 DXGI `Present` 调用前和返回时的时间，与面板实际显示分开测量。
 
 ## 计时口径
 

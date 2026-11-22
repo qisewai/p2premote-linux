@@ -42,6 +42,8 @@ bool ValidCode(InputKind kind, std::uint16_t code) {
     case InputKind::text:
         return code == '\b' || code == '\r' || (code >= 32 && code != 127);
     case InputKind::set_quality:
+    case InputKind::set_video_settings:
+    case InputKind::video_settings_reply:
         return code >= static_cast<std::uint16_t>(StreamQuality::p720)
             && code <= static_cast<std::uint16_t>(StreamQuality::p1440);
     }
@@ -73,9 +75,12 @@ std::optional<InputPacket> DecodeInput(std::span<const std::uint8_t> bytes) {
     if (!sequence || !ValidCode(kind, code)) {
         return std::nullopt;
     }
-    return InputPacket{kind, code, static_cast<std::uint16_t>(ReadLittleEndian(bytes.subspan<4, 2>())),
-        static_cast<std::uint16_t>(ReadLittleEndian(bytes.subspan<6, 2>())), sequence,
-        ReadLittleEndian(bytes.subspan<12, 8>())};
+    const auto x = static_cast<std::uint16_t>(ReadLittleEndian(bytes.subspan<4, 2>()));
+    const auto y = static_cast<std::uint16_t>(ReadLittleEndian(bytes.subspan<6, 2>()));
+    if (IsVideoSettingsMessage(kind) && (x < static_cast<std::uint16_t>(VideoBitratePreset::economy)
+            || x > static_cast<std::uint16_t>(VideoBitratePreset::detail)
+            || y > (kind == InputKind::video_settings_reply ? 1 : 0))) return std::nullopt;
+    return InputPacket{kind, code, x, y, sequence, ReadLittleEndian(bytes.subspan<12, 8>())};
 }
 
 bool InputReceiveClock::IsFresh(std::uint64_t sent_ms, std::uint64_t received_ms) {

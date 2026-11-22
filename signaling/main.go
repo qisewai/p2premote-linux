@@ -31,6 +31,7 @@ type message struct {
 	Type      string `json:"type"`
 	Payload   string `json:"payload"`
 	Retryable bool   `json:"retryable,omitempty"`
+	MiniRTC   bool   `json:"minirtc,omitempty"`
 }
 
 var (
@@ -90,6 +91,7 @@ type client struct {
 	ip       netip.Addr
 	role     internetRole
 	identity *accountSession
+	miniRTC  bool
 }
 
 func (c *client) send(kind string, payload string) {
@@ -116,6 +118,8 @@ type room struct {
 	acceptedAt   time.Time
 	hostICE      iceCandidateCounts
 	viewerICE    iceCandidateCounts
+	miniRTC      bool
+	miniJoined   bool
 }
 
 type iceCandidateCounts struct {
@@ -191,7 +195,8 @@ func (h *hub) startExpiry(r *room) {
 func request(r *room, viewer *client) {
 	r.viewer, r.stage = viewer, "requested"
 	viewer.send("waiting", "")
-	r.host.send("request", viewer.ip.String())
+	r.host.sendMessage(message{Type: "request", Payload: viewer.ip.String(),
+		MiniRTC: r.deviceID != "" && r.host.miniRTC && viewer.miniRTC})
 }
 
 func (h *hub) enter(c *client, first message) (*room, error) {
@@ -267,14 +272,26 @@ func (h *hub) relay(r *room, from *client, m message) bool {
 	if !h.contains(r) {
 		return false
 	}
+	if r.miniRTC {
+		return relayMiniRTC(r, from, m)
+	}
 	switch {
 	case from == r.host && r.stage == "requested" && m.Type == "accept":
+		if m.MiniRTC && (r.deviceID == "" || !r.host.miniRTC || !r.viewer.miniRTC ||
+			(m.Payload != "control" && m.Payload != "view")) {
+			return false
+		}
+		r.miniRTC = m.MiniRTC
 		r.stage = "accepted"
 		r.expiration.Stop()
 		if h.internet != nil {
 			r.acceptedAt = time.Now()
 		}
-		r.viewer.send("accepted", "")
+		accepted := message{Type: "accepted", MiniRTC: r.miniRTC}
+		if r.miniRTC {
+			accepted.Payload = m.Payload
+		}
+		r.viewer.sendMessage(accepted)
 	case from == r.host && r.stage == "accepted" && m.Type == "offer" && m.Payload != "":
 		r.stage = "offered"
 		if h.internet != nil {
@@ -386,7 +403,8 @@ func (h *hub) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	address, _ := netip.ParseAddrPort(r.RemoteAddr)
-	c := &client{out: make(chan message, 64), cancel: cancel, ip: address.Addr().Unmap(), role: role, identity: identity}
+	c := &client{out: make(chan message, 64), cancel: cancel, ip: address.Addr().Unmap(), role: role,
+		identity: identity, miniRTC: identity != nil && first.MiniRTC}
 	session, err := h.enter(c, first)
 	if err != nil {
 		retry := errors.Is(err, errDirectUnavailable) || errors.Is(err, errDirectHostInUse)

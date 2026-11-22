@@ -62,6 +62,7 @@ struct Result {
 
 struct IceOverrides {
     std::filesystem::path trace_directory;
+    std::filesystem::path latency_trace_directory;
     std::string stun_url;
     bool stun_only{};
 };
@@ -379,6 +380,7 @@ private:
         auto& stream = host ? host_ : viewer_;
         Cancel(stream);
         connection.ice_trace_dir = ice_.trace_directory;
+        connection.latency_trace_dir = ice_.latency_trace_directory;
         if (!ice_.stun_url.empty()) {
             bool replaced{};
             for (auto& server : connection.ice_servers) {
@@ -506,12 +508,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 compatible_http = true;
             } else if (option == L"--stun-only") {
                 ice.stun_only = true;
-            } else if (option == L"--ice-trace") {
+            } else if (option == L"--ice-trace" || option == L"--latency-trace") {
                 if (++i >= count || !*args.get()[i] || std::wstring_view(args.get()[i]).starts_with(L"--")) {
-                    throw std::runtime_error("--ice-trace 需要指定日志目录");
+                    throw std::runtime_error(winrt::to_string(winrt::hstring(option)) + " 需要指定日志目录");
                 }
-                ice.trace_directory = std::filesystem::absolute(args.get()[i]);
-                std::filesystem::create_directories(ice.trace_directory);
+                auto& directory = option == L"--ice-trace" ? ice.trace_directory : ice.latency_trace_directory;
+                directory = std::filesystem::absolute(args.get()[i]);
+                std::filesystem::create_directories(directory);
             } else if (option == L"--stun") {
                 if (++i >= count || !*args.get()[i] || std::wstring_view(args.get()[i]).starts_with(L"--")) {
                     throw std::runtime_error("--stun 需要指定 stun:主机:端口");

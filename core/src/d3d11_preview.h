@@ -27,12 +27,15 @@ public:
     void Upload(const CapturedFrame& frame);
     void UploadTexture(ID3D11Texture2D* texture, unsigned width, unsigned height);
     void UploadBgra(const std::uint8_t* pixels, unsigned stride, unsigned width, unsigned height);
-    void Draw();
+    [[nodiscard]] bool UploadNv12(const std::uint8_t* y, unsigned y_stride, const std::uint8_t* uv,
+        unsigned uv_stride, unsigned width, unsigned height);
+    void Draw(bool enhance_text = false);
     [[nodiscard]] bool Present(unsigned sync_interval = 1);
 
 private:
     void CreateTarget();
-    void EnsureSource(unsigned width, unsigned height);
+    void EnsureSource(unsigned width, unsigned height, bool nv12 = false);
+    ID3D11PixelShader* SelectPixelShader(bool enhance_text);
 
     HWND window_{};
     winrt::com_ptr<ID3D11Device> device_;
@@ -43,9 +46,16 @@ private:
     winrt::com_ptr<ID3D11RenderTargetView> target_;
     winrt::com_ptr<ID3D11VertexShader> vertex_shader_;
     winrt::com_ptr<ID3D11PixelShader> pixel_shader_;
+    winrt::com_ptr<ID3D11PixelShader> nv12_shader_;
+    winrt::com_ptr<ID3D11PixelShader> text_shader_;
+    winrt::com_ptr<ID3D11PixelShader> nv12_text_shader_;
     winrt::com_ptr<ID3D11SamplerState> sampler_;
     winrt::com_ptr<ID3D11Texture2D> source_;
     winrt::com_ptr<ID3D11ShaderResourceView> source_view_;
+    winrt::com_ptr<ID3D11Texture2D> chroma_;
+    winrt::com_ptr<ID3D11ShaderResourceView> chroma_view_;
+    bool nv12_unavailable_{};
+    bool text_filter_unavailable_{};
     unsigned target_width_{};
     unsigned target_height_{};
     unsigned source_width_{};

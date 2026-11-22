@@ -34,13 +34,17 @@ using p2premote::StreamInputMode;
 using p2premote::StreamQuality;
 using p2premote::StreamState;
 using p2premote::StreamStatistics;
+using p2premote::VideoBitratePreset;
+using p2premote::VideoSettingsMode;
 
 enum ControlId {
     screen_select = 200, room_code, connect_button, allow_button,
     stop_button, export_button, status_text, allow_input_button, low_latency_mode, quality_select, status_panel,
-    overlay_toggle
+    overlay_toggle, bitrate_select
 };
 constexpr std::array quality_levels{StreamQuality::p720, StreamQuality::p1080, StreamQuality::p1440};
+constexpr std::array bitrate_presets{VideoBitratePreset::economy, VideoBitratePreset::automatic, VideoBitratePreset::detail};
+constexpr std::array bitrate_labels{L"省流", L"自动", L"清晰"};
 constexpr UINT_PTR statistics_timer = 1;
 constexpr UINT_PTR input_timer = 2;
 constexpr UINT_PTR cursor_timer = 3;
@@ -192,12 +196,17 @@ public:
         }
         if (!host_) {
             if (quality_selection_) {
-                quality_label_ = Control(L"STATIC", L"画质", SS_LEFT, 0);
+                quality_label_ = Control(L"STATIC", L"分辨率", SS_LEFT, 0);
                 quality_ = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, quality_select);
-                for (const auto* label : {L"720p · 4 Mbps", L"1080p · 8 Mbps", L"1440p · 16 Mbps"}) {
-                    SendMessageW(quality_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+                SetResolutionOptions(false, 1);
+                bitrate_label_ = Control(L"STATIC", L"画质", SS_LEFT, 0);
+                bitrate_ = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, bitrate_select);
+                for (std::size_t i = 0; i < bitrate_presets.size(); ++i) {
+                    const auto label = std::format(L"{} · {} Mbps", bitrate_labels[i],
+                        p2premote::VideoBitrateLimit(bitrate_presets[i]) / 1'000'000);
+                    SendMessageW(bitrate_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
                 }
-                SendMessageW(quality_, CB_SETCURSEL, internet_ ? 0 : 1, 0);
+                SendMessageW(bitrate_, CB_SETCURSEL, 1, 0);
             }
             placeholder_ = Control(blank_class, L"", 0, 0);
             surface_ = Control(screen_class, L"", 0, 0);
@@ -297,6 +306,13 @@ private:
                 }
                 return 0;
             }
+            if (LOWORD(wparam) == bitrate_select && HIWORD(wparam) == CBN_SELCHANGE) {
+                const auto index = SendMessageW(bitrate_, CB_GETCURSEL, 0, 0);
+                if (index >= 0 && static_cast<std::size_t>(index) < bitrate_presets.size()) {
+                    session_.SetVideoBitratePreset(bitrate_presets[static_cast<std::size_t>(index)]);
+                }
+                return 0;
+            }
             if (HIWORD(wparam) != BN_CLICKED) break;
             switch (LOWORD(wparam)) {
             case connect_button: Start(); return 0;
@@ -321,7 +337,8 @@ private:
         case WM_GETMINMAXINFO:
             if (!host_) {
                 auto& info = *reinterpret_cast<MINMAXINFO*>(lparam);
-                info.ptMinTrackSize = {MulDiv(590, GetDpiForWindow(hwnd), 96), MulDiv(340, GetDpiForWindow(hwnd), 96)};
+                info.ptMinTrackSize = {MulDiv(quality_selection_ ? 710 : 590, GetDpiForWindow(hwnd), 96),
+                    MulDiv(340, GetDpiForWindow(hwnd), 96)};
             }
             return 0;
         case WM_DISPLAYCHANGE:
@@ -576,6 +593,16 @@ private:
         Update();
     }
 
+    void SetResolutionOptions(bool legacy, LRESULT selected) {
+        const std::array options = legacy ? std::array{L"720p · 4 Mbps", L"1080p · 8 Mbps", L"1440p · 16 Mbps"}
+                                          : std::array{L"720p", L"1080p", L"1440p"};
+        SendMessageW(quality_, CB_RESETCONTENT, 0, 0);
+        for (const auto* option : options) {
+            SendMessageW(quality_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option));
+        }
+        SendMessageW(quality_, CB_SETCURSEL, selected, 0);
+    }
+
     void Layout() {
         if (!status_) return;
         const auto dpi = GetDpiForWindow(window_);
@@ -592,8 +619,10 @@ private:
         place(export_, actions + connect_width + 82, 9, 91, 24);
         if (quality_) {
             const auto quality_x = actions + connect_width + 185;
-            place(quality_label_, quality_x, 13, 34, 20);
-            place(quality_, quality_x + 38, 9, 140, 124);
+            place(quality_label_, quality_x, 13, 46, 20);
+            place(quality_, quality_x + 48, 9, legacy_quality_options_ ? 140 : 80, 124);
+            place(bitrate_label_, quality_x + 138, 13, 35, 20);
+            place(bitrate_, quality_x + 176, 9, 116, 124);
         }
         RECT rect{};
         GetClientRect(window_, &rect);
@@ -672,16 +701,24 @@ private:
                 rate(next.captured, previous_.captured), rate(next.submitted, previous_.submitted), rate(next.encoded, previous_.encoded))
             : std::format(L"接收 {:.1f} fps  |  解码 {:.1f} fps  |  呈现 {:.1f} fps",
                 rate(next.received, previous_.received), rate(next.decoded, previous_.decoded), *presented_fps_);
+        if (host_ && next.minirtc) {
+            rate_text_ = std::format(L"采集 {:.1f} fps  |  提交 {:.1f} fps",
+                rate(next.captured, previous_.captured), rate(next.submitted, previous_.submitted));
+        }
         if (previous_.seconds > 0) {
-            const auto bandwidth = [](double bytes_per_second) {
-                const auto kbps = bytes_per_second * 8 / 1000;
+            const auto bandwidth = [](double bits_per_second) {
+                const auto kbps = bits_per_second / 1000;
                 return kbps >= 1000 ? std::format(L"{:.2f} Mbps", kbps / 1000) : std::format(L"{:.1f} Kbps", kbps);
             };
-            up_rate_ = bandwidth(rate(next.bytes_sent, previous_.bytes_sent));
-            down_rate_ = bandwidth(rate(next.bytes_received, previous_.bytes_received));
+            up_rate_ = next.upload_bps ? bandwidth(*next.upload_bps) :
+                next.minirtc ? L"—" : bandwidth(8 * rate(next.bytes_sent, previous_.bytes_sent));
+            down_rate_ = next.download_bps ? bandwidth(*next.download_bps) :
+                next.minirtc ? L"—" : bandwidth(8 * rate(next.bytes_received, previous_.bytes_received));
             rate_text_ += std::format(L"  |  上行 {}  下行 {}", up_rate_, down_rate_);
             loss_rate_.reset();
-            if (next.video_packets_received >= previous_.video_packets_received) {
+            if (next.video_loss_fraction) {
+                loss_rate_ = 100 * *next.video_loss_fraction;
+            } else if (!next.minirtc && next.video_packets_received >= previous_.video_packets_received) {
                 const auto received = next.video_packets_received - previous_.video_packets_received;
                 const auto lost = std::max<std::int64_t>(0, next.video_packets_lost - previous_.video_packets_lost);
                 const auto total = static_cast<double>(received) + static_cast<double>(lost);
@@ -705,6 +742,17 @@ private:
         }
         const auto active = IsActive(state);
         const auto stats = session_.Statistics();
+        if (quality_) {
+            const bool legacy = state == StreamState::streaming && stats.video_settings_mode == VideoSettingsMode::legacy;
+            if (legacy != legacy_quality_options_) {
+                legacy_quality_options_ = legacy;
+                SetResolutionOptions(legacy, SendMessageW(quality_, CB_GETCURSEL, 0, 0));
+                ShowWindow(bitrate_label_, legacy ? SW_HIDE : SW_SHOWNA);
+                ShowWindow(bitrate_, legacy ? SW_HIDE : SW_SHOWNA);
+                Layout();
+            }
+            EnableWindow(quality_, !legacy || input_ready_);
+        }
         if (session_.DesktopControl() && !hotkey_) {
             hotkey_ = RegisterHotKey(window_, stop_control_hotkey, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F11);
         } else if (!session_.DesktopControl() && hotkey_) {
@@ -750,6 +798,7 @@ private:
                 text += std::format(L"  |  本端到 TURN {}", NetworkProtocol(stats.relay_protocol));
             }
             if (stats.ice_rtt_ms) text += std::format(L"  |  RTT {:.1f} ms", *stats.ice_rtt_ms);
+            if (stats.srtp_active) text += L"  |  SRTP";
             if (!host_) {
                 text += loss_rate_ ? std::format(L"  |  视频丢包 {:.1f}%", *loss_rate_) : L"  |  视频丢包 —";
                 text += L"\r\n";
@@ -762,10 +811,19 @@ private:
                 if (stats.gpu_conversion) text += L" · GPU 转换";
                 if (stats.gpu_backbuffer) text += L" · 直写上屏";
             }
-            text += std::format(L"  |  {} × {}  |  {} 帧\r\n{}\r\n", stats.width, stats.height,
+            text += std::format(L"  |  {} × {}  |  {} 帧\r\n{}", stats.width, stats.height,
                 host_ ? stats.submitted : stats.presented, rate_text_);
-            text += host_ ? std::format(L"平均采集至提交 {:.2f} ms  |  编码 {:.2f} ms", stats.capture_to_submit_ms, stats.encode_ms)
-                          : std::format(L"平均解码 {:.2f} ms  |  绘制至提交 {:.2f} ms", stats.decode_ms, stats.draw_to_present_ms);
+            if (stats.video_bitrate_limit_bps) {
+                text += std::format(L"  |  视频上限 {} Mbps", *stats.video_bitrate_limit_bps / 1'000'000);
+            }
+            text += L"\r\n";
+            if (stats.minirtc) {
+                text += host_ ? std::format(L"平均采集至提交 {:.2f} ms", stats.capture_to_submit_ms)
+                              : std::format(L"绘制至提交 {:.2f} ms", stats.draw_to_present_ms);
+            } else {
+                text += host_ ? std::format(L"平均采集至提交 {:.2f} ms  |  编码 {:.2f} ms", stats.capture_to_submit_ms, stats.encode_ms)
+                              : std::format(L"平均解码 {:.2f} ms  |  绘制至提交 {:.2f} ms", stats.decode_ms, stats.draw_to_present_ms);
+            }
             const auto ms = [](std::optional<double> value) {
                 return value ? std::format(L"{:.2f} ms", *value) : std::wstring(L"—");
             };
@@ -831,6 +889,9 @@ private:
     HWND low_latency_{};
     HWND quality_label_{};
     HWND quality_{};
+    HWND bitrate_label_{};
+    HWND bitrate_{};
+    bool legacy_quality_options_{};
     HWND stop_{};
     HWND export_{};
     HWND status_panel_{};

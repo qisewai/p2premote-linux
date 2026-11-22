@@ -16,6 +16,7 @@ constexpr UINT swap_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
 constexpr char preview_shader[] = R"hlsl(
 Texture2D image : register(t0);
+Texture2D<float2> chroma : register(t1);
 SamplerState linear_clamp : register(s0);
 
 struct Vertex {
@@ -32,6 +33,47 @@ Vertex vs_main(uint id : SV_VertexID) {
 
 float4 ps_main(Vertex vertex) : SV_Target {
     return float4(image.Sample(linear_clamp, vertex.uv).rgb, 1);
+}
+
+float4 Nv12Color(float luma, float2 chroma_value) {
+    // Match the limited-range BT.709 coefficients used by the libyuv fallback.
+    float y = (luma * 255.0 - 16.0) / 219.0;
+    float2 uv = (chroma_value - 128.0 / 255.0) / 64.0;
+    float3 rgb = y + float3(115.0 * uv.y, dot(uv, float2(-14.0, -34.0)), 128.0 * uv.x);
+    return float4(saturate(rgb), 1);
+}
+
+float4 ps_nv12(Vertex vertex) : SV_Target {
+    return Nv12Color(image.Sample(linear_clamp, vertex.uv).r, chroma.Sample(linear_clamp, vertex.uv));
+}
+
+float EnhanceLuma(float center, float4 neighbors) {
+    float detail = center - (neighbors.x + neighbors.y + neighbors.z + neighbors.w) * 0.25;
+    float boost = min(0.07, 0.65 * max(0.0, abs(detail) - 2.0 / 255.0));
+    // Bound the result by the local range to avoid bright or dark outlines.
+    float low = min(center, min(min(neighbors.x, neighbors.y), min(neighbors.z, neighbors.w)));
+    float high = max(center, max(max(neighbors.x, neighbors.y), max(neighbors.z, neighbors.w)));
+    return clamp(center + sign(detail) * boost, low, high);
+}
+
+float4 ps_nv12_text(Vertex vertex) : SV_Target {
+    float center = image.Sample(linear_clamp, vertex.uv).r;
+    float4 neighbors = image.GatherRed(linear_clamp, vertex.uv);
+    return Nv12Color(EnhanceLuma(center, neighbors), chroma.Sample(linear_clamp, vertex.uv));
+}
+
+float Luma(float3 rgb) {
+    return dot(rgb, float3(0.2126, 0.7152, 0.0722));
+}
+
+float4 ps_main_text(Vertex vertex) : SV_Target {
+    float3 rgb = image.Sample(linear_clamp, vertex.uv).rgb;
+    float center = Luma(rgb);
+    float4 neighbors = float4(Luma(image.Sample(linear_clamp, vertex.uv, int2(-1, 0)).rgb),
+        Luma(image.Sample(linear_clamp, vertex.uv, int2(1, 0)).rgb),
+        Luma(image.Sample(linear_clamp, vertex.uv, int2(0, -1)).rgb),
+        Luma(image.Sample(linear_clamp, vertex.uv, int2(0, 1)).rgb));
+    return float4(saturate(rgb + (EnhanceLuma(center, neighbors) - center)), 1);
 }
 )hlsl";
 
@@ -143,24 +185,37 @@ void D3d11Preview::ResizeToWindow() {
     CreateTarget();
 }
 
-void D3d11Preview::EnsureSource(unsigned width, unsigned height) {
-    if (width != source_width_ || height != source_height_) {
+void D3d11Preview::EnsureSource(unsigned width, unsigned height, bool nv12) {
+    if (width == source_width_ && height == source_height_ && (chroma_ != nullptr) == nv12) return;
+
+    const auto create = [this](unsigned w, unsigned h, DXGI_FORMAT pixel_format) {
         D3D11_TEXTURE2D_DESC texture{};
-        texture.Width = width;
-        texture.Height = height;
+        texture.Width = w;
+        texture.Height = h;
         texture.MipLevels = 1;
         texture.ArraySize = 1;
-        texture.Format = format;
+        texture.Format = pixel_format;
         texture.SampleDesc.Count = 1;
         texture.Usage = D3D11_USAGE_DEFAULT;
         texture.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        source_view_ = nullptr;
-        source_ = nullptr;
-        winrt::check_hresult(device_->CreateTexture2D(&texture, nullptr, source_.put()));
-        winrt::check_hresult(device_->CreateShaderResourceView(source_.get(), nullptr, source_view_.put()));
-        source_width_ = width;
-        source_height_ = height;
+        winrt::com_ptr<ID3D11Texture2D> source;
+        winrt::com_ptr<ID3D11ShaderResourceView> view;
+        winrt::check_hresult(device_->CreateTexture2D(&texture, nullptr, source.put()));
+        winrt::check_hresult(device_->CreateShaderResourceView(source.get(), nullptr, view.put()));
+        return std::pair{std::move(source), std::move(view)};
+    };
+
+    auto [source, view] = create(width, height, nv12 ? DXGI_FORMAT_R8_UNORM : format);
+    decltype(create(width, height, format)) chroma;
+    if (nv12) {
+        chroma = create(width / 2, height / 2, DXGI_FORMAT_R8G8_UNORM);
     }
+    source_ = std::move(source);
+    source_view_ = std::move(view);
+    chroma_ = std::move(chroma.first);
+    chroma_view_ = std::move(chroma.second);
+    source_width_ = width;
+    source_height_ = height;
 }
 
 void D3d11Preview::Upload(const CapturedFrame& frame) {
@@ -178,7 +233,44 @@ void D3d11Preview::UploadBgra(const std::uint8_t* pixels, unsigned stride, unsig
     context_->UpdateSubresource(source_.get(), 0, nullptr, pixels, stride, 0);
 }
 
-void D3d11Preview::Draw() {
+bool D3d11Preview::UploadNv12(const std::uint8_t* y, unsigned y_stride, const std::uint8_t* uv,
+    unsigned uv_stride, unsigned width, unsigned height) {
+    if (nv12_unavailable_ || !y || !uv || !width || !height || ((width | height) & 1u)
+            || y_stride < width || uv_stride < width) return false;
+    try {
+        if (!nv12_shader_) {
+            const auto bytecode = CompileShader("ps_nv12", "ps_5_0");
+            winrt::check_hresult(device_->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
+                nullptr, nv12_shader_.put()));
+        }
+        EnsureSource(width, height, true);
+    } catch (const winrt::hresult_error&) {
+        nv12_unavailable_ = true;
+        return false;
+    }
+    context_->UpdateSubresource(source_.get(), 0, nullptr, y, y_stride, 0);
+    context_->UpdateSubresource(chroma_.get(), 0, nullptr, uv, uv_stride, 0);
+    return true;
+}
+
+ID3D11PixelShader* D3d11Preview::SelectPixelShader(bool enhance_text) {
+    auto* standard = chroma_view_ ? nv12_shader_.get() : pixel_shader_.get();
+    if (!enhance_text || text_filter_unavailable_ || source_width_ > 1280 || source_height_ > 720) return standard;
+    auto& shader = chroma_view_ ? nv12_text_shader_ : text_shader_;
+    if (!shader) {
+        try {
+            const auto bytecode = CompileShader(chroma_view_ ? "ps_nv12_text" : "ps_main_text", "ps_5_0");
+            winrt::check_hresult(device_->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
+                nullptr, shader.put()));
+        } catch (const winrt::hresult_error&) {
+            text_filter_unavailable_ = true;
+            return standard;
+        }
+    }
+    return shader.get();
+}
+
+void D3d11Preview::Draw(bool enhance_text) {
     const auto fitted = Viewport(source_width_, source_height_);
     const D3D11_VIEWPORT viewport{
         static_cast<float>(fitted.left), static_cast<float>(fitted.top),
@@ -191,14 +283,14 @@ void D3d11Preview::Draw() {
     context_->RSSetViewports(1, &viewport);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertex_shader_.get(), nullptr, 0);
-    context_->PSSetShader(pixel_shader_.get(), nullptr, 0);
+    context_->PSSetShader(SelectPixelShader(enhance_text), nullptr, 0);
     auto* sampler = sampler_.get();
     context_->PSSetSamplers(0, 1, &sampler);
-    auto* view = source_view_.get();
-    context_->PSSetShaderResources(0, 1, &view);
+    ID3D11ShaderResourceView* views[] = {source_view_.get(), chroma_view_.get()};
+    context_->PSSetShaderResources(0, 2, views);
     context_->Draw(3, 0);
-    view = nullptr;
-    context_->PSSetShaderResources(0, 1, &view);
+    views[0] = views[1] = nullptr;
+    context_->PSSetShaderResources(0, 2, views);
 }
 
 bool D3d11Preview::Present(unsigned sync_interval) {

@@ -36,7 +36,7 @@ function Get-UpstreamText([string]$file) {
 }
 
 $recipe=Get-UpstreamText 'xmake.lua'
-$recipe=$recipe.Replace('    add_requireconfs("libyuv", {configs = {toolchains = "clang-cl"}})', '    -- Data-only probe uses MSVC for libyuv.')
+$recipe=$recipe.Replace('    add_requireconfs("libyuv", {configs = {toolchains = "clang-cl"}})', '    -- The Windows probe builds libyuv with MSVC.')
 $recipe += @'
 
 target_end()
@@ -67,7 +67,43 @@ $ws=$ws.Replace('            return self->OnTlsVerify(preverified, ctx);',@'
 if (!$ws.Contains('cannot load the probe CA certificate') -or !$ws.Contains('websocketpp::uri(self->uri_)')) {
     throw 'The probe TLS adaptation did not match the pinned MiniRTC source.'
 }
-[IO.File]::WriteAllText((Join-Path $source 'src\ws\ws_client.cpp'),$ws)
+. (Join-Path $PSScriptRoot 'PatchManaged.ps1')
+
+# Reapply local scheduling fixes to the pinned sources on every build.
+$latencyPatch=Join-Path $PSScriptRoot 'LowLatency.patch'
+$latencySources=git -C $source apply --numstat $latencyPatch
+if ($LASTEXITCODE) {throw 'Cannot read the MiniRTC latency patch.'}
+foreach ($entry in $latencySources) {
+    $file=($entry -split "`t",3)[2]
+    [IO.File]::WriteAllText((Join-Path $source $file),(Get-UpstreamText $file))
+}
+git -C $source apply --ignore-whitespace $latencyPatch
+if ($LASTEXITCODE) {throw 'The latency patch did not match the pinned MiniRTC source.'}
+
+# Allow the probe to vary ICE pacing independently of libnice debug logging.
+$ice=Get-UpstreamText 'src/ice/ice_agent.cpp'
+$marker='    g_object_set(agent, "max-connectivity-checks", 512u, nullptr);'
+$pacing=@'
+    // This override is only compiled into the Windows experiment.
+    const char* probe_pacing = g_getenv("P2PREMOTE_MINIRTC_PROBE_ICE_PACING_MS");
+    if (probe_pacing != nullptr) {
+      gchar* end = nullptr;
+      const guint64 milliseconds = g_ascii_strtoull(probe_pacing, &end, 10);
+      if (end != probe_pacing && *end == '\0' && milliseconds >= 20 &&
+          milliseconds <= 200) {
+        g_object_set(agent, "stun-pacing-timer", static_cast<guint>(milliseconds),
+                     nullptr);
+        LOG_INFO("Probe STUN pacing interval: {} ms", milliseconds);
+      } else {
+        LOG_WARN("Ignoring probe STUN pacing override outside 20-200 ms");
+      }
+    }
+'@
+if (!$ice.Contains($marker)) {
+    throw 'The probe ICE pacing adaptation did not match the pinned MiniRTC source.'
+}
+$ice=$ice.Replace($marker,($marker+"`n`n"+$pacing))
+[IO.File]::WriteAllText((Join-Path $source 'src\ice\ice_agent.cpp'),$ice)
 
 $env:P2PREMOTE_MINIRTC_PROBE_DIR=$PSScriptRoot
 Push-Location -LiteralPath $source
@@ -76,5 +112,10 @@ try {
     if ($LASTEXITCODE) {exit $LASTEXITCODE}
     & $Xmake b -y p2premote_minirtc_probe
     if ($LASTEXITCODE) {exit $LASTEXITCODE}
+    & $Xmake b -y p2premote_minirtc
+    if ($LASTEXITCODE) {exit $LASTEXITCODE}
 } finally {Pop-Location}
+$clientDir=Join-Path $root 'out\minirtc'
+Copy-Item -LiteralPath (Join-Path $source 'src\api\minirtc.h') -Destination $clientDir
 Get-Item -LiteralPath (Join-Path $root 'out\minirtc-probe\p2premote_minirtc_probe.exe')
+Get-Item -LiteralPath (Join-Path $clientDir 'p2premote_minirtc.dll')

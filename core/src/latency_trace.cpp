@@ -39,7 +39,7 @@ void LatencyTrace::Record(const char* event, std::uint64_t id, std::uint64_t aux
 
 void LatencyTrace::Pointer(const char* event, const InputPacket& input) {
     constexpr auto left = static_cast<std::uint16_t>(InputButton::left);
-    if (input.kind == InputKind::move || (input.code == left &&
+    if (input.kind == InputKind::move || input.kind == InputKind::wheel || (input.code == left &&
             (input.kind == InputKind::button_down || input.kind == InputKind::button_up))) {
         Record(event, input.sequence, static_cast<std::uint8_t>(input.kind));
     }

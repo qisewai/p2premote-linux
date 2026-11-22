@@ -8,11 +8,26 @@
 namespace p2premote {
 
 enum class InputKind : std::uint8_t {
-    move = 1, button_down, button_up, wheel, key_down, key_up, text, reset, heartbeat, set_quality, cursor_ready
+    move = 1, button_down, button_up, wheel, key_down, key_up, text, reset, heartbeat, set_quality, cursor_ready,
+    set_video_settings, video_settings_reply
 };
 
 enum class InputButton : std::uint16_t { left = 1, right, middle };
 enum class StreamQuality : std::uint16_t { p720 = 1, p1080, p1440 };
+enum class VideoBitratePreset : std::uint16_t { economy = 1, automatic, detail };
+
+constexpr int VideoBitrateLimit(VideoBitratePreset preset) noexcept {
+    switch (preset) {
+    case VideoBitratePreset::economy: return 4'000'000;
+    case VideoBitratePreset::detail: return 16'000'000;
+    case VideoBitratePreset::automatic: return 8'000'000;
+    }
+    return 8'000'000;
+}
+
+constexpr bool IsVideoSettingsMessage(InputKind kind) noexcept {
+    return kind == InputKind::set_video_settings || kind == InputKind::video_settings_reply;
+}
 
 struct InputPacket {
     InputKind kind{};
@@ -22,6 +37,9 @@ struct InputPacket {
     std::uint32_t sequence{};
     std::uint64_t sent_ms{};
 };
+
+// Video settings use code for the resolution and x for the bitrate preset.
+// Replies echo the request sequence and settings, with y set to 1 on failure.
 
 using InputBytes = std::array<std::uint8_t, 20>;
 

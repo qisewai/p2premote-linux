@@ -156,6 +156,8 @@ void InputTestPad::Apply(const p2premote::InputPacket& input) {
         Release();
         return;
     case InputKind::set_quality:
+    case InputKind::set_video_settings:
+    case InputKind::video_settings_reply:
     case InputKind::cursor_ready:
     case InputKind::heartbeat:
         return;

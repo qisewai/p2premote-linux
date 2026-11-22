@@ -17,6 +17,7 @@ namespace p2premote {
 enum class StreamState { idle, waiting, approval, negotiating, streaming, reconnecting, stopped };
 enum class StreamFrameRate { fps30 = 30, fps60 = 60 };
 enum class StreamInputMode { view_only, test_pad, desktop };
+enum class VideoSettingsMode { detecting, independent, legacy };
 
 struct IceDiagnostics {
     std::uint64_t local_srflx{};
@@ -60,6 +61,13 @@ struct StreamStatistics {
     std::string relay_protocol;
     std::optional<double> ice_rtt_ms;
     std::optional<IceDiagnostics> ice_diagnostics;
+    std::optional<std::uint32_t> upload_bps;
+    std::optional<std::uint32_t> download_bps;
+    std::optional<double> video_loss_fraction;
+    bool minirtc{};
+    bool srtp_active{};
+    VideoSettingsMode video_settings_mode{};
+    std::optional<int> video_bitrate_limit_bps;
 };
 
 // The caller owns the window and pumps the three wait handles on that thread.
@@ -71,7 +79,8 @@ public:
     void Start(HMONITOR monitor, HWND surface, const std::wstring& code,
         StreamFrameRate frame_rate = StreamFrameRate::fps30);
     void Approve(StreamInputMode input = StreamInputMode::view_only);
-    void SetQuality(StreamQuality quality) noexcept;
+    void SetQuality(StreamQuality quality);
+    void SetVideoBitratePreset(VideoBitratePreset preset);
     void Stop(std::wstring status);
     void Resize(bool drawable) noexcept;
     void DisplayChanged() noexcept;
@@ -101,6 +110,7 @@ private:
     void Open(HMONITOR monitor, HWND surface, const std::wstring& code, StreamFrameRate frame_rate);
     void Close(std::wstring status, bool intentional);
     void Recover(std::wstring status);
+    void UpdateVideoSettings();
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

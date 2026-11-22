@@ -31,28 +31,45 @@ struct DecodedFrame {
     std::int64_t queued_qpc{};
 };
 
-class RtcCall final : private webrtc::PeerConnectionObserver,
+class MediaCall {
+public:
+    virtual ~MediaCall() = default;
+    virtual void Submit(const webrtc::VideoFrame& frame) = 0;
+    virtual bool SetVideoBitrate(int max_bitrate_bps) = 0;
+    virtual void RequestStats(bool negotiating = false) = 0;
+    virtual bool InputReady() const = 0;
+    virtual bool SendInput(const InputPacket& input) = 0;
+    virtual bool SendVideoSettings(const InputPacket& settings) = 0;
+    virtual bool SendCursor(const std::string& packet) = 0;
+    virtual bool UsesHardwareEncoder() const noexcept = 0;
+    virtual bool HasFrame() const = 0;
+    virtual std::optional<DecodedFrame> TakeFrame() = 0;
+    virtual std::uint64_t ReplacedFrames() const = 0;
+};
+
+class RtcCall final : public MediaCall, private webrtc::PeerConnectionObserver,
                       private webrtc::VideoSinkInterface<webrtc::VideoFrame> {
 public:
     RtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
         bool allow_input = false, int max_framerate = 30, ID3D11Device* video_device = nullptr);
-    ~RtcCall();
+    ~RtcCall() override;
 
     void SetLocal();
     void SetRemote(const std::string& sdp);
     void AddRemoteIce(const std::string& payload);
     std::string LocalSdp() const;
-    void Submit(const webrtc::VideoFrame& frame);
-    bool SetVideoBitrate(int max_bitrate_bps);
-    void RequestStats(bool negotiating = false);
-    bool InputReady() const;
-    bool SendInput(const InputPacket& input);
-    bool SendCursor(const std::string& packet);
-    bool UsesHardwareEncoder() const noexcept { return hardware_encoder_->load(); }
+    void Submit(const webrtc::VideoFrame& frame) override;
+    bool SetVideoBitrate(int max_bitrate_bps) override;
+    void RequestStats(bool negotiating = false) override;
+    bool InputReady() const override;
+    bool SendInput(const InputPacket& input) override;
+    bool SendVideoSettings(const InputPacket& settings) override;
+    bool SendCursor(const std::string& packet) override;
+    bool UsesHardwareEncoder() const noexcept override { return hardware_encoder_->load(); }
 
-    bool HasFrame() const;
-    std::optional<DecodedFrame> TakeFrame();
-    std::uint64_t ReplacedFrames() const;
+    bool HasFrame() const override;
+    std::optional<DecodedFrame> TakeFrame() override;
+    std::uint64_t ReplacedFrames() const override;
 
 private:
     void DrainInput();
@@ -80,6 +97,7 @@ private:
     webrtc::scoped_refptr<webrtc::RtpSenderInterface> video_sender_;
     std::unique_ptr<InputChannel> controls_;
     std::unique_ptr<InputChannel> motion_;
+    std::unique_ptr<InputChannel> video_settings_;
     webrtc::scoped_refptr<webrtc::PendingTaskSafetyFlag> input_tasks_ = webrtc::PendingTaskSafetyFlag::CreateDetached();
     std::mutex input_mutex_;
     std::vector<InputPacket> pending_input_;

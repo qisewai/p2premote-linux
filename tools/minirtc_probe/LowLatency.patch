@@ -1,0 +1,478 @@
+diff --git a/src/common/clock/system_clock.cpp b/src/common/clock/system_clock.cpp
+index 8a0719d..19ef8ab 100644
+--- a/src/common/clock/system_clock.cpp
++++ b/src/common/clock/system_clock.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <time.h>
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <limits>
+ #include <utility>
+@@ -13,10 +14,7 @@
+ #include <mach/mach_time.h>
+ #endif
+ #if defined(_WIN32)
+-// clang-format off: mmsystem.h requires Windows types declared by windows.h.
+ #include <windows.h>
+-#include <mmsystem.h>
+-// clang-format on
+ #endif
+ 
+ namespace minirtc {
+@@ -51,24 +49,10 @@ int64_t ReadMonotonicTimeNs() {
+   ticks = kNumNanosecsPerSec * static_cast<int64_t>(ts.tv_sec) +
+           static_cast<int64_t>(ts.tv_nsec);
+ #elif defined(_WIN32)
+-  static volatile LONG last_timegettime = 0;
+-  static volatile int64_t num_wrap_timegettime = 0;
+-  volatile LONG *last_timegettime_ptr = &last_timegettime;
+-  DWORD now = timeGetTime();
+-  // Atomically update the last gotten time
+-  DWORD old = InterlockedExchange(last_timegettime_ptr, now);
+-  if (now < old) {
+-    // If now is earlier than old, there may have been a race between threads.
+-    // 0x0fffffff ~3.1 days, the code will not take that long to execute
+-    // so it must have been a wrap around.
+-    if (old > 0xf0000000 && now < 0x0fffffff) {
+-      num_wrap_timegettime++;
+-    }
+-  }
+-  ticks = now + (num_wrap_timegettime << 32);
+-  // TODO(deadbeef): Calculate with nanosecond precision. Otherwise, we're
+-  // just wasting a multiply and divide when doing Time() on Windows.
+-  ticks = ticks * 1000000LL; // Convert milliseconds to nanoseconds
++  // Keep packet pacing and frame admission on a high-resolution clock.
++  ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(
++              std::chrono::steady_clock::now().time_since_epoch())
++              .count();
+ #endif
+   return ticks;
+ }
+diff --git a/src/common/task_queue.h b/src/common/task_queue.h
+index 6d2eef5..d56a607 100644
+--- a/src/common/task_queue.h
++++ b/src/common/task_queue.h
+@@ -14,6 +14,13 @@
+ #include <thread>
+ #include <vector>
+ 
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#endif
++
+ #include "any_invocable.h"
+ #include "log.h"
+ 
+@@ -21,17 +28,35 @@ namespace minirtc {
+ 
+ class TaskQueue {
+  public:
++  enum class Timer { Default, HighResolution };
++
+   TaskQueue(std::string task_name, bool log_enabled = false,
+-            size_t numThreads = 1)
++            size_t numThreads = 1, Timer timer = Timer::Default)
+       : task_name_(std::move(task_name)),
+         log_enabled_(log_enabled),
+         stop_(false) {
++#if defined(_WIN32)
++    if (timer == Timer::HighResolution && numThreads == 1) {
++      deadline_timer_ = CreateWaitableTimerExW(
++          nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++          TIMER_MODIFY_STATE | SYNCHRONIZE);
++      if (deadline_timer_) {
++        deadline_changed_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++      }
++    }
++#endif
+     for (size_t i = 0; i < numThreads; ++i) {
+       workers_.emplace_back([this]() { this->WorkerThread(); });
+     }
+   }
+ 
+-  ~TaskQueue() { Stop(); }
++  ~TaskQueue() {
++    Stop();
++#if defined(_WIN32)
++    if (deadline_changed_) CloseHandle(deadline_changed_);
++    if (deadline_timer_) CloseHandle(deadline_timer_);
++#endif
++  }
+ 
+   bool PostTask(AnyInvocable<void()> task) {
+     return PostDelayedTask(std::move(task), 0);
+@@ -61,6 +86,7 @@ class TaskQueue {
+       taskQueue_.swap(cleared_tasks);
+     }
+     cond_var_.notify_all();
++    WakeDeadlineWait();
+   }
+ 
+   void Stop() {
+@@ -69,6 +95,7 @@ class TaskQueue {
+       stop_ = true;
+     }
+     cond_var_.notify_all();
++    WakeDeadlineWait();
+     for (std::thread& worker : workers_) {
+       if (worker.joinable()) {
+         worker.join();
+@@ -78,6 +105,36 @@ class TaskQueue {
+   }
+ 
+  private:
++  void WakeDeadlineWait() {
++#if defined(_WIN32)
++    if (deadline_changed_) SetEvent(deadline_changed_);
++#endif
++  }
++
++  void WaitForDeadline(std::unique_lock<std::mutex>& lock,
++                       std::chrono::steady_clock::time_point deadline) {
++#if defined(_WIN32)
++    if (deadline_changed_ && !deadline_wait_failed_) {
++      using WindowsTicks = std::chrono::duration<int64_t, std::ratio<1, 10000000>>;
++      const auto remaining = deadline - std::chrono::steady_clock::now();
++      if (remaining <= std::chrono::steady_clock::duration::zero()) return;
++      // Relative Windows waitable-timer deadlines use negative 100 ns units.
++      LARGE_INTEGER due{};
++      due.QuadPart = -std::chrono::ceil<WindowsTicks>(remaining).count();
++      if (SetWaitableTimer(deadline_timer_, &due, 0, nullptr, nullptr, FALSE)) {
++        const HANDLE handles[] = {deadline_timer_, deadline_changed_};
++        lock.unlock();
++        const auto result = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
++        lock.lock();
++        deadline_wait_failed_ = result == WAIT_FAILED;
++        return;  // Recheck the queue even if the wait failed.
++      }
++      deadline_wait_failed_ = true;
++    }
++#endif
++    cond_var_.wait_until(lock, deadline);
++  }
++
+   bool PostDelayedTaskAt(
+       AnyInvocable<void()> task,
+       std::chrono::steady_clock::time_point execute_time) {
+@@ -94,6 +151,7 @@ class TaskQueue {
+     }
+     if (notify) {
+       cond_var_.notify_one();
++      WakeDeadlineWait();
+     }
+     return true;
+   }
+@@ -149,7 +207,7 @@ class TaskQueue {
+           auto execute_time = top.execute_time;
+ 
+           if (execute_time > now) {
+-            cond_var_.wait_until(lock, execute_time);
++            WaitForDeadline(lock, execute_time);
+             if (stop_) return;
+             continue;
+           }
+@@ -197,6 +255,11 @@ class TaskQueue {
+   std::condition_variable cond_var_;
+   bool stop_;
+   uint64_t next_sequence_id_ = 0;
++#if defined(_WIN32)
++  HANDLE deadline_timer_ = nullptr;
++  HANDLE deadline_changed_ = nullptr;
++  bool deadline_wait_failed_ = false;
++#endif
+ 
+   inline static thread_local const TaskQueue* current_queue_ = nullptr;
+ };
+diff --git a/src/media/video/decode/openh264/openh264_decoder.cpp b/src/media/video/decode/openh264/openh264_decoder.cpp
+index ca0243b..a2a367c 100644
+--- a/src/media/video/decode/openh264/openh264_decoder.cpp
++++ b/src/media/video/decode/openh264/openh264_decoder.cpp
+@@ -84,8 +84,9 @@ int OpenH264Decoder::Init() {
+     return -1;
+   }
+ 
+-  // 1 thread for decoding, do not use more threads
+-  int decode_thread_count = 1;
++  // OpenH264 buffers a picture in threaded mode even with one worker.
++  // MiniRTC already invokes the decoder on its decode queue.
++  int decode_thread_count = 0;
+   ret = openh264_decoder_->SetOption(DECODER_OPTION_NUM_OF_THREADS,
+                                      &decode_thread_count);
+   if (ret != cmResultSuccess) {
+diff --git a/src/thread/thread_base.cpp b/src/thread/thread_base.cpp
+index e1f34f6..37d7767 100644
+--- a/src/thread/thread_base.cpp
++++ b/src/thread/thread_base.cpp
+@@ -59,13 +59,22 @@ std::string ThreadBase::GetThreadName() {
+   return thread_name_;
+ }
+ 
++void ThreadBase::Wake() {
++  {
++    std::lock_guard<std::mutex> lock(cv_mtx_);
++    work_pending_ = true;
++  }
++  cv_.notify_one();
++}
++
+ void ThreadBase::Run() {
+-  while (running_) {
++  for (;;) {
+     std::unique_lock<std::mutex> lock(cv_mtx_);
+-    cv_.wait_for(lock, period_, [this] { return !running_; });
+-    if (running_) {
+-      Process();
+-    }
++    cv_.wait_for(lock, period_, [this] { return !running_ || work_pending_; });
++    if (!running_) return;
++    work_pending_ = false;
++    lock.unlock();
++    Process();
+   }
+ }
+-}  // namespace minirtc
+\ No newline at end of file
++}  // namespace minirtc
+diff --git a/src/thread/thread_base.h b/src/thread/thread_base.h
+index 7129276..1bf24be 100644
+--- a/src/thread/thread_base.h
++++ b/src/thread/thread_base.h
+@@ -28,6 +28,9 @@ class ThreadBase {
+ 
+   virtual bool Process() = 0;
+ 
++ protected:
++  void Wake();
++
+  private:
+   void Run();
+ 
+@@ -38,10 +41,11 @@ class ThreadBase {
+ 
+   std::condition_variable cv_;
+   std::mutex cv_mtx_;
++  bool work_pending_ = false;
+ 
+   std::atomic<bool> running_;
+   std::atomic<bool> pause_;
+ };
+ }  // namespace minirtc
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/transport/channel/data_channel_send.cpp b/src/transport/channel/data_channel_send.cpp
+index f4813d5..47af2c6 100644
+--- a/src/transport/channel/data_channel_send.cpp
++++ b/src/transport/channel/data_channel_send.cpp
+@@ -105,17 +105,14 @@ int DataChannelSend::SendReliableData(const char* data, size_t size) {
+     return ret;
+   }
+ 
++  // Send new control messages immediately. The timer still drives retries.
++  ikcp_update(kcp_, GetCurrentTimeMs());
++  ikcp_flush(kcp_);
+   return 0;
+ }
+ 
+ bool DataChannelSend::InitKcp() {
+-  // Double-checked locking pattern
+-  if (kcp_) {
+-    return true;
+-  }
+-
+   std::lock_guard<std::mutex> lock(kcp_mutex_);
+-  // Check again after acquiring lock
+   if (kcp_) {
+     return true;
+   }
+diff --git a/src/transport/channel/rtp_data_sender.cpp b/src/transport/channel/rtp_data_sender.cpp
+index 03da178..922fd41 100644
+--- a/src/transport/channel/rtp_data_sender.cpp
++++ b/src/transport/channel/rtp_data_sender.cpp
+@@ -17,13 +17,20 @@ RtpDataSender::RtpDataSender(std::shared_ptr<IOStatistics> io_statistics)
+   SetThreadName("RtpDataSender");
+ }
+ 
+-RtpDataSender::~RtpDataSender() { SSRCManager::Instance().DeleteSsrc(ssrc_); }
++RtpDataSender::~RtpDataSender() {
++  Stop();
++  SSRCManager::Instance().DeleteSsrc(ssrc_);
++}
+ 
+ void RtpDataSender::Enqueue(
+     std::vector<std::unique_ptr<RtpPacket>>& rtp_packets) {
+-  for (auto& rtp_packet : rtp_packets) {
+-    rtp_packet_queue_.push(std::move(rtp_packet));
++  {
++    std::lock_guard<std::mutex> lock(queue_mutex_);
++    for (auto& rtp_packet : rtp_packets) {
++      rtp_packet_queue_.push(std::move(rtp_packet));
++    }
+   }
++  Wake();
+ }
+ 
+ void RtpDataSender::SetSendDataFunc(
+@@ -40,6 +47,7 @@ int RtpDataSender::SendRtpPacket(std::unique_ptr<RtpPacket> rtp_packet) {
+   int ret = data_send_func_((const char*)rtp_packet->Buffer().data(),
+                             rtp_packet->Size());
+   if (-2 == ret) {
++    std::lock_guard<std::mutex> lock(queue_mutex_);
+     rtp_packet_queue_.clear();
+     return -1;
+   }
+@@ -131,15 +139,16 @@ bool RtpDataSender::CheckIsTimeSendSR() {
+ }
+ 
+ bool RtpDataSender::Process() {
+-  for (size_t i = 0; i < 10; i++)
+-    if (!rtp_packet_queue_.isEmpty()) {
+-      std::optional<std::unique_ptr<RtpPacket>> rtp_packet =
+-          rtp_packet_queue_.pop();
+-      if (rtp_packet) {
+-        SendRtpPacket(std::move(*rtp_packet));
+-      }
++  for (size_t i = 0; i < 10; ++i) {
++    std::optional<std::unique_ptr<RtpPacket>> packet;
++    {
++      std::lock_guard<std::mutex> lock(queue_mutex_);
++      packet = rtp_packet_queue_.pop();
+     }
+-
++    if (!packet) return true;
++    SendRtpPacket(std::move(*packet));
++  }
++  Wake();
+   return true;
+ }
+ }  // namespace minirtc
+diff --git a/src/transport/channel/rtp_data_sender.h b/src/transport/channel/rtp_data_sender.h
+index 15b76b5..68a3c15 100644
+--- a/src/transport/channel/rtp_data_sender.h
++++ b/src/transport/channel/rtp_data_sender.h
+@@ -10,6 +10,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <functional>
++#include <mutex>
+ 
+ #include "io_statistics.h"
+ #include "receiver_report.h"
+@@ -44,6 +45,7 @@ class RtpDataSender : public ThreadBase {
+ 
+  private:
+   std::function<int(const char*, size_t)> data_send_func_ = nullptr;
++  std::mutex queue_mutex_;
+   RingBuffer<std::unique_ptr<RtpPacket>> rtp_packet_queue_;
+ 
+  private:
+diff --git a/src/transport/channel/rtp_video_receiver.cpp b/src/transport/channel/rtp_video_receiver.cpp
+index cdb99a7..78e8a21 100644
+--- a/src/transport/channel/rtp_video_receiver.cpp
++++ b/src/transport/channel/rtp_video_receiver.cpp
+@@ -227,6 +227,7 @@ void RtpVideoReceiver::CommitPendingFrame(
+                                       : clock_->CurrentTime().ms();
+   pending_frame = {std::move(frame), true, first_arrival_time, is_keyframe,
+                    end_sequence_number};
++  Wake();
+ }
+ 
+ void RtpVideoReceiver::ClearFrameMarkers(uint32_t timestamp) {
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+index 3164f5c..f8edb52 100644
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -146,7 +146,8 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
+   }
+ 
+   task_queue_cc_ = std::make_shared<TaskQueue>("congest control");
+-  task_queue_pacer_ = std::make_shared<TaskQueue>("pacer");
++  task_queue_pacer_ = std::make_shared<TaskQueue>(
++      "pacer", false, 1, TaskQueue::Timer::HighResolution);
+   task_queue_encode_ = std::make_shared<TaskQueueLockFree>("encode");
+   task_queue_decode_ = std::make_shared<TaskQueueLockFree>("decode");
+   task_queue_trans_fb_ =
+@@ -3279,9 +3280,38 @@ void IceTransportController::RollbackPacketFeedback(
+   transport_feedback_adapter_.RemovePacket(packet);
+ }
+ 
++MiniRtcVideoSendQueueStats IceTransportController::TakeVideoSendQueueStats() {
++  std::lock_guard<std::mutex> lock(video_send_queue_mutex_);
++  auto stats = video_send_queue_stats_;
++  if (!stats.packets) return stats;
++  const auto target = stats.packets - stats.packets / 20;
++  uint64_t count = 0;
++  for (size_t bucket = 0; bucket < video_send_queue_buckets_.size(); ++bucket) {
++    count += video_send_queue_buckets_[bucket];
++    if (count >= target) {
++      stats.p95_bucket_ms = static_cast<uint32_t>(bucket);
++      break;
++    }
++  }
++  video_send_queue_stats_ = {};
++  video_send_queue_buckets_.fill(0);
++  return stats;
++}
++
+ void IceTransportController::OnSentPacket(
+     const webrtc::RtpPacketToSend& packet,
+     const PacketFeedbackRegistration& registration) {
++  const auto queue_wait = packet.time_in_send_queue();
++  if (packet.packet_type() == webrtc::RtpPacketMediaType::kVideo && queue_wait &&
++      queue_wait->IsFinite() && *queue_wait >= webrtc::TimeDelta::Zero()) {
++    const auto delay_us = static_cast<uint64_t>(queue_wait->us());
++    const auto bucket = std::min<uint64_t>(video_send_queue_buckets_.size() - 1,
++                                           (delay_us + 999) / 1000);
++    std::lock_guard<std::mutex> lock(video_send_queue_mutex_);
++    ++video_send_queue_buckets_[bucket];
++    ++video_send_queue_stats_.packets;
++    video_send_queue_stats_.total_wait_us += delay_us;
++  }
+   if (registration.tracked) {
+     std::lock_guard<std::mutex> lock(transport_feedback_adapter_mutex_);
+     transport_feedback_adapter_.CommitFecSend(registration.fec_feedback_id);
+diff --git a/src/transport/ice_transport_controller.h b/src/transport/ice_transport_controller.h
+index ab22ca8..b6a1b25 100644
+--- a/src/transport/ice_transport_controller.h
++++ b/src/transport/ice_transport_controller.h
+@@ -137,6 +137,7 @@ class IceTransportController
+ 
+   void UpdateNetworkAvaliablity(bool network_available);
+   void SetRelayPath(bool relay_path);
++  MiniRtcVideoSendQueueStats TakeVideoSendQueueStats();
+ 
+   int DecryptIncomingPacket(uint8_t* buffer, int* size, uint32_t* out_ssrc);
+ 
+@@ -525,6 +526,10 @@ class IceTransportController
+   webrtc::DataSize congestion_window_size_;
+   std::atomic<bool> is_congested_{false};
+   std::string last_active_stream_;
++  std::mutex video_send_queue_mutex_;
++  // Whole-millisecond upper bounds; values at or beyond 100 ms share a bucket.
++  std::array<uint64_t, 101> video_send_queue_buckets_{};
++  MiniRtcVideoSendQueueStats video_send_queue_stats_{};
+ 
+  private:
+   std::unique_ptr<ResolutionAdapter> resolution_adapter_;
+diff --git a/src/transport/paced_sender/paced_sender.cpp b/src/transport/paced_sender/paced_sender.cpp
+index 9bf1de1..b48bfda 100644
+--- a/src/transport/paced_sender/paced_sender.cpp
++++ b/src/transport/paced_sender/paced_sender.cpp
+@@ -429,10 +429,7 @@ void PacedSender::MaybeProcessPackets(
+       next_process_time_ > next_send_time) {
+     if (task_queue_pacer_->PostDelayedHighPrecisionTask(
+             [this, next_send_time]() { MaybeProcessPackets(next_send_time); },
+-            std::chrono::microseconds(time_to_next_process
+-                                          .RoundUpTo(
+-                                              webrtc::TimeDelta::Millis(1))
+-                                          .us()))) {
++            std::chrono::microseconds(time_to_next_process.us()))) {
+       next_process_time_ = next_send_time;
+     } else {
+       LOG_WARN("Pacer process task rejected: task queue is stopped");

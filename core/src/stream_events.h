@@ -47,10 +47,14 @@ struct RtcCounters {
     std::optional<double> ice_rtt_ms;
     std::optional<IceCheckStats> ice_checks;
     IceDiagnostics ice_diagnostics;
+    std::optional<std::uint32_t> upload_bps;
+    std::optional<std::uint32_t> download_bps;
+    std::optional<double> video_loss_fraction;
+    bool srtp_active{};
 };
 
 enum class StreamEventType { signal, signal_lost, media_lost, error, gathered, local_set, remote_set,
-    ice_candidate, connected, stats, input_ready, input, cursor };
+    ice_candidate, connected, stats, input_ready, input, cursor, minirtc_signal, video_settings };
 
 struct StreamEvent {
     StreamEventType type;
@@ -59,6 +63,7 @@ struct StreamEvent {
     RtcCounters counters{};
     InputPacket input{};
     bool retryable{};
+    bool minirtc{};
 };
 
 class StreamEvents {
