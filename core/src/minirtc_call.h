@@ -33,9 +33,13 @@ public:
     void RequestStats();
     bool InputReady() const { return allow_input_ && connected_.load(); }
     bool SendInput(const InputPacket& input);
+    bool SendInputCommand(const InputCommand& command);
+    bool WorkspaceInputReady() const noexcept { return workspace_peer_.load(); }
     bool SendVideoSettings(const InputPacket& settings);
     bool SendCursor(const std::string& packet);
     void SetPluginsConnected(bool connected) noexcept;
+    void ProbeWorkspace() noexcept;
+    PluginHost* Plugins() const noexcept { return plugins_.get(); }
     bool HasFrame() const;
     std::optional<DecodedFrame> TakeFrame();
     std::uint64_t ReplacedFrames() const;
@@ -46,6 +50,7 @@ private:
     static void Video(const MiniRtcVideoFrame*, const char*, size_t, const char*, size_t, void*);
     static void Data(const char*, size_t, const char*, size_t, const char*, size_t, void*);
     static void Network(const char*, size_t, TraversalMode, const MiniRtcNetTrafficStats*, const char*, size_t, void*);
+    void SendWorkspaceMessage(std::string_view kind) noexcept;
 
     const bool host_, allow_input_;
     const std::shared_ptr<StreamEvents> events_;
@@ -61,6 +66,11 @@ private:
     RtcCounters counters_;
     std::unique_ptr<PluginHost> plugins_;
     std::atomic_bool plugin_transport_{};
+    std::atomic_bool workspace_peer_{};
+    std::atomic_bool workspace_running_{};
+    std::atomic_bool workspace_reply_pending_{};
+    ULONGLONG workspace_retry_{};
+    unsigned workspace_attempts_{};
 };
 
 } // namespace p2premote

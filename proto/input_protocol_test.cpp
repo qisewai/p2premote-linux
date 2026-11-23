@@ -62,5 +62,24 @@ int main() {
     passed &= check(input.Accept({InputKind::move, 0, 1, 1, 3, 60}, 210).has_value(), "Rejected motion after the wheel event");
     const auto stale_button = input.Accept({InputKind::button_up, 1, 1, 1, 4, 70}, 2300);
     passed &= check(stale_button && stale_button->kind == InputKind::reset, "Stale button release did not clear held input");
+
+    using namespace p2premote;
+    const InputCommand chord{InputCommandKind::shortcut, {0xa2, 0xa0, 0x1b}, 73};
+    const auto chord_bytes = EncodeInputCommand(chord);
+    const auto decoded_chord = DecodeInputCommand(chord_bytes);
+    passed &= check(decoded_chord && decoded_chord->kind == chord.kind && decoded_chord->units == chord.units
+        && decoded_chord->sent_ms == 73 && !DecodeInput(chord_bytes), "Keyboard chord lost order or fell through to old input");
+    passed &= check(!DecodeInputCommand(std::span(chord_bytes).first(chord_bytes.size() - 1))
+        && EncodeInputCommand({InputCommandKind::shortcut, {0x1d, 0x1d}, 0}).empty()
+        && EncodeInputCommand({InputCommandKind::shortcut, {512}, 0}).empty(), "Accepted an invalid key sequence");
+    const InputCommand text{InputCommandKind::text, {0x6d4b, '\t', 0xd83d, 0xde00, '\r', '\n'}, 74};
+    const auto decoded_text = DecodeInputCommand(EncodeInputCommand(text));
+    passed &= check(decoded_text && decoded_text->units == text.units, "Unicode text did not survive encoding");
+    passed &= check(EncodeInputCommand({InputCommandKind::text, {0xd83d}, 0}).empty()
+        && EncodeInputCommand({InputCommandKind::text, {0xde00}, 0}).empty()
+        && EncodeInputCommand({InputCommandKind::text, {0}, 0}).empty()
+        && EncodeInputCommand({InputCommandKind::text, std::vector<std::uint16_t>(input_text_limit + 1, 'x'), 0}).empty(),
+        "Accepted malformed or oversized Unicode text");
+    passed &= check(!input.AcceptCommand(text, 2300), "Accepted stale macro text");
     return passed ? 0 : 1;
 }

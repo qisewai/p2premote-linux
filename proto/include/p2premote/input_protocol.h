@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace p2premote {
 
@@ -46,6 +47,20 @@ using InputBytes = std::array<std::uint8_t, 20>;
 [[nodiscard]] InputBytes EncodeInput(const InputPacket& packet);
 [[nodiscard]] std::optional<InputPacket> DecodeInput(std::span<const std::uint8_t> bytes);
 
+enum class InputCommandKind : std::uint8_t { shortcut = 1, text };
+inline constexpr std::size_t shortcut_limit = 8;
+inline constexpr std::size_t input_text_limit = 256;
+
+struct InputCommand {
+    InputCommandKind kind{};
+    // Windows virtual keys for a shortcut, or UTF-16 code units for text.
+    std::vector<std::uint16_t> units;
+    std::uint64_t sent_ms{};
+};
+
+[[nodiscard]] std::vector<std::uint8_t> EncodeInputCommand(const InputCommand& command);
+[[nodiscard]] std::optional<InputCommand> DecodeInputCommand(std::span<const std::uint8_t> bytes);
+
 constexpr unsigned input_heartbeat_ms = 150;
 constexpr unsigned input_lease_ms = 750;
 constexpr unsigned input_max_age_ms = 2000;
@@ -61,6 +76,7 @@ private:
 class InputReceiveState {
 public:
     [[nodiscard]] std::optional<InputPacket> Accept(const InputPacket& input, std::uint64_t received_ms);
+    bool AcceptCommand(const InputCommand& command, std::uint64_t received_ms) { return clock_.IsFresh(command.sent_ms, received_ms); }
 
 private:
     InputReceiveClock clock_;

@@ -36,7 +36,7 @@ using p2premote::VideoBitratePreset;
 enum ControlId {
     screen_select = 200, connect_button, allow_button,
     stop_button, export_button, status_text, allow_input_button, low_latency_mode, quality_select, status_panel,
-    overlay_toggle, bitrate_select
+    overlay_toggle, bitrate_select, plugin_button
 };
 constexpr std::array quality_levels{StreamQuality::p720, StreamQuality::p1080, StreamQuality::p1440};
 constexpr std::array quality_labels{L"720p", L"1080p", L"1440p"};
@@ -195,6 +195,7 @@ public:
         if (!host_) status_panel_ = Control(L"BUTTON", L"连接状态", BS_GROUPBOX, status_panel);
         status_ = Control(L"STATIC", L"", SS_LEFT, status_text);
         if (!host_) {
+            plugins_ = Control(L"BUTTON", L"插件", BS_PUSHBUTTON | WS_TABSTOP, plugin_button);
             quality_label_ = Control(L"STATIC", L"分辨率", SS_LEFT, 0);
             quality_ = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, quality_select);
             for (const auto* label : quality_labels) {
@@ -342,6 +343,7 @@ private:
             case stop_button: session_.Stop(L"已断开"); Update(); return 0;
             case export_button: Export(); return 0;
             case overlay_toggle: UpdateOverlay(session_.Statistics()); return 0;
+            case plugin_button: ShowPluginMenu(); return 0;
             }
             break;
         case WM_SIZE: Layout(); return 0;
@@ -355,7 +357,7 @@ private:
         case WM_GETMINMAXINFO:
             if (!host_) {
                 auto& info = *reinterpret_cast<MINMAXINFO*>(lparam);
-                info.ptMinTrackSize = {MulDiv(710, GetDpiForWindow(hwnd), 96), MulDiv(340, GetDpiForWindow(hwnd), 96)};
+                info.ptMinTrackSize = {MulDiv(770, GetDpiForWindow(hwnd), 96), MulDiv(340, GetDpiForWindow(hwnd), 96)};
             }
             return 0;
         case WM_DISPLAYCHANGE:
@@ -399,13 +401,39 @@ private:
 
     void ProcessSessionEvents() {
         const auto before = session_.State();
+        const auto had_menu = !host_ && session_.HasPluginMenu();
+        const std::wstring previous_notice = !host_ ? std::wstring(session_.PluginNotice()) : std::wstring{};
         session_.ProcessEvents();
         const auto input_changed = RefreshInputReady();
         if (!host_) RefreshLocalCursor();
         const auto new_stats = Measure();
-        if (new_stats || input_changed || before != session_.State() || before == StreamState::waiting) {
+        const auto plugin_ui_changed = !host_ && (had_menu != session_.HasPluginMenu() || previous_notice != session_.PluginNotice());
+        if (new_stats || input_changed || plugin_ui_changed || before != session_.State() || before == StreamState::waiting) {
             Update();
         }
+    }
+
+    void ShowPluginMenu() {
+        const auto entries = session_.PluginMenu();
+        if (entries.empty()) return;
+        const auto menu = CreatePopupMenu();
+        if (!menu) return;
+        for (const auto& item : entries) {
+            AppendMenuW(menu, MF_STRING | (item.checked.value_or(false) ? MF_CHECKED : MF_UNCHECKED), item.id, item.label.c_str());
+        }
+        RECT button{};
+        GetWindowRect(plugins_, &button);
+        const auto command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            button.left, button.bottom, window_, nullptr);
+        DestroyMenu(menu);
+        if (command) {
+            UpdatePluginLocks();
+            session_.InvokePluginMenu(command);
+        }
+    }
+
+    void UpdatePluginLocks() {
+        session_.UpdatePluginLockState((GetKeyState(VK_CAPITAL) & 1) != 0, (GetKeyState(VK_NUMLOCK) & 1) != 0);
     }
 
     void TryPresent() {
@@ -518,6 +546,10 @@ private:
             return 0;
         case WM_KEYDOWN:
         case WM_KEYUP:
+            if (wparam == VK_CAPITAL || wparam == VK_NUMLOCK) {
+                UpdatePluginLocks();
+                if (session_.PluginCapturesLockKeys()) return 0;
+            }
             if (GetFocus() == hwnd) SetKey(wparam, lparam, message == WM_KEYDOWN);
             return 0;
         case WM_SYSKEYDOWN:
@@ -699,6 +731,7 @@ private:
             const auto width = std::max(0L, rect.right - px(20));
             const auto height = std::max(0L, rect.bottom - px(176));
             MoveWindow(overlay_toggle_, rect.right - px(70), px(9), px(60), px(24), TRUE);
+            MoveWindow(plugins_, rect.right - px(138), px(9), px(60), px(24), TRUE);
             MoveWindow(surface_, px(10), px(42), width, height, TRUE);
             MoveWindow(placeholder_, px(10), px(42), width, height, TRUE);
             MoveWindow(status_panel_, px(10), px(46) + height, width, px(122), TRUE);
@@ -812,6 +845,8 @@ private:
             EnableWindow(allow_, state == StreamState::approval);
             EnableWindow(allow_input_, state == StreamState::approval);
         } else {
+            UpdatePluginLocks();
+            EnableWindow(plugins_, session_.HasPluginMenu());
             const auto show_video = state == StreamState::streaming;
             if (show_video != video_visible_) {
                 ShowWindow(surface_, show_video ? SW_SHOWNA : SW_HIDE);
@@ -861,6 +896,10 @@ private:
             HCURSOR cursor{};
             if (session_.LocalCursor(cursor)) text += L"\r\n本地光标 · 点击画面接管键鼠，按 F12 释放。";
             else text += L"\r\n画面同步光标 · 点击画面接管键鼠，按 F12 释放。";
+        }
+        if (const auto notice = session_.PluginNotice(); !notice.empty()) {
+            text += L"\r\n";
+            text += notice;
         }
         if (session_.DesktopControl()) text += hotkey_ ? L"\r\n本机 Ctrl+Alt+F11 停止整桌面控制。"
                                                       : L"\r\n点击断开以停止整桌面控制。";
@@ -918,6 +957,7 @@ private:
     HWND surface_{};
     HWND placeholder_{};
     HWND overlay_toggle_{};
+    HWND plugins_{};
     HWND overlay_{};
     bool video_visible_{};
     bool input_ready_{};

@@ -7,6 +7,8 @@ namespace p2premote {
 namespace {
 
 constexpr std::uint8_t version = 1;
+constexpr std::uint8_t command_version = 2;
+constexpr std::size_t command_header = 12;
 
 void WriteLittleEndian(std::span<std::uint8_t> bytes, std::uint64_t value) {
     for (auto& byte : bytes) {
@@ -49,6 +51,26 @@ bool ValidCode(InputKind kind, std::uint16_t code) {
     return false;
 }
 
+bool ValidCommand(InputCommandKind kind, std::span<const std::uint16_t> units) {
+    if (units.empty()) return false;
+    if (kind == InputCommandKind::shortcut) {
+        if (units.size() > shortcut_limit) return false;
+        for (std::size_t i = 0; i < units.size(); ++i) {
+            const auto prefix = units.first(i);
+            if (units[i] == 0 || units[i] > 0xfe || std::ranges::find(prefix, units[i]) != prefix.end()) return false;
+        }
+        return true;
+    }
+    if (kind != InputCommandKind::text || units.size() > input_text_limit) return false;
+    bool surrogate{};
+    for (const auto unit : units) {
+        const bool low = unit >= 0xdc00 && unit <= 0xdfff;
+        if ((unit < 32 && unit != '\n' && unit != '\r' && unit != '\t') || unit == 127 || low != surrogate) return false;
+        surrogate = unit >= 0xd800 && unit <= 0xdbff;
+    }
+    return !surrogate;
+}
+
 } // namespace
 
 InputBytes EncodeInput(const InputPacket& packet) {
@@ -80,6 +102,33 @@ std::optional<InputPacket> DecodeInput(std::span<const std::uint8_t> bytes) {
             || x > static_cast<std::uint16_t>(VideoBitratePreset::detail)
             || y > (kind == InputKind::video_settings_reply ? 1 : 0))) return std::nullopt;
     return InputPacket{kind, code, x, y, sequence, ReadLittleEndian(bytes.subspan<12, 8>())};
+}
+
+std::vector<std::uint8_t> EncodeInputCommand(const InputCommand& command) {
+    if (!ValidCommand(command.kind, command.units)) return {};
+    std::vector<std::uint8_t> bytes(command_header + 2 * command.units.size());
+    std::span wire(bytes);
+    bytes[0] = command_version;
+    bytes[1] = static_cast<std::uint8_t>(command.kind);
+    WriteLittleEndian(wire.subspan<2, 2>(), command.units.size());
+    WriteLittleEndian(wire.subspan<4, 8>(), command.sent_ms);
+    for (std::size_t i = 0; i < command.units.size(); ++i) {
+        WriteLittleEndian(wire.subspan(command_header + 2 * i, 2), command.units[i]);
+    }
+    return bytes;
+}
+
+std::optional<InputCommand> DecodeInputCommand(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < command_header || bytes[0] != command_version) return std::nullopt;
+    const auto count = ReadLittleEndian(bytes.subspan<2, 2>());
+    if (!count || count > input_text_limit || bytes.size() != command_header + 2 * count) return std::nullopt;
+    InputCommand command{static_cast<InputCommandKind>(bytes[1]), {}, ReadLittleEndian(bytes.subspan<4, 8>())};
+    command.units.reserve(static_cast<std::size_t>(count));
+    for (std::size_t offset = command_header; offset < bytes.size(); offset += 2) {
+        command.units.push_back(static_cast<std::uint16_t>(ReadLittleEndian(bytes.subspan(offset, 2))));
+    }
+    if (!ValidCommand(command.kind, command.units)) return std::nullopt;
+    return command;
 }
 
 bool InputReceiveClock::IsFresh(std::uint64_t sent_ms, std::uint64_t received_ms) {

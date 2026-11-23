@@ -6,6 +6,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
+#include <utility>
 
 namespace p2premote {
 namespace {
@@ -20,6 +21,38 @@ INPUT Key(std::uint16_t scan, bool up) {
     input.ki.dwFlags = KEYEVENTF_SCANCODE | ((scan & 0x100) ? KEYEVENTF_EXTENDEDKEY : 0)
         | (up ? KEYEVENTF_KEYUP : 0);
     return input;
+}
+
+INPUT UnicodeKey(std::uint16_t code, bool up) {
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wScan = code;
+    input.ki.dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0);
+    return input;
+}
+
+bool IsExtendedVirtualKey(std::uint16_t key) noexcept {
+    switch (key) {
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_HOME:
+    case VK_END:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_LEFT:
+    case VK_RIGHT:
+    case VK_UP:
+    case VK_DOWN:
+    case VK_LWIN:
+    case VK_RWIN:
+    case VK_APPS:
+    case VK_RCONTROL:
+    case VK_RMENU:
+    case VK_DIVIDE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 INPUT Mouse(DWORD flags, LONG x = 0, LONG y = 0, DWORD delta = 0) {
@@ -76,14 +109,24 @@ DesktopInput::~DesktopInput() {
 void DesktopInput::Submit(const InputPacket& input) {
     {
         const std::lock_guard lock(mutex_);
+        auto* previous = pending_.empty() ? nullptr : std::get_if<InputPacket>(&pending_.back());
         if (input.kind == InputKind::reset || pending_.size() >= 64) {
             pending_.clear();
-            pending_.push_back({InputKind::reset});
-        } else if (input.kind == InputKind::move && !pending_.empty() && pending_.back().kind == InputKind::move) {
-            pending_.back() = input;
+            pending_.push_back(InputPacket{InputKind::reset});
+        } else if (input.kind == InputKind::move && previous && previous->kind == InputKind::move) {
+            *previous = input;
         } else {
             pending_.push_back(input);
         }
+    }
+    changed_.notify_one();
+}
+
+void DesktopInput::Submit(InputCommand command) {
+    {
+        const std::lock_guard lock(mutex_);
+        if (pending_.size() >= 64) return;
+        pending_.push_back(std::move(command));
     }
     changed_.notify_one();
 }
@@ -100,9 +143,9 @@ void DesktopInput::Run(std::stop_token stop) {
             changed_.wait(lock, stop, queued);
         }
         if (stop.stop_requested()) break;
-        std::optional<InputPacket> input;
+        std::optional<PendingInput> input;
         if (queued()) {
-            input = pending_.front();
+            input = std::move(pending_.front());
             pending_.pop_front();
         }
         lock.unlock();
@@ -113,12 +156,72 @@ void DesktopInput::Run(std::stop_token stop) {
             deadline = now + std::chrono::milliseconds(input_heartbeat_ms);
         }
         if (input) {
-            if (trace_) trace_->Pointer("input_dispatched", *input);
-            Apply(*input);
-            if (input->kind != InputKind::move) deadline = now + std::chrono::milliseconds(input_lease_ms);
+            if (const auto* packet = std::get_if<InputPacket>(&*input)) {
+                if (trace_) trace_->Pointer("input_dispatched", *packet);
+                Apply(*packet);
+                if (packet->kind != InputKind::move) deadline = now + std::chrono::milliseconds(input_lease_ms);
+            } else {
+                Apply(std::get<InputCommand>(*input));
+            }
         }
     }
     Release();
+}
+
+void DesktopInput::Apply(const InputCommand& command) {
+    const auto layout = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
+    std::array<INPUT, 2 * input_text_limit> events;
+    std::array<std::uint16_t, shortcut_limit> scans{};
+    UINT count{};
+    if (command.kind == InputCommandKind::shortcut) {
+        // Windows blocks simulated Win+L via SendInput; lock the workstation directly instead.
+        if (command.units.size() == 2 && (command.units[0] == VK_LWIN || command.units[0] == VK_RWIN) && command.units[1] == 'L') {
+            Release();
+            LockWorkStation();
+            return;
+        }
+        for (std::size_t i = 0; i < command.units.size(); ++i) {
+            const auto key = command.units[i];
+            const auto scan = MapVirtualKeyExW(key, MAPVK_VK_TO_VSC_EX, layout);
+            if (!scan || (scan > 0xff && (scan & 0xff00) != 0xe000)) return;
+            const bool extended = scan > 0xff || IsExtendedVirtualKey(key);
+            scans[i] = static_cast<std::uint16_t>((scan & 0xff) | (extended ? 0x100 : 0));
+            if (keys_.test(scans[i]) || (GetAsyncKeyState(key) & 0x8000)) return;
+            events[count++] = Key(scans[i], false);
+        }
+        for (auto i = command.units.size(); i > 0; --i) events[count++] = Key(scans[i - 1], true);
+    } else {
+        bool previous_cr{};
+        for (const auto unit : command.units) {
+            const bool skip = unit == '\n' && previous_cr;
+            previous_cr = unit == '\r';
+            if (skip) continue;
+            // Enter and Tab need physical key events to behave as typed input.
+            if (unit == '\n' || unit == '\r' || unit == '\t') {
+                const auto scan = static_cast<std::uint16_t>(MapVirtualKeyExW(unit == '\t' ? VK_TAB : VK_RETURN, MAPVK_VK_TO_VSC, layout));
+                if (!scan || keys_.test(scan)) return;
+                events[count++] = Key(scan, false);
+                events[count++] = Key(scan, true);
+            } else {
+                events[count++] = UnicodeKey(unit, false);
+                events[count++] = UnicodeKey(unit, true);
+            }
+        }
+    }
+    if (!count) return;
+    const auto sent = SendInput(count, events.data(), sizeof(INPUT));
+    if (sent == count) return;
+    if (command.kind == InputCommandKind::shortcut) {
+        // Release every key that might have made it down if Windows stopped mid-batch.
+        auto pressed = std::min<std::size_t>(sent, command.units.size());
+        while (pressed > 0) {
+            const auto scan = scans[--pressed];
+            if (!Inject(Key(scan, true))) keys_.set(scan);
+        }
+    } else if (sent % 2) {
+        auto up = events[sent];
+        Inject(up);
+    }
 }
 
 void DesktopInput::Apply(const InputPacket& input) {

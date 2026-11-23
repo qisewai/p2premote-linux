@@ -6,6 +6,7 @@
 #include "plugin_host.h"
 #include "qpc.h"
 
+#include <p2premote/plugin_protocol.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 
@@ -190,7 +191,7 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
         try {
             plugins_ = std::make_unique<PluginHost>(host_, [this](std::string_view frame) {
                 return connected_.load() && api_->send_reliable(peer_, frame.data(), frame.size(), plugin_name) == 0;
-            });
+            }, std::filesystem::path{}, [events = events_] { events->Notify(); });
         } catch (...) {
             OutputDebugStringW(L"P2PRemote: could not start plugin worker\n");
         }
@@ -215,7 +216,37 @@ MiniRtcCall::~MiniRtcCall() {
 }
 
 void MiniRtcCall::SetPluginsConnected(bool connected) noexcept {
-    if (plugins_) plugins_->SetConnected(connected && plugin_transport_.load() && connected_.load());
+    if (!plugins_) return;
+    const auto ready = connected && plugin_transport_.load() && connected_.load();
+    workspace_running_ = ready;
+    if (!ready) {
+        workspace_peer_ = false;
+        workspace_reply_pending_ = false;
+    }
+    plugins_->SetConnected(ready);
+    if (ready) ProbeWorkspace();
+}
+
+void MiniRtcCall::SendWorkspaceMessage(std::string_view kind) noexcept {
+    try {
+        if (const auto frame = EncodePluginPacket({workspace_protocol_id, kind, "1"})) {
+            api_->send_reliable(peer_, frame->data(), frame->size(), plugin_name);
+        }
+    } catch (...) {}
+}
+
+void MiniRtcCall::ProbeWorkspace() noexcept {
+    if (!workspace_running_.load()) return;
+    if (host_) {
+        if (workspace_reply_pending_.exchange(false)) SendWorkspaceMessage("ready");
+        return;
+    }
+    if (WorkspaceInputReady() || workspace_attempts_ == 12) return;
+    const auto now = GetTickCount64();
+    if (now < workspace_retry_) return;
+    workspace_retry_ = now + 1'000;
+    ++workspace_attempts_;
+    SendWorkspaceMessage("hello");
 }
 
 void MiniRtcCall::SignalOut(const char* data, size_t size, void* context) noexcept {
@@ -304,7 +335,21 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
     if (!data || !source || !self.connected_.load()) return;
     const std::string_view label(source, source_size);
     if (label == controls_name || (self.host_ && label == motion_name)) {
-        const auto input = DecodeInput({reinterpret_cast<const std::uint8_t*>(data), size});
+        const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(data), size);
+        if (label == controls_name && self.host_ && self.allow_input_ && self.WorkspaceInputReady() && self.workspace_running_.load() &&
+                !bytes.empty() && bytes.front() != 1) {
+            try {
+                if (auto command = DecodeInputCommand(bytes)) {
+                    if (const auto& trace = self.events_->Trace()) {
+                        trace->Record("input_command_received", command->sent_ms,
+                            static_cast<std::uint64_t>(command->kind), command->units.size());
+                    }
+                    self.events_->PushInputCommand(std::move(*command));
+                }
+            } catch (...) {}
+            return;
+        }
+        const auto input = DecodeInput(bytes);
         if (!input) return;
         if (IsVideoSettingsMessage(input->kind)) {
             if (label == controls_name && input->kind == (self.host_ ? InputKind::set_video_settings : InputKind::video_settings_reply)) {
@@ -316,8 +361,21 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
         }
     } else if (!self.host_ && self.allow_input_ && label == cursor_name && size <= cursor_max_packet) {
         self.events_->Push({StreamEventType::cursor, {}, std::string(data, size)});
-    } else if (self.plugins_ && label == plugin_name) {
-        self.plugins_->Receive({data, size});
+    } else if (self.plugins_ && label == plugin_name && self.workspace_running_.load()) {
+        const std::string_view frame(data, size);
+        const auto packet = DecodePluginPacket(frame);
+        if (!packet) return;
+        if (packet->id != workspace_protocol_id) {
+            self.plugins_->Receive(frame);
+        } else if (packet->payload == "1") {
+            if (self.host_ && packet->type == "hello") {
+                self.workspace_peer_ = true;
+                self.workspace_reply_pending_ = true;
+                self.events_->Notify();
+            } else if (!self.host_ && packet->type == "ready") {
+                self.workspace_peer_ = true;
+            }
+        }
     }
 }
 
@@ -399,6 +457,7 @@ bool MiniRtcCall::SetVideoBitrate(int bitrate) {
 }
 
 void MiniRtcCall::RequestStats() {
+    ProbeWorkspace();
     if (!connected_) return;
     const std::lock_guard lock(mutex_);
     events_->Push({StreamEventType::stats, {}, {}, counters_});
@@ -410,6 +469,12 @@ bool MiniRtcCall::SendInput(const InputPacket& packet) {
     const auto* data = reinterpret_cast<const char*>(bytes.data());
     if (packet.kind == InputKind::move) return api_->send_data(peer_, data, bytes.size(), motion_name) == 0;
     return api_->send_reliable(peer_, data, bytes.size(), controls_name) == 0;
+}
+
+bool MiniRtcCall::SendInputCommand(const InputCommand& command) {
+    if (host_ || !InputReady() || !WorkspaceInputReady() || !workspace_running_.load()) return false;
+    const auto bytes = EncodeInputCommand(command);
+    return !bytes.empty() && api_->send_reliable(peer_, reinterpret_cast<const char*>(bytes.data()), bytes.size(), controls_name) == 0;
 }
 
 bool MiniRtcCall::SendVideoSettings(const InputPacket& settings) {

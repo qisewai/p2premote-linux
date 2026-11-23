@@ -28,11 +28,12 @@ target_compile_features(plugin_protocol PUBLIC cxx_std_20)
 target_compile_options(plugin_protocol PRIVATE /W4 /permissive- /utf-8)
 
 include(cmake/lua-target.cmake)
-add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp)
+add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp core/src/plugin_settings.cpp)
+target_include_directories(plugin_host PUBLIC core/include)
 target_compile_features(plugin_host PRIVATE cxx_std_20)
 target_compile_definitions(plugin_host PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(plugin_host PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(plugin_host PRIVATE plugin_protocol p2premote_lua bcrypt user32 windowsapp)
+target_link_libraries(plugin_host PUBLIC input_protocol PRIVATE plugin_protocol p2premote_lua bcrypt user32 imm32 shell32 ole32 windowsapp)
 
 add_library(core STATIC
     core/src/d3d11_preview.cpp
@@ -71,12 +72,17 @@ add_custom_target(p2premote_minirtc_runtime
     VERBATIM)
 add_dependencies(p2premote p2premote_minirtc_runtime)
 
-set(clipboard_plugin "${CMAKE_CURRENT_SOURCE_DIR}/plugins/clipboard-sync")
+set(plugin_assets)
+foreach(plugin clipboard-sync shortcut-macros keyboard-sync adaptive-quality)
+    set(plugin_dir "${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}")
+    set(plugin_output "$<TARGET_FILE_DIR:p2premote>/plugins/${plugin}")
+    list(APPEND plugin_assets
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${plugin_output}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${plugin_dir}/plugin.json" "${plugin_dir}/main.lua" "${plugin_output}")
+endforeach()
 add_custom_target(p2premote_plugins
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:p2premote>/plugins/clipboard-sync"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${clipboard_plugin}/plugin.json" "${clipboard_plugin}/main.lua"
-        "$<TARGET_FILE_DIR:p2premote>/plugins/clipboard-sync"
+    ${plugin_assets}
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${P2PREMOTE_LUA_NOTICE}" "$<TARGET_FILE_DIR:p2premote>/lua-notice.html"
     VERBATIM)
@@ -98,5 +104,6 @@ target_compile_definitions(plugin_host_test PRIVATE UNICODE _UNICODE WIN32_LEAN_
 target_compile_options(plugin_host_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
 add_test(NAME plugin_host_test COMMAND plugin_host_test)
 add_test(NAME clipboard_plugin_test COMMAND plugin_host_test "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
-set_tests_properties(plugin_host_test clipboard_plugin_test PROPERTIES TIMEOUT 20)
+add_test(NAME office_plugin_test COMMAND plugin_host_test --office "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
+set_tests_properties(plugin_host_test clipboard_plugin_test office_plugin_test PROPERTIES TIMEOUT 20)
 set_tests_properties(clipboard_plugin_test PROPERTIES SKIP_RETURN_CODE 77)

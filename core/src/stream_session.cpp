@@ -6,6 +6,7 @@
 #include "desktop_input.h"
 #include "dxgi_capturer.h"
 #include "minirtc_call.h"
+#include "plugin_host.h"
 #include "qpc.h"
 #include "signal_socket.h"
 #include "stream_events.h"
@@ -259,6 +260,9 @@ struct ActiveStream {
     ULONGLONG transport_close_deadline{};
     StreamQuality quality{StreamQuality::p1080};
     std::optional<VideoRequest> video_request;
+    VideoBitratePreset plugin_bitrate{VideoBitratePreset::automatic};
+    std::wstring plugin_notice;
+    ULONGLONG plugin_notice_until{};
     std::optional<std::pair<StreamQuality, VideoBitratePreset>> rejected_video_settings;
     StreamInputMode input_mode{};
     bool input_ready{};
@@ -483,7 +487,7 @@ void StreamSession::UpdateVideoSettings() {
     auto& stats = impl_->stats;
     const auto now = GetTickCount64();
     const auto resolution = impl_->requested_quality;
-    const auto preset = impl_->requested_bitrate;
+    const auto preset = impl_->requested_bitrate == VideoBitratePreset::automatic ? active.plugin_bitrate : impl_->requested_bitrate;
 
     if (active.video_request) {
         auto& request = *active.video_request;
@@ -577,7 +581,7 @@ HANDLE StreamSession::PresentEvent() const {
 
 void StreamSession::ProcessEvents() {
     bool poll_cursor{};
-    for (const auto& event : impl_->active->events->Drain()) {
+    for (auto& event : impl_->active->events->Drain()) {
         auto& active = *impl_->active;
         switch (event.type) {
         case StreamEventType::signal_lost:
@@ -641,7 +645,7 @@ void StreamSession::ProcessEvents() {
             break;
         case StreamEventType::minirtc_signal:
             if (MiniRtcCall::IsSessionSignal(event.payload)) {
-                active.signal->Send("minirtc", event.payload);
+                active.signal->Send("minirtc", std::move(event.payload));
             }
             break;
         case StreamEventType::connected:
@@ -687,6 +691,9 @@ void StreamSession::ProcessEvents() {
             stats.ice_path = rtc.ice_path;
             stats.ice_protocol = rtc.ice_protocol;
             stats.ice_rtt_ms = rtc.ice_rtt_ms;
+            if (const auto* call = active.rtc.get(); call && call->Plugins()) {
+                call->Plugins()->UpdateMetrics({stats.ice_path, stats.ice_rtt_ms, stats.video_loss_fraction, stats.download_bps});
+            }
             if (impl_->state == StreamState::streaming) {
                 if (!impl_->host) stats.decoded_replaced = active.rtc->ReplacedFrames();
                 stats.seconds = QpcMilliseconds(QpcNow() - impl_->start) / 1000;
@@ -757,7 +764,71 @@ void StreamSession::ProcessEvents() {
         }
     }
     if (poll_cursor) PollCursor();
+    if (impl_->active && impl_->active->rtc) impl_->active->rtc->ProbeWorkspace();
+    ProcessPluginActions();
     UpdateVideoSettings();
+}
+
+bool StreamSession::HasPluginMenu() const {
+    if (impl_->host || !InputReady()) return false;
+    const auto* plugins = impl_->active->rtc->Plugins();
+    return plugins && plugins->HasMenu();
+}
+
+std::vector<PluginMenuItem> StreamSession::PluginMenu() const {
+    if (impl_->host || !InputReady()) return {};
+    const auto* plugins = impl_->active->rtc->Plugins();
+    return plugins ? plugins->Menu() : std::vector<PluginMenuItem>{};
+}
+
+void StreamSession::InvokePluginMenu(unsigned id) {
+    if (impl_->host || !InputReady()) return;
+    if (auto* plugins = impl_->active->rtc->Plugins()) plugins->Invoke(id);
+}
+
+void StreamSession::UpdatePluginLockState(bool caps, bool num) {
+    if (impl_->host || !InputReady()) return;
+    if (auto* plugins = impl_->active->rtc->Plugins()) plugins->UpdateLockState(caps, num);
+}
+
+bool StreamSession::PluginCapturesLockKeys() const noexcept {
+    if (impl_->host || !InputReady()) return false;
+    const auto* plugins = impl_->active->rtc->Plugins();
+    return plugins && plugins->CapturesLockKeys();
+}
+
+std::wstring_view StreamSession::PluginNotice() const noexcept {
+    const auto* active = impl_->active.get();
+    if (active && GetTickCount64() < active->plugin_notice_until) return active->plugin_notice;
+    return {};
+}
+
+void StreamSession::ProcessPluginActions() {
+    if (impl_->host || !InputReady()) return;
+    auto& active = *impl_->active;
+    auto* plugins = active.rtc->Plugins();
+    if (!plugins) return;
+    for (auto& action : plugins->TakeActions()) {
+        switch (action.kind) {
+        case PluginAction::Kind::notice:
+            active.plugin_notice = std::move(action.notice);
+            active.plugin_notice_until = GetTickCount64() + 4'000;
+            break;
+        case PluginAction::Kind::input:
+            action.input.sent_ms = GetTickCount64();
+            if (!active.rtc->SendInputCommand(action.input)) {
+                active.plugin_notice = L"未能发送快捷输入，请确认对端支持办公插件";
+                active.plugin_notice_until = GetTickCount64() + 4'000;
+            }
+            break;
+        case PluginAction::Kind::bitrate:
+            if (active.plugin_bitrate != action.bitrate) {
+                active.plugin_bitrate = action.bitrate;
+                if (impl_->requested_bitrate == VideoBitratePreset::automatic) active.rejected_video_settings.reset();
+            }
+            break;
+        }
+    }
 }
 
 bool StreamSession::InputReady() const noexcept {

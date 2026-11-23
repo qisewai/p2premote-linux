@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -38,7 +39,7 @@ public:
     }
 
     void Plugin(std::string_view id, std::string_view script, std::string_view role = "viewer",
-        std::string_view entry = "main.lua", bool enabled = true) {
+        std::string_view entry = "main.lua", bool enabled = true, std::string_view permissions = R"("channel")") {
         const auto directory = root / id;
         std::filesystem::create_directory(directory);
         paths.push_back(directory);
@@ -47,7 +48,19 @@ public:
         paths.push_back(directory / "plugin.json");
         std::ofstream(paths.back(), std::ios::binary)
             << "{\"id\":\"" << id << "\",\"entry\":\"" << entry << "\",\"enabled\":" << std::boolalpha << enabled
-            << ",\"roles\":[\"" << role << "\"],\"permissions\":[\"channel\"]}";
+            << ",\"roles\":[\"" << role << "\"],\"permissions\":[" << permissions << "]}";
+    }
+
+    void RemoveOnExit(const std::filesystem::path& file) { paths.push_back(file); }
+
+    void CopyPlugin(const std::filesystem::path& source) {
+        const auto directory = root / source.filename();
+        Check(std::filesystem::create_directory(directory), "Could not stage plugin fixture");
+        paths.push_back(directory);
+        for (const auto* leaf : {"plugin.json", "main.lua"}) {
+            paths.push_back(directory / leaf);
+            std::filesystem::copy_file(source / leaf, paths.back());
+        }
     }
 
     const std::filesystem::path root;
@@ -103,6 +116,7 @@ void TestSandbox() {
         assert(load == nil and dofile == nil and loadfile == nil and rawset == nil and pcall == nil)
         assert(string.dump == nil and string.match == nil and table.move == nil)
         assert(p2p.clipboard == nil and p2p.log == nil and p2p.input == nil)
+        assert(p2p.ui == nil and p2p.config == nil and p2p.video == nil)
         assert(p2p.session.role() == "viewer")
         assert(p2p.crypto.sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         p2p.session.on("connected", function()
@@ -126,6 +140,7 @@ void TestSandbox() {
     fixture.Plugin("e-path", "", "viewer", "../sandbox/main.lua");
     fixture.Plugin("f-role", "p2p.channel.send('leak', '')", "host");
     fixture.Plugin("g-disabled", "p2p.channel.send('leak', '')", "viewer", "main.lua", false);
+    fixture.Plugin("_workspace", "p2p.channel.send('leak', '')");
 
     WireLog log;
     PluginHost host(false, [&log](std::string_view frame) { return log.Send(frame); }, fixture.root);
@@ -143,7 +158,7 @@ void TestSandbox() {
         "Plugin payload crossed routing namespaces");
     Check(log.Count({"sandbox", "premature", ""}) == 0 && log.Count({"unknown", "echo", "ignored"}) == 0,
         "Accepted a message outside the available routes");
-    for (const auto* id : {"b-memory", "c-api", "d-globals", "f-role", "g-disabled"}) {
+    for (const auto* id : {"b-memory", "c-api", "d-globals", "f-role", "g-disabled", "_workspace"}) {
         Check(log.Count({id, "leak", ""}) == 0, "Sandbox, role or manifest restriction failed");
     }
     Check(log.Count({"sandbox", "ready", "timer"}) == 1, "Cancelled timer fired again");
@@ -257,14 +272,132 @@ private:
     bool switched{};
 };
 
+void TestWorkspace() {
+    Fixture fixture;
+    const auto config = fixture.root / "config";
+    fixture.RemoveOnExit(config);
+    fixture.RemoveOnExit(config / "office.viewer.json");
+    fixture.Plugin("office", R"lua(
+        local api, id = p2p.ui, nil
+        local saved = p2p.config.get("enabled", false)
+        id = api.add_menu("测试开关", function()
+            assert(api.set_checked(id, true))
+            assert(not api.set_checked(id + 1, true))
+            assert(p2p.config.set("enabled", true))
+            assert(p2p.config.set("text", "办公 😀"))
+            assert(p2p.config.set("number", 4.5))
+            assert(p2p.config.get("text") == "办公 😀" and p2p.config.get("number") == 4.5)
+            assert(p2p.config.set("number", nil) and p2p.config.get("number", 9) == 9)
+            assert(not p2p.config.set("../wrong", true))
+            local stats = p2p.session.stats()
+            assert(stats.route == "relay" and stats.rtt_ms == 42 and stats.loss == 0.25 and stats.download_bps == 1234)
+            local keys = p2p.input.get_state()
+            assert(keys.caps_lock == true and keys.num_lock == false)
+            assert(not p2p.input.set_lock("caps_lock", false))
+            assert(not p2p.input.set_ime(false))
+            assert(p2p.input.send_keys({"Ctrl", "Shift", "Esc"}))
+            assert(p2p.input.send_text("办公 😀"))
+            assert(p2p.video.set_bitrate("economy"))
+            assert(api.notify("更新完成"))
+            assert(p2p.channel.send("done", ""))
+        end, saved)
+        assert(id and p2p.channel.send("loaded", saved and "yes" or "no"))
+    )lua", "viewer", "main.lua", true, R"("channel", "ui", "config", "video", "input")");
+
+    WireLog log;
+    const auto send = [&log](std::string_view frame) { return log.Send(frame); };
+    PluginHost viewer(false, send, fixture.root, {}, config);
+    viewer.UpdateMetrics({IcePath::relay, 42, 0.25, 1234});
+    viewer.UpdateLockState(true, false);
+    viewer.SetConnected(true);
+    Check(log.Wait({"office", "loaded", "no"}), "Office plugin did not load");
+    const auto initial = viewer.Menu();
+    Check(initial.size() == 1 && initial[0].label == L"测试开关" && initial[0].checked == false, "Wrong menu state");
+    viewer.Invoke(initial[0].id + 1);
+    viewer.Invoke(initial[0].id);
+    Check(log.Wait({"office", "done", ""}), "Menu invokes the wrong handler or a workspace API failed");
+    const auto actions = viewer.TakeActions();
+    Check(actions.size() == 4 && actions[0].input.kind == InputCommandKind::shortcut && actions[0].input.units.size() == 3 &&
+        actions[1].input.kind == InputCommandKind::text && actions[1].input.units == std::vector<std::uint16_t>{0x529e, 0x516c, 32, 0xd83d, 0xde00} &&
+        actions[2].bitrate == VideoBitratePreset::economy && actions[3].notice == L"更新完成", "Lua actions were not copied to the UI queue");
+    viewer.Stop();
+    Check(viewer.Menu().empty() && viewer.TakeActions().empty(), "Office UI persisted after disconnect");
+
+    PluginHost resumed(false, send, fixture.root, {}, config);
+    resumed.SetConnected(true);
+    Check(log.Wait({"office", "loaded", "yes"}), "JSON settings did not survive a fresh session");
+    Check(resumed.Menu().size() == 1 && resumed.Menu()[0].checked == true && resumed.Menu()[0].id != initial[0].id,
+        "Reloaded menu did not restore its setting or reused a stale command ID");
+}
+
+void TestOfficePolicies(const std::filesystem::path& root) {
+    Fixture fixture;
+    const auto config = fixture.root / "config";
+    fixture.RemoveOnExit(config);
+    fixture.RemoveOnExit(config / "keyboard-sync.viewer.json");
+    fixture.RemoveOnExit(config / "adaptive-quality.viewer.json");
+    fixture.CopyPlugin(root / "keyboard-sync");
+    fixture.CopyPlugin(root / "adaptive-quality");
+
+    std::atomic_bool keyboard_hello{}, keyboard_sent{}, keyboard_toggled{};
+    PluginHost viewer(false, [&](std::string_view bytes) {
+        const auto packet = DecodePluginPacket(bytes);
+        if (packet && packet->id == "keyboard-sync") {
+            if (packet->type == "hello" && packet->payload.empty()) keyboard_hello = true;
+            if (packet->type == "state" && packet->payload.size() == 3 && packet->payload.starts_with("10")) keyboard_sent = true;
+            if (packet->type == "state" && packet->payload.size() == 3 && packet->payload.starts_with("01")) keyboard_toggled = true;
+        }
+        return true;
+    }, fixture.root, {}, config);
+
+    const auto wait = [](auto timeout, const auto& predicate) {
+        const auto until = std::chrono::steady_clock::now() + timeout;
+        do {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(20ms);
+        } while (std::chrono::steady_clock::now() < until);
+        return false;
+    };
+    viewer.UpdateMetrics({IcePath::relay, 150, 0.04, {}});
+    viewer.UpdateLockState(true, false);
+    viewer.SetConnected(true);
+    std::vector<PluginMenuItem> menu;
+    Check(wait(3s, [&] { menu = viewer.Menu(); return menu.size() == 2; }), "Built-in office plugins did not load");
+    Check(menu[0].checked == false && menu[1].checked == false, "Office policies should default to off");
+    for (const auto& item : menu) viewer.Invoke(item.id);
+    Check(wait(2s, [&] { return keyboard_hello.load(); }) && !keyboard_sent.load() && !viewer.CapturesLockKeys(),
+        "Peer support was not negotiated first");
+    Deliver(viewer, {"keyboard-sync", "ready", ""});
+    Check(wait(2s, [&] { return keyboard_sent.load(); }) && viewer.CapturesLockKeys(),
+        "Keyboard plugin did not take over lock keys and send their state");
+    viewer.UpdateLockState(false, true);
+    Check(wait(250ms, [&] { return keyboard_toggled.load(); }),
+        "Lock-key change was not pushed immediately without waiting for the poll timer");
+
+    const auto has_bitrate = [&](VideoBitratePreset bitrate) {
+        for (const auto& action : viewer.TakeActions()) {
+            if (action.kind == PluginAction::Kind::bitrate && action.bitrate == bitrate) return true;
+        }
+        return false;
+    };
+    Check(wait(4s, [&] { return has_bitrate(VideoBitratePreset::economy); }), "Policy did not reduce bitrate on a weak route");
+    viewer.UpdateMetrics({IcePath::host, 5, 0.001, {}});
+    Check(wait(9s, [&] { return has_bitrate(VideoBitratePreset::detail); }), "Policy did not recover bitrate on a clear LAN");
+    viewer.UpdateMetrics({IcePath::relay, 50, 0.001, {}});
+    Check(wait(2s, [&] { return has_bitrate(VideoBitratePreset::automatic); }), "Policy retained the LAN preset after switching to relay");
+    viewer.Stop();
+    Check(!viewer.CapturesLockKeys(), "Lock keys were still intercepted after disconnect");
+}
+
 int TestClipboard(const std::filesystem::path& root) {
     PrivateClipboard clipboard;
     if (!clipboard.Available()) {
         std::cout << "Could not allocate a private Windows clipboard\n";
         return 77;
     }
+    Fixture config;
     WireLog log;
-    PluginHost host(true, [&log](std::string_view frame) { return log.Send(frame); }, root);
+    PluginHost host(true, [&log](std::string_view frame) { return log.Send(frame); }, root, {}, config.root);
     host.SetConnected(true);
     Deliver(host, {"clipboard-sync", "text", "before handshake"});
     Deliver(host, {"clipboard-sync", "hello", ""});
@@ -279,7 +412,7 @@ int TestClipboard(const std::filesystem::path& root) {
     host.Stop();
 
     WireLog viewer_log;
-    PluginHost viewer(false, [&viewer_log](std::string_view frame) { return viewer_log.Send(frame); }, root);
+    PluginHost viewer(false, [&viewer_log](std::string_view frame) { return viewer_log.Send(frame); }, root, {}, config.root);
     viewer.SetConnected(true);
     Check(viewer_log.Wait({"clipboard-sync", "hello", ""}), "Viewer did not advertise its plugin");
     Check(viewer_log.Count({"clipboard-sync", "text", "被控 → 主控\r\nOffice"}) == 0,
@@ -293,8 +426,13 @@ int TestClipboard(const std::filesystem::path& root) {
 
 int wmain(int argc, wchar_t** argv) {
     try {
+        if (argc == 3 && std::wstring_view(argv[1]) == L"--office") {
+            TestOfficePolicies(argv[2]);
+            return 0;
+        }
         if (argc == 2) return TestClipboard(argv[1]);
         TestSandbox();
+        TestWorkspace();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

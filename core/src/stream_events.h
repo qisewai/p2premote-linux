@@ -83,6 +83,11 @@ public:
         }
     }
 
+    void PushInputCommand(InputCommand command) {
+        const std::lock_guard lock(mutex_);
+        if (desktop_ && desktop_input_state_.AcceptCommand(command, GetTickCount64())) desktop_->Submit(std::move(command));
+    }
+
     std::vector<StreamEvent> Drain() {
         const std::lock_guard lock(mutex_);
         ResetEvent(ready_.get());

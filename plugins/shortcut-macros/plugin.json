@@ -1,0 +1,9 @@
+{
+  "id": "shortcut-macros",
+  "name": "快捷输入",
+  "version": "1.0.0",
+  "entry": "main.lua",
+  "roles": ["viewer"],
+  "enabled": true,
+  "permissions": ["ui", "input", "config"]
+}

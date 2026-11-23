@@ -2,6 +2,7 @@
 
 #include <p2premote/connection_options.h>
 #include <p2premote/input_protocol.h>
+#include <p2premote/plugin_workspace.h>
 
 #include <windows.h>
 
@@ -10,6 +11,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace p2premote {
 
@@ -73,6 +76,12 @@ public:
     bool InputReady() const noexcept;
     bool DesktopControl() const noexcept;
     bool SubmitInput(InputPacket input);
+    bool HasPluginMenu() const;
+    std::vector<PluginMenuItem> PluginMenu() const;
+    void InvokePluginMenu(unsigned id);
+    void UpdatePluginLockState(bool caps, bool num);
+    bool PluginCapturesLockKeys() const noexcept;
+    std::wstring_view PluginNotice() const noexcept;
 
     StreamState State() const noexcept;
     std::wstring Status() const;
@@ -84,6 +93,7 @@ private:
     void Close(std::wstring status, bool intentional);
     void Recover(std::wstring status);
     void UpdateVideoSettings();
+    void ProcessPluginActions();
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

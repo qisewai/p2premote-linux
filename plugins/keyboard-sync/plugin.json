@@ -1,0 +1,9 @@
+{
+  "id": "keyboard-sync",
+  "name": "键盘状态同步",
+  "version": "1.0.0",
+  "entry": "main.lua",
+  "roles": ["viewer", "host"],
+  "enabled": true,
+  "permissions": ["ui", "input", "channel", "config"]
+}

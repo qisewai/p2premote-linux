@@ -1,0 +1,9 @@
+{
+  "id": "adaptive-quality",
+  "name": "智能画质",
+  "version": "1.0.0",
+  "entry": "main.lua",
+  "roles": ["viewer"],
+  "enabled": true,
+  "permissions": ["ui", "video", "config"]
+}

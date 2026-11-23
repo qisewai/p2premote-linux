@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <variant>
 
 namespace p2premote {
 
@@ -22,6 +23,7 @@ public:
     ~DesktopInput();
 
     void Submit(const InputPacket& input);
+    void Submit(InputCommand command);
 
 private:
     struct ScreenMetrics {
@@ -37,6 +39,7 @@ private:
     void Run(std::stop_token stop);
     std::optional<INPUT> BuildMove(const InputPacket& input);
     void Apply(const InputPacket& input);
+    void Apply(const InputCommand& command);
     void Release();
 
     HMONITOR monitor_;
@@ -46,7 +49,8 @@ private:
     std::bitset<4> buttons_;
     std::mutex mutex_;
     std::condition_variable_any changed_;
-    std::deque<InputPacket> pending_;
+    using PendingInput = std::variant<InputPacket, InputCommand>;
+    std::deque<PendingInput> pending_;
     std::jthread worker_;
 };
 

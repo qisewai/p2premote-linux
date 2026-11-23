@@ -111,10 +111,20 @@ plugins/
 | `p2p.timer` | 默认开放 | `after(ms, fn)` / `every(ms, fn)` / `cancel(id)` | 插件线程非阻塞定时器 |
 | `p2p.log` | `"log"` | `info(msg)` / `warn(msg)` / `error(msg)` | 统一结构化日志输出 |
 
-### Phase 2–3（后续增量扩展）
-- **`p2p.ui`（`"ui"`）**：在 Viewer 工具条/悬浮条注册开关按钮、菜单项、轻量提示。
-- **`p2p.input`（`"input"`）**：发送组合键、Unicode 文本、查询/切换 IME 与 `CapsLock`/`NumLock`。
-- **`p2p.config`（`"config"`）**：按插件隔离的 JSON 持久化配置。
+### Phase 2（办公插件 API）
+
+| 命名空间 | 权限 | 接口 |
+| --- | --- | --- |
+| `p2p.ui` | `"ui"` | `add_menu(label, fn [, checked])` 注册主控工具栏「插件」中的操作或开关，返回菜单 ID。`set_checked(id, value)` 更新本插件的开关。`notify(text)` 在连接状态区短暂显示提示。 |
+| `p2p.input` | `"input"` | 主控用 `send_keys({"Ctrl", "Shift", "Esc"})` 或 `send_text(text)` 向被控端提交输入（`Win+L` 由被控端调用 `LockWorkStation()` 执行）。`get_state()` 返回本机 `caps_lock`、`num_lock` 和可用时的 `ime_open`；`on_state_change(fn)` 在主控锁定键切换时立即触发。被控端用 `set_lock(key, value)` 和 `set_ime(open)` 调整本机状态。`use_lock_sync(enabled)` 让插件接管主控窗口中的锁定键同步。 |
+| `p2p.config` | `"config"` | `get(key [, default])` 读取设置，`set(key, value)` 保存布尔值、有限数值或字符串，传 `nil` 删除。键名沿用插件 ID 的字符和长度规则。 |
+| `p2p.session` | 默认开放 | `stats()` 返回 `route`（`lan` / `direct` / `relay` / `unknown`）、可用时的 `rtt_ms`、`loss`（0–1）和 `download_bps`。 |
+| `p2p.video` | `"video"` | `set_bitrate(preset)` 提交 `economy`、`automatic` 或 `detail`，在主控选中「自动」画质时生效。 |
+
+输入和菜单回调经有界队列跨线程传递。组合键最多 8 个键，文本最多 256 个 UTF-16 代码单元。两端在加密插件通道中确认批量输入能力，再通过可靠控制通道发送输入。Windows 前台应用和输入法决定实际可用的状态及注入行为。配置按插件 ID 和端角色保存到 `%LOCALAPPDATA%\P2PRemote\plugin-config\`，每份 JSON 上限 16 KiB。
+
+### Phase 3（后续增量扩展）
+
 - **`p2p.fs`（`"fs"`）**：受限下载目录流式读写 + 拖放事件（支撑文件传输插件）。
 - **`p2p.clipboard` 图片扩展**：支持 `CF_DIB` / PNG 截图同步与自动分片。
 
@@ -138,6 +148,8 @@ plugins/
    - 实现 `ClipboardBridge` 与 `PluginHost`（独立线程、沙箱、看门狗、权限控制）及单元测试 `plugin_host_test`。
    - 内置 `plugins/clipboard-sync/` 并在构建时自动同步到输出目录，双机实测双向复制粘贴。
 2. **Phase 2（UI + 输入扩展）**
-   - 接入 `p2p.ui` / `p2p.input` / `p2p.config`，落地快捷热键宏、IME/大写锁定同步、智能画质策略插件。
+   - `shortcut-macros` 提供远端切换窗口、任务管理器、锁屏和文本模板。
+   - `keyboard-sync` 可从主控向被控同步 Caps Lock、Num Lock 和当前输入法的开关状态。
+   - `adaptive-quality` 根据线路、RTT 和丢包选择码率档位，保留手动画质选择和当前分辨率。
 3. **Phase 3（文件传输 + 图片剪贴板）**
    - 接入 `p2p.fs` 与分片传输，落地拖拽传文件与截图同步插件。
