@@ -10,6 +10,8 @@
 
 登录后，本机在当前 Windows 桌面会话中接收同账号设备的控制请求。「停止接收」可让本机下线，同时保留主控能力。「退出登录」会关闭本机的远控会话并撤销本次登录。启动电脑后需要登录 Windows 并打开客户端。
 
+两端安装内置 `clipboard-sync` 插件后，已授权的远控会话支持双向复制粘贴文本。连接时会先同步主控端现有的文本，随后同步两端新复制的文本，每条最多 60 KiB。可将程序旁 `plugins/clipboard-sync/plugin.json` 的 `enabled` 改为 `false`，下次连接时关闭同步。插件接口见 [Lua 插件设计](lua-plugin-design.md)。
+
 远控窗口顶部可分别选择 720p、1080p 或 1440p 的传输分辨率，以及省流、自动或清晰画质。默认使用 1080p、自动。三个画质档分别将视频码率上限设为 4、8、16 Mbps，实际码率随网络和画面变化调整。传输尺寸受被控屏幕大小约束。状态区显示实际收到的尺寸、带宽及被控端确认的码率上限。与旧客户端连接时，窗口会显示兼容的分辨率和码率组合档。
 
 选择 720p 时，MiniRTC 主控端对收到的画面做轻量亮度边缘增强，让放大的文字更易辨认。源桌面缩小时损失的细节取决于原始字号和画面尺寸。
@@ -302,7 +304,7 @@ out\minirtc-probe\p2premote_minirtc_probe.exe viewer wss://127.0.0.1:47000/signa
 
 ### 账号模式使用 MiniRTC
 
-使用 x64 Visual Studio 开发终端构建库和正式客户端。把 `p2premote.exe` 和同目录生成的 `p2premote_minirtc.dll` 一起放到两台电脑。
+使用 x64 Visual Studio 开发终端构建库和正式客户端。把 `p2premote.exe`、`p2premote_minirtc.dll`、`plugins/` 及 `lua-notice.html` 一起放到两台电脑，并保持相对路径。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/minirtc_probe/Build.ps1

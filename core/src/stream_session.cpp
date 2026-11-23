@@ -515,6 +515,7 @@ void StreamSession::Stop(std::wstring status) {
 
 void StreamSession::Close(std::wstring status, bool intentional) {
     if (auto active = std::move(impl_->active)) {
+        if (active->rtc) active->rtc->SetPluginsConnected(false);
         active->events->SetDesktopInput(nullptr);
         active->desktop.reset();
         active->capture.reset();
@@ -584,6 +585,7 @@ void StreamSession::ProcessEvents() {
             if (impl_->state == StreamState::streaming) {
                 if (!active.transport_close_deadline) {
                     active.transport_close_deadline = GetTickCount64() + close_grace_ms;
+                    if (active.rtc) active.rtc->SetPluginsConnected(false);
                     active.events->SetDesktopInput(nullptr);
                     active.ResetInput();
                     impl_->detail = winrt::to_hstring(event.payload).c_str();
@@ -663,6 +665,7 @@ void StreamSession::ProcessEvents() {
                 impl_->reconnect.reset();
                 if (active.input_ready) active.events->SetDesktopInput(active.desktop.get());
                 impl_->detail = impl_->host ? active.SharingStatus() : L"正在接收视频";
+                active.rtc->SetPluginsConnected(true);
             }
             break;
         case StreamEventType::stats: {

@@ -3,6 +3,7 @@
 #include "cursor_shape.h"
 #include "dxgi_nv12_frame.h"
 #include "minirtc_desktop_video.h"
+#include "plugin_host.h"
 #include "qpc.h"
 
 #include <winrt/Windows.Data.Json.h>
@@ -25,6 +26,23 @@ constexpr char video_name[] = "desktop";
 constexpr char controls_name[] = "control";
 constexpr char motion_name[] = "pointer";
 constexpr char cursor_name[] = "cursor";
+constexpr char plugin_name[] = "plugin";
+
+bool SupportsEncryptedPluginChannel(std::wstring_view sdp) noexcept {
+    bool data_srtp{}, fingerprint{}, plugin_track{};
+    while (!sdp.empty()) {
+        const auto end = sdp.find(L'\n');
+        auto line = sdp.substr(0, end);
+        if (line.ends_with(L'\r')) line.remove_suffix(1);
+        data_srtp |= line == L"a=x-minirtc-audio-data-srtp:1";
+        fingerprint |= line.starts_with(L"a=fingerprint:sha-256 ");
+        plugin_track |= line.starts_with(L"a=ssrc:") && line.ends_with(L" name:plugin");
+        if (end == std::wstring_view::npos) break;
+        sdp.remove_prefix(end + 1);
+    }
+    // MiniRTC validates the SDP and rejects data packets if SRTP is unavailable.
+    return data_srtp && fingerprint && plugin_track;
+}
 
 std::optional<DecodedFrame> RetainNv12(const MiniRtcVideoFrame& frame, std::int64_t queued_qpc) {
     if (const auto* native = frame.native_frame; native && native->struct_size >= sizeof(*native)
@@ -168,8 +186,21 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
     params.on_receive_video_frame = Video;
     params.on_receive_data_buffer = Data;
     params.on_net_status_report = Network;
+    if (allow_input_) {
+        try {
+            plugins_ = std::make_unique<PluginHost>(host_, [this](std::string_view frame) {
+                return connected_.load() && api_->send_reliable(peer_, frame.data(), frame.size(), plugin_name) == 0;
+            });
+        } catch (...) {
+            OutputDebugStringW(L"P2PRemote: could not start plugin worker\n");
+        }
+    }
     const auto release = [api = api_](PeerPtr* peer) { api->destroy(&peer); };
     std::unique_ptr<PeerPtr, decltype(release)> peer(api_->create(&params), release);
+    if (peer && plugins_ && api_->add_data(peer.get(), plugin_name, true) != 0) {
+        plugins_.reset();
+        OutputDebugStringW(L"P2PRemote: could not register plugin channel\n");
+    }
     if (!peer || api_->add_video(peer.get(), video_name) != 0 || api_->add_data(peer.get(), controls_name, true) != 0 ||
         api_->add_data(peer.get(), motion_name, false) != 0 || api_->add_data(peer.get(), cursor_name, true) != 0 ||
         api_->init(peer.get(), SignalOut, this) != 0 || (!host_ && api_->join(peer.get(), "host") != 0)) {
@@ -179,7 +210,12 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
 }
 
 MiniRtcCall::~MiniRtcCall() {
+    if (plugins_) plugins_->Stop();
     if (peer_) api_->destroy(&peer_);
+}
+
+void MiniRtcCall::SetPluginsConnected(bool connected) noexcept {
+    if (plugins_) plugins_->SetConnected(connected && plugin_transport_.load() && connected_.load());
 }
 
 void MiniRtcCall::SignalOut(const char* data, size_t size, void* context) noexcept {
@@ -199,6 +235,11 @@ bool MiniRtcCall::IsSessionSignal(const std::string& payload) {
 void MiniRtcCall::ReceiveSignal(const std::string& payload) {
     auto message = JsonObject::Parse(winrt::to_hstring(payload));
     const auto kind = message.GetNamedString(L"type");
+    if (plugins_ && (kind == L"offer" || kind == L"answer")) {
+        const bool supported = SupportsEncryptedPluginChannel(message.GetNamedString(L"sdp", L""));
+        plugin_transport_.store(supported);
+        if (!supported) SetPluginsConnected(false);
+    }
     if (kind == L"offer" || kind == L"user_join_transmission") {
         message.SetNamedValue(L"ice", IceConfiguration(ice_));
     }
@@ -218,6 +259,7 @@ void MiniRtcCall::Status(ConnectionStatus status, const char*, size_t, void* con
     } else if (status == Closed || status == Failed || status == Disconnected ||
                status == IncorrectPassword || status == NoSuchTransmissionId || status == RemoteUnavailable) {
         self.connected_ = false;
+        self.SetPluginsConnected(false);
         self.events_->Push({StreamEventType::input_ready, {}, {}});
         self.events_->Push({StreamEventType::media_lost, {}, "MiniRTC 连接已断开"});
     }
@@ -274,6 +316,8 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
         }
     } else if (!self.host_ && self.allow_input_ && label == cursor_name && size <= cursor_max_packet) {
         self.events_->Push({StreamEventType::cursor, {}, std::string(data, size)});
+    } else if (self.plugins_ && label == plugin_name) {
+        self.plugins_->Receive({data, size});
     }
 }
 

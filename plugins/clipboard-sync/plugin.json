@@ -1,0 +1,9 @@
+{
+  "id": "clipboard-sync",
+  "name": "剪贴板同步",
+  "version": "1.0.0",
+  "entry": "main.lua",
+  "roles": ["host", "viewer"],
+  "enabled": true,
+  "permissions": ["channel", "clipboard"]
+}

@@ -17,6 +17,8 @@
 
 namespace p2premote {
 
+class PluginHost;
+
 class MiniRtcCall final {
 public:
     static bool Available(const ConnectionOptions& options);
@@ -33,6 +35,7 @@ public:
     bool SendInput(const InputPacket& input);
     bool SendVideoSettings(const InputPacket& settings);
     bool SendCursor(const std::string& packet);
+    void SetPluginsConnected(bool connected) noexcept;
     bool HasFrame() const;
     std::optional<DecodedFrame> TakeFrame();
     std::uint64_t ReplacedFrames() const;
@@ -56,6 +59,8 @@ private:
     std::optional<DecodedFrame> latest_;
     std::uint64_t replaced_{};
     RtcCounters counters_;
+    std::unique_ptr<PluginHost> plugins_;
+    std::atomic_bool plugin_transport_{};
 };
 
 } // namespace p2premote
