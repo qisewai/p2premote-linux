@@ -4,6 +4,8 @@ add_executable(p2premote_qt WIN32
     viewer/qt/main.cpp
     viewer/qt/account_window.cpp
     viewer/qt/credentials.cpp
+    viewer/qt/plugin_dialog.cpp
+    viewer/qt/plugin_dialog.h
     viewer/qt/remote_window.cpp
     viewer/qt/stream_driver.cpp
     viewer/qt/stream_driver.h)

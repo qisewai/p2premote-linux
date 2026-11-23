@@ -1,0 +1,9 @@
+{
+  "id": "file-transfer",
+  "name": "文件传输",
+  "version": "1.0.0",
+  "entry": "main.lua",
+  "enabled": true,
+  "roles": ["host", "viewer"],
+  "permissions": ["channel", "ui", "fs", "log"]
+}

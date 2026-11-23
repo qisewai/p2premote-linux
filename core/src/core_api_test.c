@@ -31,6 +31,11 @@ int main(void) {
 
     p2p_account_cancel(account);
     passed &= check(p2p_account_complete(account) == P2P_PENDING, "Cancelled result was published");
+    {
+        p2p_ui_command ui_cmd = {0};
+        passed &= check(p2p_stream_poll_ui_command(NULL, &ui_cmd) == P2P_ERROR, "Null stream poll accepted")
+            && check(p2p_stream_send_ui_event(NULL, 1, "btn", "click", "{}") == P2P_ERROR, "Null stream UI event accepted");
+    }
     p2p_account_destroy(account);
     return passed ? 0 : 1;
 }

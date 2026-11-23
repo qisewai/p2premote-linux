@@ -422,12 +422,190 @@ int TestClipboard(const std::filesystem::path& root) {
     return 0;
 }
 
+std::string ReadBinaryFile(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    Check(static_cast<bool>(file), "Could not open file for verification");
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+std::string JsonEscape(std::string_view text) {
+    std::string out;
+    out.push_back('"');
+    for (char c : text) {
+        if (c == '\\') out.append("\\\\");
+        else if (c == '"') out.append("\\\"");
+        else out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+void TestFileTransfer(const std::filesystem::path& root) {
+    Fixture fixture;
+    const auto config = fixture.root / "config";
+    const auto local_dir = fixture.root / "local";
+    const auto remote_dir = fixture.root / "remote";
+    std::filesystem::create_directory(local_dir);
+    std::filesystem::create_directory(remote_dir);
+    fixture.RemoveOnExit(config);
+    fixture.CopyPlugin(root / "file-transfer");
+
+    // Prepare multi-chunk binary files (with NUL bytes) and an empty file.
+    std::string up_bytes(150 * 1024 + 37, '\0');
+    for (std::size_t i = 0; i < up_bytes.size(); ++i) up_bytes[i] = static_cast<char>((i * 131 + 17) & 0xff);
+    std::string down_bytes(180 * 1024 + 19, '\0');
+    for (std::size_t i = 0; i < down_bytes.size(); ++i) down_bytes[i] = static_cast<char>((i * 73 + 5) & 0xff);
+
+    {
+        std::ofstream(local_dir / "sample_up.bin", std::ios::binary).write(up_bytes.data(), up_bytes.size());
+        std::ofstream(local_dir / "empty.bin", std::ios::binary);
+        std::ofstream(remote_dir / "sample_down.bin", std::ios::binary).write(down_bytes.data(), down_bytes.size());
+    }
+
+    // Also validate path-traversal rejection and declarative UI round-trip via a tiny probe plugin.
+    fixture.Plugin("ui-fs-probe", R"lua(
+        assert(p2p.fs ~= nil and p2p.json ~= nil)
+        local j = p2p.json.encode({ ok = true, arr = {1, 2, "三"} })
+        local d = p2p.json.decode(j)
+        assert(d.ok == true and d.arr[3] == "三")
+        assert(p2p.fs.join("C:\\Temp", "../escape") == nil)
+        assert(p2p.fs.join("C:\\Temp", "a\\b") == nil)
+        assert(p2p.fs.join("C:\\Temp", "a/b") == nil)
+        assert(p2p.fs.join("C:\\Temp", "C:evil") == nil)
+        assert(p2p.fs.join("C:\\Temp", "..") == nil)
+        p2p.session.on("connected", function()
+            local dlg = nil
+            dlg = p2p.ui.open_dialog({ title = "probe", body = { type = "vbox", children = {} } }, function(ev)
+                if ev.control == "ping" and ev.event == "click" then
+                    assert(ev.values.note == "hello")
+                    p2p.ui.update_dialog(dlg, { status = { text = "pong" } })
+                    p2p.ui.close_dialog(dlg)
+                end
+            end)
+            assert(dlg and dlg > 0)
+        end)
+    )lua", "viewer", "main.lua", true, R"("ui", "fs")");
+
+    std::unique_ptr<PluginHost> host;
+    std::unique_ptr<PluginHost> viewer;
+    host = std::make_unique<PluginHost>(true, [&](std::string_view frame) {
+        if (viewer) viewer->Receive(frame);
+        return true;
+    }, fixture.root, PluginHost::Notify{}, config);
+    viewer = std::make_unique<PluginHost>(false, [&](std::string_view frame) {
+        if (host) host->Receive(frame);
+        return true;
+    }, fixture.root, PluginHost::Notify{}, config);
+
+    const auto wait = [](auto timeout, const auto& predicate) {
+        const auto until = std::chrono::steady_clock::now() + timeout;
+        do {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(20ms);
+        } while (std::chrono::steady_clock::now() < until);
+        return false;
+    };
+
+    host->SetConnected(true);
+    viewer->SetConnected(true);
+
+    // 1. Verify probe dialog open -> event -> update -> close round-trip.
+    std::uint32_t probe_dlg{};
+    std::uint32_t ft_dlg{};
+    bool probe_pong{}, probe_closed{};
+    bool peer_ready{}, local_ready{}, remote_ready{};
+    const auto drain_ui = [&] {
+        for (const auto& cmd : viewer->TakeUiCommands()) {
+            if (cmd.kind == "open" && cmd.json.find("\"probe\"") != std::string::npos) {
+                probe_dlg = cmd.dialog_id;
+            } else if (cmd.kind == "open" && cmd.json.find("local_table") != std::string::npos) {
+                ft_dlg = cmd.dialog_id;
+            } else if (cmd.kind == "update" && cmd.dialog_id == probe_dlg && cmd.json.find("\"pong\"") != std::string::npos) {
+                probe_pong = true;
+            } else if (cmd.kind == "close" && cmd.dialog_id == probe_dlg) {
+                probe_closed = true;
+            } else if (cmd.kind == "update" && cmd.dialog_id == ft_dlg) {
+                if (cmd.json.find("remote_quick") != std::string::npos) peer_ready = true;
+                if (cmd.json.find("sample_up.bin") != std::string::npos) local_ready = true;
+                if (cmd.json.find("sample_down.bin") != std::string::npos) remote_ready = true;
+            }
+        }
+    };
+
+    Check(wait(3s, [&] { drain_ui(); return probe_dlg != 0; }), "Probe dialog did not open");
+    viewer->SendUiEvent({probe_dlg, "ping", "click", R"({"values":{"note":"hello"}})"});
+    Check(wait(3s, [&] { drain_ui(); return probe_pong && probe_closed; }), "Declarative UI event/update/close round-trip failed");
+
+    // 2. Open built-in file-transfer dialog from Viewer menu.
+    std::vector<PluginMenuItem> menu;
+    Check(wait(3s, [&] { menu = viewer->Menu(); return !menu.empty(); }), "File-transfer menu did not register");
+    viewer->Invoke(menu[0].id);
+    Check(wait(3s, [&] { drain_ui(); return ft_dlg != 0 && peer_ready; }), "File-transfer dialog or peer handshake failed");
+
+    // 3. Navigate both panes to our temp local and remote directories.
+    const auto local_utf8 = local_dir.u8string();
+    const auto remote_utf8 = remote_dir.u8string();
+    const std::string local_str(reinterpret_cast<const char*>(local_utf8.data()), local_utf8.size());
+    const std::string remote_str(reinterpret_cast<const char*>(remote_utf8.data()), remote_utf8.size());
+
+    viewer->SendUiEvent({ft_dlg, "local_path", "submit", "{\"text\":" + JsonEscape(local_str) + "}"});
+    viewer->SendUiEvent({ft_dlg, "remote_path", "submit", "{\"text\":" + JsonEscape(remote_str) + "}"});
+    Check(wait(4s, [&] { drain_ui(); return local_ready && remote_ready; }), "Dual-pane directory listing failed");
+
+    // 4. Create folders on both local and remote sides.
+    viewer->SendUiEvent({ft_dlg, "local_mkdir", "click", R"({"text":"new_local"})"});
+    viewer->SendUiEvent({ft_dlg, "remote_mkdir", "click", R"({"text":"new_remote"})"});
+    Check(wait(3s, [&] {
+        return std::filesystem::is_directory(local_dir / "new_local") &&
+            std::filesystem::is_directory(remote_dir / "new_remote");
+    }), "Local or remote mkdir failed");
+
+    // 5. Upload two files (150 KiB binary + 0-byte empty file) from Viewer -> Host.
+    viewer->SendUiEvent({ft_dlg, "upload_btn", "click",
+        R"({"values":{"local_table":["sample_up.bin","empty.bin"]}})"});
+    Check(wait(8s, [&] {
+        drain_ui();
+        return std::filesystem::is_regular_file(remote_dir / "sample_up.bin") &&
+            std::filesystem::is_regular_file(remote_dir / "empty.bin") &&
+            std::filesystem::file_size(remote_dir / "sample_up.bin") == up_bytes.size();
+    }), "Upload of binary and empty files failed");
+    Check(ReadBinaryFile(remote_dir / "sample_up.bin") == up_bytes, "Uploaded binary content mismatch");
+    Check(ReadBinaryFile(remote_dir / "empty.bin").empty(), "Uploaded empty file mismatch");
+
+    // 6. Download a 180 KiB binary file from Host -> Viewer.
+    viewer->SendUiEvent({ft_dlg, "download_btn", "click",
+        R"({"values":{"remote_table":["sample_down.bin"]}})"});
+    Check(wait(8s, [&] {
+        drain_ui();
+        return std::filesystem::is_regular_file(local_dir / "sample_down.bin") &&
+            std::filesystem::file_size(local_dir / "sample_down.bin") == down_bytes.size();
+    }), "Download of binary file failed");
+    Check(ReadBinaryFile(local_dir / "sample_down.bin") == down_bytes, "Downloaded binary content mismatch");
+
+    // 7. Stop and verify clean close command + zero leftover .p2ptmp files.
+    viewer->Stop();
+    host->Stop();
+    bool ft_closed{};
+    for (const auto& cmd : viewer->TakeUiCommands()) {
+        if (cmd.dialog_id == ft_dlg && cmd.kind == "close") ft_closed = true;
+    }
+    Check(ft_closed, "Open dialog did not emit close command on disconnect");
+
+    std::error_code ignored;
+    std::filesystem::remove_all(local_dir, ignored);
+    std::filesystem::remove_all(remote_dir, ignored);
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 3 && std::wstring_view(argv[1]) == L"--office") {
             TestOfficePolicies(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::wstring_view(argv[1]) == L"--file-transfer") {
+            TestFileTransfer(argv[2]);
             return 0;
         }
         if (argc == 2) return TestClipboard(argv[1]);

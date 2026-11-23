@@ -79,6 +79,7 @@ if (!$ws.Contains('cannot load the probe CA certificate') -or !$ws.Contains('web
 $recoveryPatch=if ($ExperimentalRelayRecovery) {'RelayRecovery.patch'} else {'RecoveredPacketOrdering.patch'}
 $patches=@(
     (Join-Path $PSScriptRoot 'LowLatency.patch')
+    (Join-Path $PSScriptRoot 'DesktopVideoQuality.patch')
     (Join-Path $PSScriptRoot $recoveryPatch)
 )
 # A reused dependency checkout may contain the relay recovery experiment.

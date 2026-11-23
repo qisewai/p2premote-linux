@@ -415,6 +415,7 @@ struct StreamSession::Impl {
     double draw_to_present_total{};
     std::int64_t decoded_frame_wait_ticks{};
     std::deque<StreamStatistics> samples;
+    std::deque<PluginUiCommand> pending_ui_commands;
 };
 
 StreamSession::StreamSession(bool host, ConnectionOptions connection)
@@ -519,7 +520,17 @@ void StreamSession::Stop(std::wstring status) {
 
 void StreamSession::Close(std::wstring status, bool intentional) {
     if (auto active = std::move(impl_->active)) {
-        if (active->rtc) active->rtc->SetPluginsConnected(false);
+        if (active->rtc) {
+            active->rtc->SetPluginsConnected(false);
+            if (!impl_->host) {
+                if (auto* plugins = active->rtc->Plugins()) {
+                    plugins->Stop();
+                    for (auto& command : plugins->TakeUiCommands()) {
+                        impl_->pending_ui_commands.push_back(std::move(command));
+                    }
+                }
+            }
+        }
         active->events->SetDesktopInput(nullptr);
         active->desktop.reset();
         active->capture.reset();
@@ -790,6 +801,28 @@ void StreamSession::InvokePluginMenu(unsigned id) {
     if (auto* plugins = impl_->active->rtc->Plugins()) plugins->Invoke(id);
 }
 
+std::vector<PluginUiCommand> StreamSession::TakePluginUiCommands() {
+    if (!impl_->host && impl_->active && impl_->active->rtc) {
+        if (auto* plugins = impl_->active->rtc->Plugins()) {
+            for (auto& command : plugins->TakeUiCommands()) {
+                impl_->pending_ui_commands.push_back(std::move(command));
+            }
+        }
+    }
+    std::vector<PluginUiCommand> result;
+    result.reserve(impl_->pending_ui_commands.size());
+    while (!impl_->pending_ui_commands.empty()) {
+        result.push_back(std::move(impl_->pending_ui_commands.front()));
+        impl_->pending_ui_commands.pop_front();
+    }
+    return result;
+}
+
+void StreamSession::SendPluginUiEvent(PluginUiEvent event) {
+    if (impl_->host || !InputReady()) return;
+    if (auto* plugins = impl_->active->rtc->Plugins()) plugins->SendUiEvent(std::move(event));
+}
+
 void StreamSession::UpdatePluginLockState(bool caps, bool num) {
     if (impl_->host || !InputReady()) return;
     if (auto* plugins = impl_->active->rtc->Plugins()) plugins->UpdateLockState(caps, num);
@@ -920,7 +953,21 @@ void StreamSession::Capture() {
     }
     impl_->stats.captured += active.capture->Poll().acquired;
     const auto frame = active.capture->TakeFrame();
-    if (!frame) return;
+    if (!frame) {
+        if (active.dxgi_capture && active.dynamic_cadence && active.last_video
+            && active.last_video_quality == active.quality && active.refinement_left > 0) {
+            const auto now = QpcNow();
+            if (now - active.last_submit_qpc >= QpcFrequency() / 15) {
+                active.last_submit_qpc = now;
+                --active.refinement_left;
+                ++active.idle_repeats;
+                ++impl_->stats.submitted;
+                if (const auto& trace = active.events->Trace()) trace->Record("frame_idle_repeat", active.idle_repeats);
+                active.rtc->Submit(*active.last_video);
+            }
+        }
+        return;
+    }
     const auto& trace = active.events->Trace();
     if (trace) {
         if (frame->metadata.source_qpc) {
@@ -951,6 +998,7 @@ void StreamSession::Capture() {
         active.last_video = nv12;
         active.last_video_quality = active.quality;
         active.last_submit_qpc = QpcNow();
+        if (active.dxgi_capture) active.refinement_left = 4;
     }
     active.quality_refresh_due = 0;
     if (trace) trace->Record("frame_submitted", frame->metadata.frame_id);

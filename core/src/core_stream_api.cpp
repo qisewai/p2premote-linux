@@ -2,6 +2,7 @@
 #include "viewer_input.h"
 
 #include <commctrl.h>
+#include <deque>
 #include <memory>
 
 using namespace p2premote;
@@ -148,6 +149,8 @@ struct p2p_stream {
     std::wstring status, notice;
     StreamStatistics stats;
     std::vector<PluginMenuItem> menu;
+    std::deque<PluginUiCommand> ui_commands;
+    PluginUiCommand current_ui_command;
 };
 
 p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host,
@@ -352,6 +355,39 @@ int32_t p2p_stream_invoke_menu(p2p_stream* stream, uint32_t id) {
         auto& session = Required(stream).session;
         ViewerInput::UpdatePluginLocks(session);
         session.InvokePluginMenu(id);
+    });
+}
+
+int32_t p2p_stream_poll_ui_command(p2p_stream* stream, p2p_ui_command* command) {
+    int32_t status = P2P_PENDING;
+    const auto result = Guard([&] {
+        auto& state = Required(stream);
+        auto& out = Required(command);
+        if (state.ui_commands.empty()) {
+            for (auto& item : state.session.TakePluginUiCommands()) {
+                state.ui_commands.push_back(std::move(item));
+            }
+        }
+        if (state.ui_commands.empty()) {
+            out = {};
+            status = P2P_PENDING;
+            return;
+        }
+        state.current_ui_command = std::move(state.ui_commands.front());
+        state.ui_commands.pop_front();
+        out = {state.current_ui_command.dialog_id, state.current_ui_command.kind.c_str(),
+            state.current_ui_command.json.c_str()};
+        status = P2P_OK;
+    });
+    return result == P2P_OK ? status : result;
+}
+
+int32_t p2p_stream_send_ui_event(p2p_stream* stream, uint32_t dialog_id,
+    const char* control, const char* event, const char* payload_json) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        if (!dialog_id || !event || !*event) throw std::invalid_argument("无效的插件界面事件");
+        state.session.SendPluginUiEvent({dialog_id, control ? control : "", event, payload_json ? payload_json : ""});
     });
 }
 

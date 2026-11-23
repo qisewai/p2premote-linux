@@ -8,14 +8,18 @@
 #include <bcrypt.h>
 #include <imm.h>
 #include <lua.hpp>
+#include <shlobj.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cwctype>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -34,9 +38,13 @@ using winrt::Windows::Data::Json::IJsonValueStatics;
 using winrt::Windows::Data::Json::JsonValue;
 using winrt::Windows::Data::Json::JsonValueType;
 constexpr std::size_t max_plugins = 16;
-constexpr std::size_t max_pending_frames = 32;
+constexpr std::size_t max_pending_frames = 128;
 constexpr std::size_t lua_memory_limit = 2 * 1024 * 1024;
 constexpr int lua_instruction_limit = 200'000;
+constexpr std::size_t max_json_bytes = 512 * 1024;
+constexpr int max_json_depth = 16;
+constexpr std::size_t max_fs_read_chunk = 48 * 1024;
+constexpr std::size_t max_fs_list_entries = 1500;
 
 struct Manifest {
     std::string id;
@@ -47,6 +55,7 @@ struct Manifest {
     bool input{};
     bool config{};
     bool video{};
+    bool fs{};
 };
 
 void Log(std::string_view id, std::string_view level, std::string_view message) noexcept {
@@ -109,6 +118,7 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
         else if (name == L"input") manifest.input = true;
         else if (name == L"config") manifest.config = true;
         else if (name == L"video") manifest.video = true;
+        else if (name == L"fs") manifest.fs = true;
         else throw std::runtime_error("Unknown plugin permission");
     }
     const auto filename = winrt::to_string(json.GetNamedString(L"entry"));
@@ -161,6 +171,21 @@ public:
         return true;
     }
 
+    std::uint32_t NextDialogId() noexcept {
+        static std::atomic_uint32_t next_id{1};
+        return next_id.fetch_add(1);
+    }
+
+    bool PushUiCommand(PluginUiCommand command) {
+        {
+            const std::lock_guard lock(mutex);
+            if (ui_commands.size() >= 256) return false;
+            ui_commands.push_back(std::move(command));
+        }
+        Signal();
+        return true;
+    }
+
     PluginMetrics ReadMetrics() const {
         const std::lock_guard lock(mutex);
         return metrics;
@@ -179,6 +204,8 @@ public:
     std::vector<PluginMenuItem> menu;
     std::deque<unsigned> clicks;
     std::vector<PluginAction> actions;
+    std::deque<PluginUiCommand> ui_commands;
+    std::deque<PluginUiEvent> ui_events;
     PluginMetrics metrics;
     std::optional<std::pair<bool, bool>> lock_state;
     bool lock_state_dirty{};
@@ -186,6 +213,464 @@ public:
 
 private:
     PluginHost::Notify signal_;
+};
+
+std::optional<std::wstring> Utf8ToWide(std::string_view text) {
+    if (text.find('\0') != std::string_view::npos) return std::nullopt;
+    if (text.empty()) return std::wstring{};
+    if (text.size() > 32'768) return std::nullopt;
+    const int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+        static_cast<int>(text.size()), nullptr, 0);
+    if (needed <= 0) return std::nullopt;
+    std::wstring wide(static_cast<std::size_t>(needed), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+            static_cast<int>(text.size()), wide.data(), needed) != needed) {
+        return std::nullopt;
+    }
+    return wide;
+}
+
+std::string WideToUtf8(std::wstring_view wide) {
+    if (wide.empty()) return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<std::size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+        out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+std::string Win32ErrorUtf8(DWORD code) {
+    switch (code) {
+    case ERROR_FILE_NOT_FOUND: return "文件不存在";
+    case ERROR_PATH_NOT_FOUND: return "路径不存在";
+    case ERROR_ACCESS_DENIED: return "拒绝访问";
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS: return "目标已存在";
+    case ERROR_SHARING_VIOLATION: return "文件正在被其他程序占用";
+    case ERROR_DISK_FULL: return "磁盘空间不足";
+    case ERROR_INVALID_NAME: return "文件名包含非法字符";
+    default: return "系统错误 (" + std::to_string(code) + ")";
+    }
+}
+
+std::optional<std::filesystem::path> SafeFsPath(std::string_view utf8) {
+    const auto wide = Utf8ToWide(utf8);
+    if (!wide || wide->empty()) return std::nullopt;
+    if (wide->starts_with(L"\\\\") || wide->starts_with(L"//")) return std::nullopt;
+    std::filesystem::path path(*wide);
+    path = path.lexically_normal();
+    if (path.empty() || !path.is_absolute()) return std::nullopt;
+    return path;
+}
+
+bool ValidLeafName(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 240 || name == "." || name == "..") return false;
+    for (unsigned char c : name) {
+        if (c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            return false;
+        }
+    }
+    return name.back() != ' ' && name.back() != '.';
+}
+
+std::string ParentPathUtf8(const std::filesystem::path& normalized) {
+    auto p = normalized;
+    if (p.has_relative_path() && p.filename().empty()) p = p.parent_path();
+    const auto parent = p.parent_path();
+    if (parent.empty() || parent == p) return {};
+    return WideToUtf8(parent.native());
+}
+
+std::int64_t FileTimeToUnixSeconds(const FILETIME& ft) noexcept {
+    ULARGE_INTEGER uli{};
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    constexpr std::uint64_t epoch_diff = 116444736000000000ULL;
+    if (uli.QuadPart < epoch_diff) return 0;
+    return static_cast<std::int64_t>((uli.QuadPart - epoch_diff) / 10000000ULL);
+}
+
+std::string FileTimeToLocalText(const FILETIME& ft) {
+    FILETIME local{};
+    SYSTEMTIME st{};
+    if (!FileTimeToLocalFileTime(&ft, &local) || !FileTimeToSystemTime(&local, &st)) return {};
+    char buf[32]{};
+    std::snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+    return buf;
+}
+
+void AppendJsonString(std::string& out, std::string_view text) {
+    constexpr char hex[] = "0123456789abcdef";
+    out.push_back('"');
+    for (unsigned char c : text) {
+        switch (c) {
+        case '"': out.append("\\\""); break;
+        case '\\': out.append("\\\\"); break;
+        case '\b': out.append("\\b"); break;
+        case '\f': out.append("\\f"); break;
+        case '\n': out.append("\\n"); break;
+        case '\r': out.append("\\r"); break;
+        case '\t': out.append("\\t"); break;
+        default:
+            if (c < 0x20) {
+                out.append("\\u00");
+                out.push_back(hex[c >> 4]);
+                out.push_back(hex[c & 0xf]);
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    out.push_back('"');
+}
+
+bool LuaValueToJson(lua_State* state, int index, std::string& out, int depth = 0) {
+    if (depth > max_json_depth || out.size() > max_json_bytes) return false;
+    index = lua_absindex(state, index);
+    switch (lua_type(state, index)) {
+    case LUA_TNIL:
+        out.append("null");
+        return out.size() <= max_json_bytes;
+    case LUA_TBOOLEAN:
+        out.append(lua_toboolean(state, index) ? "true" : "false");
+        return out.size() <= max_json_bytes;
+    case LUA_TNUMBER: {
+        char buf[64]{};
+        if (lua_isinteger(state, index)) {
+            const auto value = lua_tointeger(state, index);
+            const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value);
+            if (ec != std::errc{}) return false;
+            out.append(buf, ptr);
+        } else {
+            const auto value = lua_tonumber(state, index);
+            if (!std::isfinite(value)) return false;
+            const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value);
+            if (ec != std::errc{}) return false;
+            out.append(buf, ptr);
+        }
+        return out.size() <= max_json_bytes;
+    }
+    case LUA_TSTRING: {
+        std::size_t len{};
+        const auto* data = lua_tolstring(state, index, &len);
+        if (len > max_json_bytes) return false;
+        AppendJsonString(out, {data, len});
+        return out.size() <= max_json_bytes;
+    }
+    case LUA_TTABLE: {
+        if (!lua_checkstack(state, 4)) return false;
+        bool is_array = true;
+        lua_Integer max_key = 0;
+        std::size_t count = 0;
+        lua_pushnil(state);
+        while (lua_next(state, index) != 0) {
+            if (lua_type(state, -2) == LUA_TNUMBER && lua_isinteger(state, -2)) {
+                const auto k = lua_tointeger(state, -2);
+                if (k >= 1) {
+                    if (k > max_key) max_key = k;
+                    ++count;
+                } else {
+                    is_array = false;
+                }
+            } else {
+                is_array = false;
+            }
+            lua_pop(state, 1);
+        }
+        if (count > 0 && is_array && static_cast<std::size_t>(max_key) == count) {
+            out.push_back('[');
+            for (lua_Integer i = 1; i <= max_key; ++i) {
+                if (i > 1) out.push_back(',');
+                lua_rawgeti(state, index, i);
+                const bool ok = LuaValueToJson(state, -1, out, depth + 1);
+                lua_pop(state, 1);
+                if (!ok) return false;
+            }
+            out.push_back(']');
+        } else {
+            out.push_back('{');
+            bool first = true;
+            lua_pushnil(state);
+            while (lua_next(state, index) != 0) {
+                if (lua_type(state, -2) == LUA_TSTRING) {
+                    if (!first) out.push_back(',');
+                    first = false;
+                    std::size_t klen{};
+                    const auto* kdata = lua_tolstring(state, -2, &klen);
+                    AppendJsonString(out, {kdata, klen});
+                    out.push_back(':');
+                    if (!LuaValueToJson(state, -1, out, depth + 1)) {
+                        lua_pop(state, 2);
+                        return false;
+                    }
+                }
+                lua_pop(state, 1);
+            }
+            out.push_back('}');
+        }
+        return out.size() <= max_json_bytes;
+    }
+    default:
+        return false;
+    }
+}
+
+class JsonParser {
+public:
+    JsonParser(lua_State* state, std::string_view input) : state_(state), input_(input) {}
+
+    bool Parse() {
+        SkipWs();
+        if (!ParseValue(0)) return false;
+        SkipWs();
+        if (pos_ != input_.size()) {
+            lua_pop(state_, 1);
+            return false;
+        }
+        return true;
+    }
+
+private:
+    void SkipWs() noexcept {
+        while (pos_ < input_.size()) {
+            const char c = input_[pos_];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') ++pos_;
+            else break;
+        }
+    }
+
+    static void AppendUtf8(std::string& out, std::uint32_t cp) {
+        if (cp <= 0x7f) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7ff) {
+            out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+        } else if (cp <= 0xffff) {
+            out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+        } else if (cp <= 0x10ffff) {
+            out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+        }
+    }
+
+    bool ParseHex4(std::uint32_t& out) noexcept {
+        if (pos_ + 4 > input_.size()) return false;
+        out = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char c = input_[pos_++];
+            std::uint32_t v{};
+            if (c >= '0' && c <= '9') v = static_cast<std::uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') v = static_cast<std::uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v = static_cast<std::uint32_t>(c - 'A' + 10);
+            else return false;
+            out = (out << 4) | v;
+        }
+        return true;
+    }
+
+    bool ParseStringRaw(std::string& out) {
+        if (pos_ >= input_.size() || input_[pos_] != '"') return false;
+        ++pos_;
+        out.clear();
+        while (pos_ < input_.size()) {
+            const char c = input_[pos_++];
+            if (c == '"') return true;
+            if (static_cast<unsigned char>(c) < 0x20) return false;
+            if (c != '\\') {
+                out.push_back(c);
+                continue;
+            }
+            if (pos_ >= input_.size()) return false;
+            const char esc = input_[pos_++];
+            switch (esc) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                std::uint32_t cp{};
+                if (!ParseHex4(cp)) return false;
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (pos_ + 2 > input_.size() || input_[pos_] != '\\' || input_[pos_ + 1] != 'u') return false;
+                    pos_ += 2;
+                    std::uint32_t low{};
+                    if (!ParseHex4(low) || low < 0xdc00 || low > 0xdfff) return false;
+                    cp = 0x10000 + (((cp - 0xd800) << 10) | (low - 0xdc00));
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                    return false;
+                }
+                AppendUtf8(out, cp);
+                break;
+            }
+            default: return false;
+            }
+        }
+        return false;
+    }
+
+    bool ParseNumber() {
+        const auto start = pos_;
+        if (pos_ < input_.size() && input_[pos_] == '-') ++pos_;
+        if (pos_ >= input_.size()) return false;
+        if (input_[pos_] == '0') {
+            ++pos_;
+        } else if (input_[pos_] >= '1' && input_[pos_] <= '9') {
+            while (pos_ < input_.size() && input_[pos_] >= '0' && input_[pos_] <= '9') ++pos_;
+        } else {
+            return false;
+        }
+        bool is_float = false;
+        if (pos_ < input_.size() && input_[pos_] == '.') {
+            is_float = true;
+            ++pos_;
+            if (pos_ >= input_.size() || input_[pos_] < '0' || input_[pos_] > '9') return false;
+            while (pos_ < input_.size() && input_[pos_] >= '0' && input_[pos_] <= '9') ++pos_;
+        }
+        if (pos_ < input_.size() && (input_[pos_] == 'e' || input_[pos_] == 'E')) {
+            is_float = true;
+            ++pos_;
+            if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-')) ++pos_;
+            if (pos_ >= input_.size() || input_[pos_] < '0' || input_[pos_] > '9') return false;
+            while (pos_ < input_.size() && input_[pos_] >= '0' && input_[pos_] <= '9') ++pos_;
+        }
+        const auto token = input_.substr(start, pos_ - start);
+        if (!is_float) {
+            lua_Integer iv{};
+            const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), iv);
+            if (ec == std::errc{} && ptr == token.data() + token.size()) {
+                lua_pushinteger(state_, iv);
+                return true;
+            }
+        }
+        double dv{};
+        const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), dv);
+        if (ec != std::errc{} || ptr != token.data() + token.size() || !std::isfinite(dv)) return false;
+        lua_pushnumber(state_, dv);
+        return true;
+    }
+
+    bool ParseValue(int depth) {
+        if (depth > max_json_depth || !lua_checkstack(state_, 4) || pos_ >= input_.size()) return false;
+        const char c = input_[pos_];
+        if (c == 'n') {
+            if (input_.substr(pos_, 4) != "null") return false;
+            pos_ += 4;
+            lua_pushnil(state_);
+            return true;
+        }
+        if (c == 't') {
+            if (input_.substr(pos_, 4) != "true") return false;
+            pos_ += 4;
+            lua_pushboolean(state_, 1);
+            return true;
+        }
+        if (c == 'f') {
+            if (input_.substr(pos_, 5) != "false") return false;
+            pos_ += 5;
+            lua_pushboolean(state_, 0);
+            return true;
+        }
+        if (c == '"') {
+            std::string str;
+            if (!ParseStringRaw(str)) return false;
+            lua_pushlstring(state_, str.empty() ? "" : str.data(), str.size());
+            return true;
+        }
+        if (c == '[') {
+            ++pos_;
+            lua_newtable(state_);
+            SkipWs();
+            if (pos_ < input_.size() && input_[pos_] == ']') {
+                ++pos_;
+                return true;
+            }
+            lua_Integer index = 1;
+            while (true) {
+                SkipWs();
+                if (!ParseValue(depth + 1)) {
+                    lua_pop(state_, 1);
+                    return false;
+                }
+                lua_rawseti(state_, -2, index++);
+                SkipWs();
+                if (pos_ >= input_.size()) {
+                    lua_pop(state_, 1);
+                    return false;
+                }
+                if (input_[pos_] == ']') {
+                    ++pos_;
+                    return true;
+                }
+                if (input_[pos_] != ',') {
+                    lua_pop(state_, 1);
+                    return false;
+                }
+                ++pos_;
+            }
+        }
+        if (c == '{') {
+            ++pos_;
+            lua_newtable(state_);
+            SkipWs();
+            if (pos_ < input_.size() && input_[pos_] == '}') {
+                ++pos_;
+                return true;
+            }
+            std::string key;
+            while (true) {
+                SkipWs();
+                if (!ParseStringRaw(key)) {
+                    lua_pop(state_, 1);
+                    return false;
+                }
+                SkipWs();
+                if (pos_ >= input_.size() || input_[pos_] != ':') {
+                    lua_pop(state_, 1);
+                    return false;
+                }
+                ++pos_;
+                SkipWs();
+                lua_pushlstring(state_, key.empty() ? "" : key.data(), key.size());
+                if (!ParseValue(depth + 1)) {
+                    lua_pop(state_, 2);
+                    return false;
+                }
+                lua_rawset(state_, -3);
+                SkipWs();
+                if (pos_ >= input_.size()) {
+                    lua_pop(state_, 1);
+                    return false;
+                }
+                if (input_[pos_] == '}') {
+                    ++pos_;
+                    return true;
+                }
+                if (input_[pos_] != ',') {
+                    lua_pop(state_, 1);
+                    return false;
+                }
+                ++pos_;
+            }
+        }
+        if (c == '-' || (c >= '0' && c <= '9')) return ParseNumber();
+        return false;
+    }
+
+    lua_State* state_;
+    std::string_view input_;
+    std::size_t pos_{};
 };
 
 std::optional<std::wstring> UiText(std::string_view text, std::size_t limit) {
@@ -254,8 +739,8 @@ public:
         const auto now = GetTickCount64();
         if (now >= send_period_end_) {
             send_period_end_ = now + 1'000;
-            send_bytes_left_ = 4 * plugin_frame_limit;
-            send_frames_left_ = 32;
+            send_bytes_left_ = 8 * 1024 * 1024;
+            send_frames_left_ = 512;
         }
         if (!send_frames_left_ || packet.payload.size() > send_bytes_left_) return false;
         try {
@@ -291,6 +776,8 @@ public:
     ~LuaPlugin() {
         CaptureLockKeys(false);
         ClearMenu();
+        ClearDialogs();
+        ClearFiles();
         lua_close(state_);
     }
     LuaPlugin(const LuaPlugin&) = delete;
@@ -299,7 +786,13 @@ public:
     bool Load(std::string_view script) { return Run(Initialize, &script); }
     const Manifest& Info() const noexcept { return manifest_; }
 
-    void ConnectionChanged(bool connected) { Call(connected ? callbacks_.connected : callbacks_.disconnected); }
+    void ConnectionChanged(bool connected) {
+        Call(connected ? callbacks_.connected : callbacks_.disconnected);
+        if (!connected) {
+            ClearDialogs();
+            ClearFiles();
+        }
+    }
 
     void Receive(PluginPacket packet) {
         if (manifest_.channel) Call(callbacks_.message, 2, packet.type, packet.payload);
@@ -316,6 +809,42 @@ public:
     void Click(unsigned id) {
         const auto item = std::ranges::find(menu_, id, &MenuCallback::id);
         if (item != menu_.end()) Call(item->ref);
+    }
+
+    bool HandleUiEvent(const PluginUiEvent& ev) {
+        if (!healthy_ || !manifest_.ui) return false;
+        const auto slot = std::ranges::find(dialogs_, ev.dialog_id, &DialogCallback::id);
+        if (slot == dialogs_.end() || slot->ref == LUA_NOREF) return false;
+        const int ref = slot->ref;
+        const bool closing = ev.event == "close" && ev.control.empty();
+        if (closing) *slot = {};
+        struct UiCall {
+            int ref;
+            const PluginUiEvent* ev;
+        } call{ref, &ev};
+        Run([](lua_State* state) {
+            const auto& args = *static_cast<const UiCall*>(lua_touserdata(state, 1));
+            lua_rawgeti(state, LUA_REGISTRYINDEX, args.ref);
+            bool parsed_table = false;
+            if (!args.ev->json.empty() && args.ev->json.size() <= max_json_bytes) {
+                JsonParser parser(state, args.ev->json);
+                if (parser.Parse()) {
+                    if (lua_istable(state, -1)) parsed_table = true;
+                    else lua_pop(state, 1);
+                }
+            }
+            if (!parsed_table) lua_createtable(state, 0, 4);
+            lua_pushinteger(state, static_cast<lua_Integer>(args.ev->dialog_id));
+            lua_setfield(state, -2, "dialog");
+            PushString(state, args.ev->control);
+            lua_setfield(state, -2, "control");
+            PushString(state, args.ev->event);
+            lua_setfield(state, -2, "event");
+            lua_call(state, 1, 0);
+            return 0;
+        }, &call);
+        if (closing) luaL_unref(state_, LUA_REGISTRYINDEX, ref);
+        return true;
     }
 
     void RunTimer(ULONGLONG now) {
@@ -346,12 +875,52 @@ private:
         int ref{LUA_NOREF};
     };
 
+    struct DialogCallback {
+        std::uint32_t id{};
+        int ref{LUA_NOREF};
+    };
+
+    struct FileSlot {
+        lua_Integer id{};
+        HANDLE handle{INVALID_HANDLE_VALUE};
+        bool writable{};
+        std::filesystem::path target_path;
+        std::filesystem::path temp_path;
+    };
+
     void ClearMenu() noexcept {
         for (auto& item : menu_) {
             if (item.id) {
                 try { runtime_.workspace.RemoveMenu(item.id); } catch (...) {}
                 item.id = 0;
             }
+        }
+    }
+
+    void ClearDialogs() noexcept {
+        for (auto& dialog : dialogs_) {
+            if (dialog.id) {
+                try { runtime_.workspace.PushUiCommand({dialog.id, "close", "{}"}); } catch (...) {}
+                if (state_ && dialog.ref != LUA_NOREF) luaL_unref(state_, LUA_REGISTRYINDEX, dialog.ref);
+                dialog = {};
+            }
+        }
+    }
+
+    void CloseFileSlot(FileSlot& slot) noexcept {
+        if (slot.handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(slot.handle);
+            slot.handle = INVALID_HANDLE_VALUE;
+        }
+        if (slot.writable && !slot.temp_path.empty()) {
+            DeleteFileW(slot.temp_path.c_str());
+        }
+        slot = {};
+    }
+
+    void ClearFiles() noexcept {
+        for (auto& slot : files_) {
+            if (slot.id) CloseFileSlot(slot);
         }
     }
 
@@ -409,6 +978,8 @@ private:
         healthy_ = false;
         CaptureLockKeys(false);
         ClearMenu();
+        ClearDialogs();
+        ClearFiles();
         return false;
     }
 
@@ -532,6 +1103,439 @@ private:
             }
         } catch (...) {}
         lua_pushboolean(state, queued);
+        return 1;
+    }
+
+    static int OpenDialog(lua_State* state) {
+        auto& self = Self(state);
+        luaL_checktype(state, 1, LUA_TTABLE);
+        luaL_checktype(state, 2, LUA_TFUNCTION);
+        const auto slot = std::ranges::find(self.dialogs_, 0u, &DialogCallback::id);
+        std::uint32_t id{};
+        if (!self.runtime_.host && self.runtime_.Connected() && slot != self.dialogs_.end()) {
+            std::string json;
+            json.reserve(1024);
+            if (LuaValueToJson(state, 1, json)) {
+                Subscribe(state, 2, slot->ref);
+                try {
+                    const auto candidate = self.runtime_.workspace.NextDialogId();
+                    if (self.runtime_.workspace.PushUiCommand({candidate, "open", std::move(json)})) {
+                        id = candidate;
+                        slot->id = id;
+                    }
+                } catch (...) {}
+                if (!id) {
+                    luaL_unref(state, LUA_REGISTRYINDEX, slot->ref);
+                    *slot = {};
+                }
+            }
+        }
+        if (id) lua_pushinteger(state, static_cast<lua_Integer>(id));
+        else lua_pushnil(state);
+        return 1;
+    }
+
+    static int UpdateDialog(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = luaL_checkinteger(state, 1);
+        luaL_checktype(state, 2, LUA_TTABLE);
+        bool queued{};
+        if (!self.runtime_.host && self.runtime_.Connected() && id > 0 && id <= UINT32_MAX) {
+            const auto target = static_cast<std::uint32_t>(id);
+            if (std::ranges::find(self.dialogs_, target, &DialogCallback::id) != self.dialogs_.end()) {
+                std::string json;
+                json.reserve(1024);
+                if (LuaValueToJson(state, 2, json)) {
+                    try {
+                        queued = self.runtime_.workspace.PushUiCommand({target, "update", std::move(json)});
+                    } catch (...) {}
+                }
+            }
+        }
+        lua_pushboolean(state, queued);
+        return 1;
+    }
+
+    static int CloseDialog(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = luaL_checkinteger(state, 1);
+        bool closed{};
+        if (id > 0 && id <= UINT32_MAX) {
+            const auto target = static_cast<std::uint32_t>(id);
+            const auto slot = std::ranges::find(self.dialogs_, target, &DialogCallback::id);
+            if (slot != self.dialogs_.end()) {
+                if (slot->ref != LUA_NOREF) luaL_unref(state, LUA_REGISTRYINDEX, slot->ref);
+                *slot = {};
+                try {
+                    closed = self.runtime_.workspace.PushUiCommand({target, "close", "{}"});
+                } catch (...) {}
+            }
+        }
+        lua_pushboolean(state, closed);
+        return 1;
+    }
+
+    static int JsonEncode(lua_State* state) {
+        if (lua_gettop(state) < 1) {
+            lua_pushnil(state);
+            return 1;
+        }
+        std::string out;
+        out.reserve(256);
+        if (!LuaValueToJson(state, 1, out)) {
+            lua_pushnil(state);
+            return 1;
+        }
+        PushString(state, out);
+        return 1;
+    }
+
+    static int JsonDecode(lua_State* state) {
+        const auto text = CheckString(state, 1);
+        if (text.empty() || text.size() > max_json_bytes) {
+            lua_pushnil(state);
+            return 1;
+        }
+        JsonParser parser(state, text);
+        if (!parser.Parse()) {
+            lua_pushnil(state);
+            return 1;
+        }
+        return 1;
+    }
+
+    static int FsError(lua_State* state, std::string_view message) {
+        lua_pushnil(state);
+        PushString(state, message);
+        return 2;
+    }
+
+    static int FsBoolError(lua_State* state, std::string_view message) {
+        lua_pushboolean(state, 0);
+        PushString(state, message);
+        return 2;
+    }
+
+    static int FsRoots(lua_State* state) {
+        if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
+        wchar_t buffer[512]{};
+        const DWORD len = GetLogicalDriveStringsW(static_cast<DWORD>(std::size(buffer) - 1), buffer);
+        lua_newtable(state);
+        lua_Integer index = 1;
+        for (const wchar_t* p = buffer; len && p < buffer + len && *p; p += std::wcslen(p) + 1) {
+            const UINT kind = GetDriveTypeW(p);
+            if (kind == DRIVE_UNKNOWN || kind == DRIVE_NO_ROOT_DIR) continue;
+            const auto utf8 = WideToUtf8(p);
+            lua_createtable(state, 0, 3);
+            PushString(state, utf8);
+            lua_setfield(state, -2, "name");
+            PushString(state, utf8);
+            lua_setfield(state, -2, "path");
+            lua_pushstring(state, "drive");
+            lua_setfield(state, -2, "kind");
+            lua_rawseti(state, -2, index++);
+        }
+        return 1;
+    }
+
+    static int FsHome(lua_State* state) {
+        if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
+        auto known = [](REFKNOWNFOLDERID id) -> std::string {
+            PWSTR raw{};
+            if (FAILED(SHGetKnownFolderPath(id, 0, nullptr, &raw)) || !raw) return {};
+            std::wstring wide(raw);
+            CoTaskMemFree(raw);
+            return WideToUtf8(wide);
+        };
+        lua_createtable(state, 0, 3);
+        if (const auto home = known(FOLDERID_Profile); !home.empty()) {
+            PushString(state, home);
+            lua_setfield(state, -2, "home");
+        }
+        if (const auto desktop = known(FOLDERID_Desktop); !desktop.empty()) {
+            PushString(state, desktop);
+            lua_setfield(state, -2, "desktop");
+        }
+        if (const auto downloads = known(FOLDERID_Downloads); !downloads.empty()) {
+            PushString(state, downloads);
+            lua_setfield(state, -2, "downloads");
+        }
+        return 1;
+    }
+
+    static int FsJoin(lua_State* state) {
+        if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
+        const auto dir = SafeFsPath(CheckString(state, 1));
+        const auto name = CheckString(state, 2);
+        if (!dir || !ValidLeafName(name)) return FsError(state, "路径或文件名无效");
+        const auto wide_name = Utf8ToWide(name);
+        if (!wide_name) return FsError(state, "文件名编码无效");
+        const auto joined = (*dir / *wide_name).lexically_normal();
+        PushString(state, WideToUtf8(joined.native()));
+        return 1;
+    }
+
+    static int FsStat(lua_State* state) {
+        if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
+        const auto path = SafeFsPath(CheckString(state, 1));
+        if (!path) return FsError(state, "路径无效");
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (!GetFileAttributesExW(path->c_str(), GetFileExInfoStandard, &data)) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+                lua_createtable(state, 0, 4);
+                lua_pushboolean(state, 0);
+                lua_setfield(state, -2, "exists");
+                lua_pushboolean(state, 0);
+                lua_setfield(state, -2, "is_dir");
+                lua_pushinteger(state, 0);
+                lua_setfield(state, -2, "size");
+                lua_pushinteger(state, 0);
+                lua_setfield(state, -2, "mtime");
+                return 1;
+            }
+            return FsError(state, Win32ErrorUtf8(err));
+        }
+        ULARGE_INTEGER sz{};
+        sz.LowPart = data.nFileSizeLow;
+        sz.HighPart = data.nFileSizeHigh;
+        lua_createtable(state, 0, 4);
+        lua_pushboolean(state, 1);
+        lua_setfield(state, -2, "exists");
+        lua_pushboolean(state, (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        lua_setfield(state, -2, "is_dir");
+        lua_pushinteger(state, static_cast<lua_Integer>(sz.QuadPart));
+        lua_setfield(state, -2, "size");
+        lua_pushinteger(state, static_cast<lua_Integer>(FileTimeToUnixSeconds(data.ftLastWriteTime)));
+        lua_setfield(state, -2, "mtime");
+        return 1;
+    }
+
+    static int FsMkdir(lua_State* state) {
+        if (!Self(state).runtime_.Connected()) return FsBoolError(state, "未连接");
+        const auto path = SafeFsPath(CheckString(state, 1));
+        if (!path) return FsBoolError(state, "路径无效");
+        if (!CreateDirectoryW(path->c_str(), nullptr)) {
+            return FsBoolError(state, Win32ErrorUtf8(GetLastError()));
+        }
+        lua_pushboolean(state, 1);
+        return 1;
+    }
+
+    static int FsList(lua_State* state) {
+        if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
+        const auto path = SafeFsPath(CheckString(state, 1));
+        if (!path) return FsError(state, "路径无效");
+        const auto attrs = GetFileAttributesW(path->c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) return FsError(state, Win32ErrorUtf8(GetLastError()));
+        if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return FsError(state, "目标不是目录");
+
+        const auto pattern = (*path / L"*").native();
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch,
+            nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) {
+            const DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND) return FsError(state, Win32ErrorUtf8(err));
+        }
+
+        struct DirEntry {
+            std::string name;
+            std::wstring lower;
+            bool is_dir{};
+            std::uint64_t size{};
+            std::int64_t mtime{};
+            std::string mtime_text;
+        };
+        std::vector<DirEntry> entries;
+        bool truncated = false;
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                const std::wstring_view wname(data.cFileName);
+                if (wname == L"." || wname == L"..") continue;
+                if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+                if ((data.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) ==
+                    (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+                if (entries.size() >= max_fs_list_entries) {
+                    truncated = true;
+                    break;
+                }
+                std::wstring lower(wname);
+                for (auto& ch : lower) ch = static_cast<wchar_t>(std::towlower(ch));
+                ULARGE_INTEGER sz{};
+                sz.LowPart = data.nFileSizeLow;
+                sz.HighPart = data.nFileSizeHigh;
+                entries.push_back({WideToUtf8(wname), std::move(lower),
+                    (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+                    sz.QuadPart, FileTimeToUnixSeconds(data.ftLastWriteTime),
+                    FileTimeToLocalText(data.ftLastWriteTime)});
+            } while (FindNextFileW(find, &data));
+            FindClose(find);
+        }
+
+        std::ranges::sort(entries, [](const DirEntry& a, const DirEntry& b) {
+            if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
+            return a.lower < b.lower;
+        });
+
+        lua_createtable(state, 0, 4);
+        PushString(state, WideToUtf8(path->native()));
+        lua_setfield(state, -2, "path");
+        PushString(state, ParentPathUtf8(*path));
+        lua_setfield(state, -2, "parent");
+        lua_pushboolean(state, truncated);
+        lua_setfield(state, -2, "truncated");
+        lua_createtable(state, static_cast<int>(entries.size()), 0);
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const auto& e = entries[i];
+            lua_createtable(state, 0, 5);
+            PushString(state, e.name);
+            lua_setfield(state, -2, "name");
+            lua_pushboolean(state, e.is_dir);
+            lua_setfield(state, -2, "is_dir");
+            lua_pushinteger(state, static_cast<lua_Integer>(e.size));
+            lua_setfield(state, -2, "size");
+            lua_pushinteger(state, static_cast<lua_Integer>(e.mtime));
+            lua_setfield(state, -2, "mtime");
+            PushString(state, e.mtime_text);
+            lua_setfield(state, -2, "mtime_text");
+            lua_rawseti(state, -2, static_cast<lua_Integer>(i + 1));
+        }
+        lua_setfield(state, -2, "entries");
+        return 1;
+    }
+
+    static int FsOpenRead(lua_State* state) {
+        auto& self = Self(state);
+        if (!self.runtime_.Connected()) return FsError(state, "未连接");
+        const auto path = SafeFsPath(CheckString(state, 1));
+        if (!path) return FsError(state, "路径无效");
+        const auto slot = std::ranges::find(self.files_, 0, &FileSlot::id);
+        if (slot == self.files_.end()) return FsError(state, "同时打开的文件过多");
+        const auto attrs = GetFileAttributesW(path->c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) return FsError(state, Win32ErrorUtf8(GetLastError()));
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            return FsError(state, "只能读取普通文件");
+        }
+        HANDLE file = CreateFileW(path->c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return FsError(state, Win32ErrorUtf8(GetLastError()));
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file, &size)) {
+            const DWORD err = GetLastError();
+            CloseHandle(file);
+            return FsError(state, Win32ErrorUtf8(err));
+        }
+        slot->id = ++self.next_file_;
+        slot->handle = file;
+        slot->writable = false;
+        slot->target_path = *path;
+        slot->temp_path.clear();
+        lua_pushinteger(state, slot->id);
+        lua_pushinteger(state, static_cast<lua_Integer>(size.QuadPart));
+        return 2;
+    }
+
+    static int FsRead(lua_State* state) {
+        auto& self = Self(state);
+        if (!self.runtime_.Connected()) return FsError(state, "未连接");
+        const auto id = luaL_checkinteger(state, 1);
+        const auto requested = luaL_optinteger(state, 2, static_cast<lua_Integer>(32 * 1024));
+        if (requested <= 0) return FsError(state, "读取大小无效");
+        const auto slot = std::ranges::find(self.files_, id, &FileSlot::id);
+        if (slot == self.files_.end() || slot->id == 0 || slot->writable || slot->handle == INVALID_HANDLE_VALUE) {
+            return FsError(state, "无效的读取句柄");
+        }
+        const auto chunk = static_cast<DWORD>(std::min<lua_Integer>(requested, static_cast<lua_Integer>(max_fs_read_chunk)));
+        std::string buffer(chunk, '\0');
+        DWORD read{};
+        if (!::ReadFile(slot->handle, buffer.data(), chunk, &read, nullptr)) {
+            return FsError(state, Win32ErrorUtf8(GetLastError()));
+        }
+        lua_pushlstring(state, buffer.data(), read);
+        return 1;
+    }
+
+    static int FsOpenWrite(lua_State* state) {
+        auto& self = Self(state);
+        if (!self.runtime_.Connected()) return FsError(state, "未连接");
+        const auto path = SafeFsPath(CheckString(state, 1));
+        if (!path || path->filename().empty()) return FsError(state, "目标路径无效");
+        const auto slot = std::ranges::find(self.files_, 0, &FileSlot::id);
+        if (slot == self.files_.end()) return FsError(state, "同时打开的文件过多");
+        const auto attrs = GetFileAttributesW(path->c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES &&
+            ((attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))) {
+            return FsError(state, "目标路径不可写入");
+        }
+        const auto next_id = ++self.next_file_;
+        const auto temp_name = L".p2ptmp." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(next_id);
+        const auto temp_path = path->parent_path() / temp_name;
+        HANDLE file = CreateFileW(temp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return FsError(state, Win32ErrorUtf8(GetLastError()));
+        slot->id = next_id;
+        slot->handle = file;
+        slot->writable = true;
+        slot->target_path = *path;
+        slot->temp_path = temp_path;
+        lua_pushinteger(state, slot->id);
+        return 1;
+    }
+
+    static int FsWrite(lua_State* state) {
+        auto& self = Self(state);
+        if (!self.runtime_.Connected()) return FsBoolError(state, "未连接");
+        const auto id = luaL_checkinteger(state, 1);
+        const auto data = CheckString(state, 2);
+        const auto slot = std::ranges::find(self.files_, id, &FileSlot::id);
+        if (slot == self.files_.end() || slot->id == 0 || !slot->writable || slot->handle == INVALID_HANDLE_VALUE) {
+            return FsBoolError(state, "无效的写入句柄");
+        }
+        std::size_t written_total = 0;
+        while (written_total < data.size()) {
+            DWORD written{};
+            const auto to_write = static_cast<DWORD>(std::min<std::size_t>(data.size() - written_total, 64 * 1024));
+            if (!WriteFile(slot->handle, data.data() + written_total, to_write, &written, nullptr) || written == 0) {
+                return FsBoolError(state, Win32ErrorUtf8(GetLastError()));
+            }
+            written_total += written;
+        }
+        lua_pushboolean(state, 1);
+        return 1;
+    }
+
+    static int FsCommit(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = luaL_checkinteger(state, 1);
+        const auto slot = std::ranges::find(self.files_, id, &FileSlot::id);
+        if (slot == self.files_.end() || slot->id == 0 || !slot->writable || slot->handle == INVALID_HANDLE_VALUE) {
+            return FsBoolError(state, "无效的写入句柄");
+        }
+        CloseHandle(slot->handle);
+        slot->handle = INVALID_HANDLE_VALUE;
+        const auto temp = std::move(slot->temp_path);
+        const auto target = std::move(slot->target_path);
+        *slot = {};
+        if (!MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            const DWORD err = GetLastError();
+            DeleteFileW(temp.c_str());
+            return FsBoolError(state, Win32ErrorUtf8(err));
+        }
+        lua_pushboolean(state, 1);
+        return 1;
+    }
+
+    static int FsClose(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = luaL_checkinteger(state, 1);
+        const auto slot = std::ranges::find(self.files_, id, &FileSlot::id);
+        if (slot != self.files_.end() && slot->id != 0) {
+            self.CloseFileSlot(*slot);
+            lua_pushboolean(state, 1);
+        } else {
+            lua_pushboolean(state, 0);
+        }
         return 1;
     }
 
@@ -798,7 +1802,12 @@ private:
         static const luaL_Reg timer[] = {
             {"after", [](lua_State* l) { return AddTimer(l, false); }},
             {"every", [](lua_State* l) { return AddTimer(l, true); }},
-            {"cancel", CancelTimer}, {nullptr, nullptr}
+            {"cancel", CancelTimer},
+            {"now_ms", [](lua_State* l) { lua_pushinteger(l, static_cast<lua_Integer>(GetTickCount64())); return 1; }},
+            {nullptr, nullptr}
+        };
+        static const luaL_Reg json[] = {
+            {"encode", JsonEncode}, {"decode", JsonDecode}, {nullptr, nullptr}
         };
         static const luaL_Reg log[] = {
             {"info", [](lua_State* l) { Log(Self(l).manifest_.id, "info", CheckString(l, 1)); return 0; }},
@@ -806,16 +1815,28 @@ private:
             {"error", [](lua_State* l) { Log(Self(l).manifest_.id, "error", CheckString(l, 1)); return 0; }},
             {nullptr, nullptr}
         };
-        static const luaL_Reg ui[] = {{"add_menu", AddMenu}, {"set_checked", CheckMenu}, {"notify", Notice}, {nullptr, nullptr}};
+        static const luaL_Reg ui[] = {
+            {"add_menu", AddMenu}, {"set_checked", CheckMenu}, {"notify", Notice},
+            {"open_dialog", OpenDialog}, {"update_dialog", UpdateDialog}, {"close_dialog", CloseDialog},
+            {nullptr, nullptr}
+        };
         static const luaL_Reg input[] = {{"send_keys", SendKeys}, {"send_text", SendText}, {"get_state", InputState},
             {"on_state_change", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.lock_state); return 0; }},
             {"set_lock", SetLocalLock}, {"set_ime", SetIme}, {"use_lock_sync", UseLockSync}, {nullptr, nullptr}};
         static const luaL_Reg config[] = {{"get", ConfigGet}, {"set", ConfigSet}, {nullptr, nullptr}};
         static const luaL_Reg video[] = {{"set_bitrate", SetBitrate}, {nullptr, nullptr}};
+        static const luaL_Reg fs[] = {
+            {"roots", FsRoots}, {"home", FsHome}, {"list", FsList}, {"stat", FsStat},
+            {"mkdir", FsMkdir}, {"join", FsJoin},
+            {"open_read", FsOpenRead}, {"read", FsRead},
+            {"open_write", FsOpenWrite}, {"write", FsWrite}, {"commit", FsCommit}, {"close", FsClose},
+            {nullptr, nullptr}
+        };
         lua_newtable(state);
         Namespace(state, "session", session);
         Namespace(state, "crypto", crypto);
         Namespace(state, "timer", timer);
+        Namespace(state, "json", json);
         if (manifest_.channel) Namespace(state, "channel", channel);
         if (manifest_.clipboard) Namespace(state, "clipboard", clipboard);
         if (manifest_.log) Namespace(state, "log", log);
@@ -823,6 +1844,7 @@ private:
         if (manifest_.input) Namespace(state, "input", input);
         if (manifest_.config) Namespace(state, "config", config);
         if (manifest_.video) Namespace(state, "video", video);
+        if (manifest_.fs) Namespace(state, "fs", fs);
         ReadOnly(state);
         lua_setglobal(state, "p2p");
     }
@@ -879,9 +1901,12 @@ private:
     } callbacks_;
     std::array<Timer, 32> timers_{};
     std::array<MenuCallback, 8> menu_{};
+    std::array<DialogCallback, 4> dialogs_{};
+    std::array<FileSlot, 4> files_{};
     std::optional<PluginSettings> settings_;
     std::string config_result_;
     lua_Integer next_timer_{};
+    lua_Integer next_file_{};
 };
 
 void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
@@ -963,6 +1988,7 @@ struct PluginHost::Impl {
                 }
 
                 unsigned click{};
+                std::optional<PluginUiEvent> ui_event;
                 bool lock_changed{};
                 {
                     const std::lock_guard lock(workspace.mutex);
@@ -970,10 +1996,19 @@ struct PluginHost::Impl {
                         click = workspace.clicks.front();
                         workspace.clicks.pop_front();
                     }
+                    if (!workspace.ui_events.empty()) {
+                        ui_event = std::move(workspace.ui_events.front());
+                        workspace.ui_events.pop_front();
+                    }
                     lock_changed = std::exchange(workspace.lock_state_dirty, false);
                 }
                 if (click && connected.load()) {
                     for (const auto& plugin : plugins) plugin->Click(click);
+                }
+                if (ui_event && connected.load()) {
+                    for (const auto& plugin : plugins) {
+                        if (plugin->HandleUiEvent(*ui_event)) break;
+                    }
                 }
                 if (lock_changed && connected.load()) {
                     for (const auto& plugin : plugins) plugin->LockStateChanged();
@@ -982,7 +2017,7 @@ struct PluginHost::Impl {
                 for (const auto& plugin : plugins) {
                     if (connected.load()) plugin->RunTimer(now);
                 }
-                if (!frame.empty() || click || lock_changed) continue;
+                if (!frame.empty() || click || ui_event || lock_changed) continue;
                 now = GetTickCount64();
                 DWORD wait = runtime.clipboard ? runtime.clipboard->Wait(now) : INFINITE;
                 for (const auto& plugin : plugins) wait = std::min(wait, plugin->Wait(now));
@@ -1081,6 +2116,28 @@ std::vector<PluginAction> PluginHost::TakeActions() {
     auto actions = std::exchange(impl_->workspace.actions, {});
     if (!impl_->connected.load()) actions.clear();
     return actions;
+}
+
+std::vector<PluginUiCommand> PluginHost::TakeUiCommands() {
+    const std::lock_guard lock(impl_->workspace.mutex);
+    std::vector<PluginUiCommand> result;
+    result.reserve(impl_->workspace.ui_commands.size());
+    while (!impl_->workspace.ui_commands.empty()) {
+        result.push_back(std::move(impl_->workspace.ui_commands.front()));
+        impl_->workspace.ui_commands.pop_front();
+    }
+    return result;
+}
+
+void PluginHost::SendUiEvent(PluginUiEvent event) {
+    if (!event.dialog_id || event.event.empty()) return;
+    {
+        auto& workspace = impl_->workspace;
+        const std::lock_guard lock(workspace.mutex);
+        if (!impl_->connected.load() || workspace.ui_events.size() >= 64) return;
+        workspace.ui_events.push_back(std::move(event));
+    }
+    SetEvent(impl_->wake.get());
 }
 
 void PluginHost::Stop() { impl_->Stop(); }

@@ -18,10 +18,7 @@ index 78e8a21..f30b9bf 100644
        request_keyframe_for_nack_overflow = nack_->ConsumeKeyFrameRequest();
      }
      SendPreparedNackBatch(std::move(nack_batch));
-@@ -471,6 +471,18 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
-     return;
-   }
-
+@@ -474,3 +474,15 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
 +  // Keep the NACK blocking newer delta frames until the recovered packet is
 +  // visible to frame assembly. Its earlier Wake() may run before the NACK is
 +  // cleared, so wake the receiver again after removing the blocker.
@@ -53,11 +50,9 @@ index 78e8a21..f30b9bf 100644
        return;
      }
  #ifdef SAVE_RTP_RECV_STREAM
-@@ -508,6 +522,7 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+@@ -508,4 +522,5 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
        ProcessH264RtpPacket(rtp_packet_h264);
      }
    }
 +  retire_recovered_nack();
  }
-
- void RtpVideoReceiver::ProcessH264RtpPacket(RtpPacketH264& rtp_packet_h264) {

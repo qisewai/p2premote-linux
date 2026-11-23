@@ -1,4 +1,5 @@
 #include "remote_window.h"
+#include "plugin_dialog.h"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -135,7 +136,11 @@ RemoteWindow::RemoteWindow(p2p_account* account, const QString& device, const QS
         return;
     }
 
+    dialogs_ = new PluginDialogManager(this, this);
     connect(driver_.get(), &StreamDriver::changed, this, &RemoteWindow::showState);
+    connect(driver_.get(), &StreamDriver::uiCommandsReady, this, [this] {
+        if (driver_ && driver_->handle()) dialogs_->poll(driver_->handle());
+    });
     connect(connect_, &QPushButton::clicked, this, &RemoteWindow::start);
     connect(stop_, &QPushButton::clicked, this, [this] {
         driver_->update(p2p_stream_stop(driver_->handle(), nullptr));
@@ -159,7 +164,9 @@ RemoteWindow::RemoteWindow(p2p_account* account, const QString& device, const QS
     connect(&hover_, &QTimer::timeout, this, &RemoteWindow::positionFullscreenToolbar);
 }
 
-RemoteWindow::~RemoteWindow() = default;
+RemoteWindow::~RemoteWindow() {
+    if (dialogs_) dialogs_->closeAll();
+}
 
 void RemoteWindow::start() {
     if (driver_ && driver_->handle()) {
@@ -188,6 +195,10 @@ void RemoteWindow::syncVideo() {
 void RemoteWindow::showState(const p2p_stream_snapshot_v1& snapshot) {
     const auto active = snapshot.state != P2P_IDLE && snapshot.state != P2P_STOPPED;
     playing_ = snapshot.state == P2P_STREAMING;
+    if (dialogs_) {
+        if (driver_ && driver_->handle()) dialogs_->poll(driver_->handle());
+        if (!active) dialogs_->closeAll();
+    }
     connect_->setEnabled(!active);
     stop_->setEnabled(active);
     export_->setEnabled(!active && snapshot.seconds > 0);

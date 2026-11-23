@@ -55,6 +55,7 @@ void StreamDriver::update(int result) {
     }
     syncWaits();
     publish();
+    emit uiCommandsReady();
 }
 
 void StreamDriver::resize(bool drawable) {
@@ -80,6 +81,7 @@ void StreamDriver::dispatch(uint32_t kind) {
         if (p2p_stream_state(handle()) != state_ || (p2p_stream_input_ready(handle()) != 0) != input_ready_) {
             publish();
         }
+        if (kind == P2P_WAIT_SESSION) emit uiCommandsReady();
     }
     syncWaits();
 }

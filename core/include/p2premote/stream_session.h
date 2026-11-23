@@ -80,6 +80,8 @@ public:
     bool HasPluginMenu() const;
     std::vector<PluginMenuItem> PluginMenu() const;
     void InvokePluginMenu(unsigned id);
+    std::vector<PluginUiCommand> TakePluginUiCommands();
+    void SendPluginUiEvent(PluginUiEvent event);
     void UpdatePluginLockState(bool caps, bool num);
     bool PluginCapturesLockKeys() const noexcept;
     std::wstring_view PluginNotice() const noexcept;

@@ -73,6 +73,14 @@ typedef struct p2p_menu_item {
     int32_t checked;
 } p2p_menu_item;
 
+typedef struct p2p_ui_command {
+    uint32_t dialog_id;
+    /* UTF-8 command kind: "open", "update", or "close". */
+    const char* kind;
+    /* UTF-8 JSON payload. */
+    const char* json;
+} p2p_ui_command;
+
 /*
  * Windows x64, default C calling convention. Strings are UTF-16 unless marked char (UTF-8).
  * Use each handle from its creating thread and release it with its DLL destroy function.
@@ -131,6 +139,14 @@ P2P_CORE_API size_t p2p_stream_read_menu(p2p_stream* stream);
 /* Menu text views expire at the next read_menu call or destruction. */
 P2P_CORE_API int32_t p2p_stream_menu_item(const p2p_stream* stream, size_t index, p2p_menu_item* item);
 P2P_CORE_API int32_t p2p_stream_invoke_menu(p2p_stream* stream, uint32_t id);
+/*
+ * Declarative plugin UI commands and events (UTF-8 JSON, frontend-agnostic).
+ * poll_ui_command returns P2P_OK when a command is dequeued, P2P_PENDING when empty.
+ * Borrowed strings expire at the next poll_ui_command call or stream destruction.
+ */
+P2P_CORE_API int32_t p2p_stream_poll_ui_command(p2p_stream* stream, p2p_ui_command* command);
+P2P_CORE_API int32_t p2p_stream_send_ui_event(p2p_stream* stream, uint32_t dialog_id,
+    const char* control, const char* event, const char* payload_json);
 P2P_CORE_API int32_t p2p_stream_export_csv(p2p_stream* stream, const wchar_t* file);
 
 #ifdef __cplusplus

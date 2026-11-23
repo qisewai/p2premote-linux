@@ -230,8 +230,15 @@ public:
     }
     int SetTargetBitrate(int bitrate) override {
         Apartment apartment;
+        if (bitrate <= 0) return -1;
         if (software_) return software_->SetTargetBitrate(bitrate);
+        if (bitrate == config_.init_bitrate) return 0;
         if (!SetNumber(api_.get(), CODECAPI_AVEncCommonMeanBitRate, bitrate)) return -1;
+        // If bitrate jumped significantly upward (e.g. startup ramp-up), request a clean keyframe
+        // so low-bitrate blur does not persist across a long P-frame chain.
+        if (config_.init_bitrate > 0 && bitrate >= 2LL * config_.init_bitrate) {
+            force_idr_ = true;
+        }
         config_.init_bitrate = bitrate;
         return 0;
     }
@@ -271,6 +278,19 @@ private:
 
     void Open(UINT width, UINT height) {
         CloseHardware();
+        try {
+            OpenProfile(width, height, eAVEncH264VProfile_Main);
+        } catch (const winrt::hresult_error&) {
+            // Retry on a fresh MFT if any part of Main profile setup failed.
+            OpenProfile(width, height, eAVEncH264VProfile_Base);
+        }
+        width_ = width;
+        height_ = height;
+        resolution_.store((static_cast<uint64_t>(width) << 32) | height, std::memory_order_relaxed);
+        input_requests_ = 0;
+    }
+
+    void OpenProfile(UINT width, UINT height, UINT32 profile) {
         const auto activate = EncoderActivation(device_.get());
         if (!activate) winrt::throw_hresult(MF_E_TOPO_CODEC_NOT_FOUND);
         com_ptr<IMFTransform> mft;
@@ -280,26 +300,26 @@ private:
         check_hresult(mft->GetAttributes(attributes.put()));
         check_hresult(attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE));
         attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
-        transform_ = std::make_unique<Transform>(std::move(mft), device_.get());
-        generator_ = transform_->mft.as<IMFMediaEventGenerator>();
-        api_ = transform_->mft.try_as<ICodecAPI>();
-        Enable(api_.get(), CODECAPI_AVLowLatencyMode);
-        SetNumber(api_.get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
-        SetNumber(api_.get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+        auto transform = std::make_unique<Transform>(std::move(mft), device_.get());
+        auto generator = transform->mft.as<IMFMediaEventGenerator>();
+        auto api = transform->mft.try_as<ICodecAPI>();
+        Enable(api.get(), CODECAPI_AVLowLatencyMode);
+        SetNumber(api.get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+        SetNumber(api.get(), CODECAPI_AVEncCommonQualityVsSpeed, 70);
+        SetNumber(api.get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         const auto fps = static_cast<UINT>(std::clamp(config_.max_frame_rate, 1, 60));
-        SetNumber(api_.get(), CODECAPI_AVEncMPVGOPSize, fps * 4);
+        SetNumber(api.get(), CODECAPI_AVEncMPVGOPSize, fps * 2);
         const auto h264 = VideoType(MFVideoFormat_H264, width, height, fps);
         check_hresult(h264->SetUINT32(MF_MT_AVG_BITRATE, config_.init_bitrate));
-        check_hresult(h264->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base));
-        check_hresult(transform_->mft->SetOutputType(transform_->output, h264.get(), 0));
+        check_hresult(h264->SetUINT32(MF_MT_MPEG2_PROFILE, profile));
+        check_hresult(transform->mft->SetOutputType(transform->output, h264.get(), 0));
         const auto nv12 = VideoType(MFVideoFormat_NV12, width, height, fps);
-        check_hresult(transform_->mft->SetInputType(transform_->input, nv12.get(), 0));
-        transform_->Start();
+        check_hresult(transform->mft->SetInputType(transform->input, nv12.get(), 0));
+        transform->Start();
         waiter_ = winrt::make_self<EventWaiter>();
-        width_ = width;
-        height_ = height;
-        resolution_.store((static_cast<uint64_t>(width) << 32) | height, std::memory_order_relaxed);
-        input_requests_ = 0;
+        api_ = std::move(api);
+        generator_ = std::move(generator);
+        transform_ = std::move(transform);
     }
 
     void EncodeHardware(const RawFrame& raw, const std::function<int(const EncodedFrame&)>& output) {

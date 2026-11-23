@@ -32,6 +32,7 @@ public:
 
 signals:
     void changed(const p2p_stream_snapshot_v1& snapshot);
+    void uiCommandsReady();
     void failed(const QString& message);
 
 private:

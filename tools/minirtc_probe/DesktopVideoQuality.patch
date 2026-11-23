@@ -1,0 +1,152 @@
+diff --git a/src/common/rtc_base/system_time.cc b/src/common/rtc_base/system_time.cc
+--- a/src/common/rtc_base/system_time.cc
++++ b/src/common/rtc_base/system_time.cc
+@@ -14,6 +14,7 @@
+ 
+ #include <stdint.h>
+ 
++#include <chrono>
+ #include <limits>
+ 
+ #if defined(__linux__)
+@@ -65,35 +66,9 @@
+ #elif defined(WINUWP)
+   ticks = WinUwpSystemTimeNanos();
+ #elif defined(_WIN32)
+-  // TODO(webrtc:14601): Fix the volatile increment instead of suppressing the
+-  // warning.
+-#if defined(__clang__)
+-#pragma clang diagnostic push
+-#pragma clang diagnostic ignored "-Wdeprecated-volatile"
+-#endif
+-  static volatile LONG last_timegettime = 0;
+-  static volatile int64_t num_wrap_timegettime = 0;
+-  volatile LONG* last_timegettime_ptr = &last_timegettime;
+-  DWORD now = timeGetTime();
+-  // Atomically update the last gotten time
+-  DWORD old = InterlockedExchange(last_timegettime_ptr, now);
+-  if (now < old) {
+-    // If now is earlier than old, there may have been a race between threads.
+-    // 0x0fffffff ~3.1 days, the code will not take that long to execute
+-    // so it must have been a wrap around.
+-    if (old > 0xf0000000 && now < 0x0fffffff) {
+-      num_wrap_timegettime++;
+-    }
+-  }
+-  ticks = now + (num_wrap_timegettime << 32);
+-  // TODO(deadbeef): Calculate with nanosecond precision. Otherwise, we're
+-#if defined(__clang__)
+-#pragma clang diagnostic pop
+-#endif
+-  ticks = ticks * kNumNanosecsPerMillisec;
+-#if defined(__clang__)
+-#pragma clang diagnostic pop
+-#endif
++  ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(
++              std::chrono::steady_clock::now().time_since_epoch())
++              .count();
+ #else
+ #error Unsupported platform.
+ #endif
+diff --git a/src/statistics/io_statistics.cpp b/src/statistics/io_statistics.cpp
+--- a/src/statistics/io_statistics.cpp
++++ b/src/statistics/io_statistics.cpp
+@@ -41,14 +41,16 @@
+     cond_var_.wait_for(lock, std::chrono::milliseconds(interval_),
+                        [this] { return !running_; });
+ 
+-    video_inbound_bitrate_ = video_inbound_bytes_.load() * 1000 * 8 / interval_;
+-    video_outbound_bitrate_ =
+-        video_outbound_bytes_.load() * 1000 * 8 / interval_;
+-    audio_inbound_bitrate_ = audio_inbound_bytes_.load() * 1000 * 8 / interval_;
+-    audio_outbound_bitrate_ =
+-        audio_outbound_bytes_.load() * 1000 * 8 / interval_;
+-    data_inbound_bitrate_ = data_inbound_bytes_.load() * 1000 * 8 / interval_;
+-    data_outbound_bitrate_ = data_outbound_bytes_.load() * 1000 * 8 / interval_;
++    const auto rate = [interval = interval_](std::atomic<uint32_t>& bytes) {
++      return static_cast<uint32_t>(
++          static_cast<uint64_t>(bytes.exchange(0)) * 8000 / interval);
++    };
++    video_inbound_bitrate_ = rate(video_inbound_bytes_);
++    video_outbound_bitrate_ = rate(video_outbound_bytes_);
++    audio_inbound_bitrate_ = rate(audio_inbound_bytes_);
++    audio_outbound_bitrate_ = rate(audio_outbound_bytes_);
++    data_inbound_bitrate_ = rate(data_inbound_bytes_);
++    data_outbound_bitrate_ = rate(data_outbound_bytes_);
+     total_inbound_bitrate_ =
+         video_inbound_bitrate_ + audio_inbound_bitrate_ + data_inbound_bitrate_;
+     total_outbound_bitrate_ = video_outbound_bitrate_ +
+@@ -109,12 +111,6 @@
+       data_rtp_pkt_loss_rate_ = 0;
+     }
+ 
+-    video_inbound_bytes_.store(0);
+-    video_outbound_bytes_.store(0);
+-    audio_inbound_bytes_.store(0);
+-    audio_outbound_bytes_.store(0);
+-    data_inbound_bytes_.store(0);
+-    data_outbound_bytes_.store(0);
+     video_rtp_pkt_loss_cnt_.store(0);
+     audio_rtp_pkt_loss_cnt_.store(0);
+     data_rtp_pkt_loss_cnt_.store(0);
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -42,6 +42,16 @@
+   return config.video_content_type == VideoContentType::ScreenContent &&
+          config.video_degradation_preference !=
+              VideoDegradationPreference::MaintainResolution;
++}
++
++bool ShouldApplyVideoBitrate(int target, std::optional<int> applied) {
++  // Admission handles a zero budget without reconfiguring the codec.
++  if (target <= 0) return false;
++  if (!applied) return true;
++
++  // Keep small estimator fluctuations off the encode queue.
++  const auto delta = std::abs(static_cast<int64_t>(target) - *applied);
++  return delta >= 100'000 || delta * 25 >= *applied;
+ }
+ 
+ }  // namespace
+@@ -3948,12 +3958,9 @@
+ 
+       const int per_video_bitrate = static_cast<int>(context->fec_protection.media_bitrate_bps);
+       context->desired_target_bitrate = per_video_bitrate;
+-      // Admission pauses at zero; avoid passing unsupported zero to codecs.
+-      if (per_video_bitrate <= 0) continue;
+-      if (context->bitrate_update_queued) {
+-        continue;
+-      }
+-      if (context->applied_target_bitrate == per_video_bitrate) {
++      if (context->bitrate_update_queued ||
++          !ShouldApplyVideoBitrate(per_video_bitrate,
++                                   context->applied_target_bitrate)) {
+         continue;
+       }
+ 
+@@ -4011,11 +4018,8 @@
+     }
+ 
+     target_bitrate = context->desired_target_bitrate.value();
+-    if (target_bitrate <= 0) {
+-      context->bitrate_update_queued = false;
+-      return;
+-    }
+-    if (context->applied_target_bitrate == target_bitrate) {
++    if (!ShouldApplyVideoBitrate(target_bitrate,
++                                 context->applied_target_bitrate)) {
+       context->bitrate_update_queued = false;
+       return;
+     }
+@@ -4038,7 +4042,9 @@
+     }
+ 
+     if (context->desired_target_bitrate.has_value() &&
+-        context->desired_target_bitrate.value() != target_bitrate) {
++        context->desired_target_bitrate.value() != target_bitrate &&
++        ShouldApplyVideoBitrate(*context->desired_target_bitrate,
++                                context->applied_target_bitrate)) {
+       // Keep the in-flight flag set. Reposting at the tail gives frame tasks a
+       // chance to run while still converging to the newest desired bitrate.
+       post_followup = true;

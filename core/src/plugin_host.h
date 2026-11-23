@@ -32,6 +32,8 @@ public:
     std::vector<PluginMenuItem> Menu() const;
     void Invoke(unsigned id);
     std::vector<PluginAction> TakeActions();
+    std::vector<PluginUiCommand> TakeUiCommands();
+    void SendUiEvent(PluginUiEvent event);
     void Stop();
 
 private:

@@ -9,6 +9,7 @@ class QComboBox;
 class QLabel;
 class QPushButton;
 class QVBoxLayout;
+class PluginDialogManager;
 
 class RemoteWindow final : public QWidget {
 public:
@@ -30,6 +31,7 @@ private:
     void exportCsv();
 
     std::unique_ptr<StreamDriver> driver_;
+    PluginDialogManager* dialogs_{};
     QVBoxLayout* layout_{};
     QWidget* toolbar_{};
     QWidget* video_{};

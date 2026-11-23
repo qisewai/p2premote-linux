@@ -28,4 +28,17 @@ struct PluginAction {
     VideoBitratePreset bitrate{VideoBitratePreset::automatic};
 };
 
+struct PluginUiCommand {
+    std::uint32_t dialog_id{};
+    std::string kind;
+    std::string json;
+};
+
+struct PluginUiEvent {
+    std::uint32_t dialog_id{};
+    std::string control;
+    std::string event;
+    std::string json;
+};
+
 } // namespace p2premote
