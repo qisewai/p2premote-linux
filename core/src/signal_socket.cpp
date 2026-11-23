@@ -37,6 +37,10 @@ void Write(const DataWriter& writer, std::stop_token stop, const std::string& ki
     JsonObject object;
     object.SetNamedValue(L"type", JsonValue::CreateStringValue(winrt::to_hstring(kind)));
     object.SetNamedValue(L"payload", JsonValue::CreateStringValue(winrt::to_hstring(payload)));
+    // Older account servers use this flag to select MiniRTC for the room.
+    if (kind == "listen_internet" || kind == "join_internet" || kind == "accept") {
+        object.SetNamedValue(L"minirtc", JsonValue::CreateBooleanValue(true));
+    }
     writer.WriteString(object.Stringify());
     Await(writer.StoreAsync(), stop);
 }
