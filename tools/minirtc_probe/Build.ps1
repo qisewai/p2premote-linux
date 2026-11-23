@@ -1,4 +1,4 @@
-param([string]$Xmake, [string]$Perl)
+param([string]$Xmake, [string]$Perl, [switch]$ExperimentalRelayRecovery)
 
 $ErrorActionPreference='Stop'
 $root=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
@@ -69,16 +69,32 @@ if (!$ws.Contains('cannot load the probe CA certificate') -or !$ws.Contains('web
 }
 . (Join-Path $PSScriptRoot 'PatchManaged.ps1')
 
-# Reapply local scheduling fixes to the pinned sources on every build.
-$latencyPatch=Join-Path $PSScriptRoot 'LowLatency.patch'
-$latencySources=git -C $source apply --numstat $latencyPatch
-if ($LASTEXITCODE) {throw 'Cannot read the MiniRTC latency patch.'}
-foreach ($entry in $latencySources) {
-    $file=($entry -split "`t",3)[2]
+# Restore each patched source once before applying our changes in order.
+$recoveryPatch=if ($ExperimentalRelayRecovery) {'RelayRecovery.patch'} else {'RecoveredPacketOrdering.patch'}
+$patches=@(
+    (Join-Path $PSScriptRoot 'LowLatency.patch')
+    (Join-Path $PSScriptRoot $recoveryPatch)
+)
+# A reused dependency checkout may contain the relay recovery experiment.
+$patchedFiles=@(
+    'src/qos/nack_requester.cc'
+    'src/qos/nack_requester.h'
+    'src/qos/video_recovery_timing.h'
+    'src/transport/channel/rtp_video_receiver.h'
+)
+$patchedFiles+=foreach ($patch in $patches) {
+    if (!(Test-Path -LiteralPath $patch)) {throw "Cannot find MiniRTC patch $patch"}
+    $entries=git -C $source apply --numstat $patch
+    if ($LASTEXITCODE) {throw "Cannot read MiniRTC patch $patch"}
+    foreach ($entry in $entries) {($entry -split "`t",3)[2]}
+}
+foreach ($file in ($patchedFiles | Sort-Object -Unique)) {
     [IO.File]::WriteAllText((Join-Path $source $file),(Get-UpstreamText $file))
 }
-git -C $source apply --ignore-whitespace $latencyPatch
-if ($LASTEXITCODE) {throw 'The latency patch did not match the pinned MiniRTC source.'}
+foreach ($patch in $patches) {
+    git -C $source apply --ignore-whitespace $patch
+    if ($LASTEXITCODE) {throw "MiniRTC patch did not match the pinned source: $patch"}
+}
 
 # Allow the probe to vary ICE pacing independently of libnice debug logging.
 $ice=Get-UpstreamText 'src/ice/ice_agent.cpp'

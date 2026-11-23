@@ -1,0 +1,63 @@
+diff --git a/src/transport/channel/rtp_video_receiver.cpp b/src/transport/channel/rtp_video_receiver.cpp
+index 78e8a21..f30b9bf 100644
+--- a/src/transport/channel/rtp_video_receiver.cpp
++++ b/src/transport/channel/rtp_video_receiver.cpp
+@@ -452,13 +452,13 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+     receive_side_congestion_controller_.OnReceivedPacket(
+         rtp_packet_received, MediaType::VIDEO);
+   }
+-  if (RtxEnabled()) {
++  if (RtxEnabled() && !is_recovered) {
+     std::vector<uint16_t> nack_batch;
+     bool request_keyframe_for_nack_overflow = false;
+     {
+       std::lock_guard<std::mutex> lock(nack_mtx_);
+       nack_batch = nack_->OnReceivedPacket(media_packet->SequenceNumber(),
+-                                           is_recovered);
++                                           false);
+       request_keyframe_for_nack_overflow = nack_->ConsumeKeyFrameRequest();
+     }
+     SendPreparedNackBatch(std::move(nack_batch));
+@@ -471,6 +471,18 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+     return;
+   }
+
++  // Keep the NACK blocking newer delta frames until the recovered packet is
++  // visible to frame assembly. Its earlier Wake() may run before the NACK is
++  // cleared, so wake the receiver again after removing the blocker.
++  const auto retire_recovered_nack = [&]() {
++    if (!is_recovered || !RtxEnabled()) return;
++    {
++      std::lock_guard<std::mutex> lock(nack_mtx_);
++      nack_->OnReceivedPacket(media_packet->SequenceNumber(), true);
++    }
++    Wake();
++  };
++
+   if (payload_type == rtp::PAYLOAD_TYPE::AV1) {
+     RtpPacketAv1 rtp_packet_av1;
+     if (!rtp_packet_av1.Build(media_packet->Buffer().data(),
+@@ -479,6 +491,7 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+       LOG_WARN("Invalid AV1 RTP payload at sequence {}",
+                media_packet->SequenceNumber());
+       RequestKeyFrame();
++      retire_recovered_nack();
+       return;
+     }
+ #ifdef SAVE_RTP_RECV_STREAM
+@@ -497,6 +510,7 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+       LOG_WARN("Invalid H264 RTP payload at sequence {}",
+                media_packet->SequenceNumber());
+       RequestKeyFrame();
++      retire_recovered_nack();
+       return;
+     }
+ #ifdef SAVE_RTP_RECV_STREAM
+@@ -508,6 +522,7 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+       ProcessH264RtpPacket(rtp_packet_h264);
+     }
+   }
++  retire_recovered_nack();
+ }
+
+ void RtpVideoReceiver::ProcessH264RtpPacket(RtpPacketH264& rtp_packet_h264) {
