@@ -282,7 +282,7 @@ struct ActiveStream {
     }
 
     bool ShouldSubmit(const CapturedFrame& frame) {
-        if (!frame_difference) return true;
+        if (!frame_difference || dxgi_capture) return true;
         const auto width = frame.metadata.width;
         const auto height = frame.metadata.height;
         std::optional<UINT> changed;
@@ -575,6 +575,7 @@ HANDLE StreamSession::PresentEvent() const {
 }
 
 void StreamSession::ProcessEvents() {
+    bool poll_cursor{};
     for (const auto& event : impl_->active->events->Drain()) {
         auto& active = *impl_->active;
         switch (event.type) {
@@ -627,7 +628,7 @@ void StreamSession::ProcessEvents() {
                 active.negotiation_start = QpcNow();
                 active.device = CreateD3d11Device(true);
                 active.rtc = std::make_unique<MiniRtcCall>(false, active.events, impl_->connection,
-                    event.payload == "control", 30, active.device.get());
+                    event.payload == "control", 60, active.device.get());
             } else if (active.rtc && event.name == "minirtc" &&
                 (impl_->state == StreamState::negotiating || impl_->state == StreamState::streaming)) {
                 active.rtc->ReceiveSignal(event.payload);
@@ -747,10 +748,12 @@ void StreamSession::ProcessEvents() {
             if (impl_->host && active.input_mode == StreamInputMode::desktop && InputReady()
                     && event.input.kind == InputKind::cursor_ready) {
                 active.cursor_requested = true;
+                poll_cursor = true;
             }
             break;
         }
     }
+    if (poll_cursor) PollCursor();
     UpdateVideoSettings();
 }
 
@@ -849,7 +852,7 @@ void StreamSession::Capture() {
     }
     const auto stamp = frame->metadata.source_qpc ? frame->metadata.source_qpc : frame->metadata.capture_qpc;
     if (const auto interval = active.capture_interval) {
-        const auto tolerance = interval / 20;
+        const auto tolerance = interval / 8;
         if (stamp + tolerance < active.next_capture) return;
         if (!active.next_capture || stamp - active.next_capture > interval || stamp <= active.next_capture + tolerance) {
             active.next_capture = stamp;

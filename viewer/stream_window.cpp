@@ -13,6 +13,7 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -44,6 +45,7 @@ constexpr std::array bitrate_labels{L"省流", L"自动", L"清晰"};
 constexpr UINT_PTR statistics_timer = 1;
 constexpr UINT_PTR input_timer = 2;
 constexpr UINT_PTR cursor_timer = 3;
+constexpr std::int64_t mouse_move_min_interval_ms = 4;
 constexpr int stop_control_hotkey = 1;
 constexpr wchar_t stream_window_class[] = L"P2PRemote.Stream";
 constexpr wchar_t screen_class[] = L"P2PRemote.VideoSurface";
@@ -51,6 +53,21 @@ constexpr wchar_t blank_class[] = L"P2PRemote.BlankSurface";
 constexpr wchar_t overlay_class[] = L"P2PRemote.Diagnostics";
 
 bool IsActive(StreamState state) { return state != StreamState::idle && state != StreamState::stopped; }
+
+std::int64_t QpcFrequency() noexcept {
+    static const std::int64_t frequency = [] {
+        LARGE_INTEGER value{};
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart > 0 ? value.QuadPart : 1;
+    }();
+    return frequency;
+}
+
+std::int64_t QpcNow() noexcept {
+    LARGE_INTEGER value{};
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
 
 const wchar_t* NetworkProtocol(std::string_view protocol) {
     if (protocol == "udp") return L"UDP";
@@ -213,38 +230,63 @@ public:
 
         for (;;) {
             MSG message{};
-            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            for (int drained = 0; drained < 32 && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++drained) {
                 if (message.message == WM_QUIT) return static_cast<int>(message.wParam);
                 if (!IsDialogMessageW(window_, &message)) {
                     TranslateMessage(&message);
                     DispatchMessageW(&message);
                 }
             }
+            try {
+                FlushPendingMove(false);
+                if (!host_) TryPresent();
+            } catch (...) {
+                HandleError();
+            }
             const auto event = session_.Event();
             const auto capture = session_.CaptureEvent();
             const auto present = session_.PresentEvent();
-            const std::array<HANDLE, 2> handles{event, capture ? capture : present};
-            const DWORD count = !event ? 0 : handles[1] ? 2 : 1;
-            const auto result = MsgWaitForMultipleObjectsEx(count, handles.data(), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            const auto media = capture ? capture : present;
+            std::array<HANDLE, 2> handles{};
+            DWORD count = 0;
+            int media_index = -1;
+            int event_index = -1;
+            if (media) {
+                media_index = static_cast<int>(count);
+                handles[count++] = media;
+            }
+            if (event) {
+                event_index = static_cast<int>(count);
+                handles[count++] = event;
+            }
+            const auto timeout = PendingMoveTimeoutMs();
+            const auto result = MsgWaitForMultipleObjectsEx(count, handles.data(), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             if (result == WAIT_FAILED) winrt::throw_last_error();
             try {
-                if (count && result == WAIT_OBJECT_0) {
-                    const auto before = session_.State();
-                    session_.ProcessEvents();
-                    const auto input_changed = RefreshInputReady();
-                    if (!host_) RefreshLocalCursor();
-                    const auto new_stats = Measure();
-                    if (new_stats || input_changed || before != session_.State() || before == StreamState::waiting) {
-                        Update();
-                    }
-                } else if (count == 2 && result == WAIT_OBJECT_0 + 1) {
+                if (result == WAIT_TIMEOUT) {
+                    FlushPendingMove(false);
+                } else if (media_index >= 0 && result == WAIT_OBJECT_0 + static_cast<DWORD>(media_index)) {
                     if (capture) {
                         session_.Capture();
                         if (!IsActive(session_.State())) Update();
                     } else {
                         session_.Present();
+                        SyncVideoDimensions();
+                    }
+                    if (event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
+                        ProcessSessionEvents();
+                    }
+                } else if (event_index >= 0 && result == WAIT_OBJECT_0 + static_cast<DWORD>(event_index)) {
+                    ProcessSessionEvents();
+                    if (!host_) {
+                        TryPresent();
+                    } else if (const auto next_capture = session_.CaptureEvent();
+                            next_capture && WaitForSingleObject(next_capture, 0) == WAIT_OBJECT_0) {
+                        session_.Capture();
+                        if (!IsActive(session_.State())) Update();
                     }
                 }
+                FlushPendingMove(false);
             } catch (...) {
                 HandleError();
             }
@@ -355,10 +397,71 @@ private:
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
 
+    void ProcessSessionEvents() {
+        const auto before = session_.State();
+        session_.ProcessEvents();
+        const auto input_changed = RefreshInputReady();
+        if (!host_) RefreshLocalCursor();
+        const auto new_stats = Measure();
+        if (new_stats || input_changed || before != session_.State() || before == StreamState::waiting) {
+            Update();
+        }
+    }
+
+    void TryPresent() {
+        if (const auto present = session_.PresentEvent();
+                present && WaitForSingleObject(present, 0) == WAIT_OBJECT_0) {
+            session_.Present();
+            SyncVideoDimensions();
+        }
+    }
+
+    void SyncVideoDimensions() const {
+        const auto stats = session_.Statistics();
+        if (stats.width && stats.height) {
+            video_width_ = stats.width;
+            video_height_ = stats.height;
+        }
+    }
+
+    void QueueMouseMove(const InputPacket& input) {
+        if (!pending_move_ && last_move_sent_ && last_move_sent_->first == input.x && last_move_sent_->second == input.y) {
+            return;
+        }
+        pending_move_ = input;
+        FlushPendingMove(false);
+    }
+
+    void FlushPendingMove(bool force) {
+        if (!pending_move_ || host_ || !input_ready_) return;
+        const auto now = QpcNow();
+        const auto min_interval = QpcFrequency() * mouse_move_min_interval_ms / 1000;
+        if (!force && last_move_qpc_ && now - last_move_qpc_ < min_interval) return;
+        const auto move = *std::exchange(pending_move_, std::nullopt);
+        if (last_move_sent_ && last_move_sent_->first == move.x && last_move_sent_->second == move.y) return;
+        if (session_.SubmitInput(move)) {
+            last_move_sent_ = {move.x, move.y};
+            last_move_qpc_ = now;
+        }
+    }
+
+    DWORD PendingMoveTimeoutMs() const noexcept {
+        if (!pending_move_ || host_ || !input_ready_) return INFINITE;
+        const auto min_interval = QpcFrequency() * mouse_move_min_interval_ms / 1000;
+        const auto elapsed = last_move_qpc_ ? (QpcNow() - last_move_qpc_) : min_interval;
+        if (elapsed >= min_interval) return 0;
+        const auto remaining_ms = ((min_interval - elapsed) * 1000 + QpcFrequency() - 1) / QpcFrequency();
+        return static_cast<DWORD>(std::clamp<std::int64_t>(remaining_ms, 1, mouse_move_min_interval_ms));
+    }
+
     void RefreshLocalCursor() {
         HCURSOR cursor{};
+        const bool active = session_.LocalCursor(cursor);
+        if (active == last_local_cursor_active_ && cursor == last_local_cursor_) return;
+        last_local_cursor_active_ = active;
+        last_local_cursor_ = cursor;
         POINT point{};
-        if (GetFocus() == surface_ && session_.LocalCursor(cursor) && GetCursorPos(&point)
+        if (active && GetFocus() == surface_ && GetCursorPos(&point)
                 && (WindowFromPoint(point) == surface_ || GetCapture() == surface_) && ScreenToClient(surface_, &point)
                 && PointInput(InputKind::move, 0, point, buttons_.any())) {
             SetCursor(cursor);
@@ -402,12 +505,13 @@ private:
         case WM_MOUSEMOVE:
             if (GetFocus() == hwnd) {
                 if (const auto input = PointInput(InputKind::move, 0, point, buttons_.any())) {
-                    session_.SubmitInput(*input);
+                    QueueMouseMove(*input);
                 }
             }
             return 0;
         case WM_MOUSEWHEEL:
             if (GetFocus() == hwnd && ScreenToClient(hwnd, &point)) {
+                FlushPendingMove(true);
                 const auto code = static_cast<std::uint16_t>(GET_WHEEL_DELTA_WPARAM(wparam));
                 if (const auto input = PointInput(InputKind::wheel, code, point, buttons_.any())) SendControl(*input);
             }
@@ -435,8 +539,8 @@ private:
     std::optional<InputPacket> PointInput(InputKind kind, std::uint16_t code, POINT point, bool clamp) const {
         RECT client{};
         GetClientRect(surface_, &client);
-        const auto stats = session_.Statistics();
-        const auto viewport = p2premote::FitVideo(client.right, client.bottom, stats.width, stats.height);
+        if (!video_width_ || !video_height_) SyncVideoDimensions();
+        const auto viewport = p2premote::FitVideo(client.right, client.bottom, video_width_, video_height_);
         if (!viewport.width || !viewport.height) return std::nullopt;
         const auto x = static_cast<int>(point.x) - static_cast<int>(viewport.left);
         const auto y = static_cast<int>(point.y) - static_cast<int>(viewport.top);
@@ -452,6 +556,7 @@ private:
     void SetButton(InputButton button, bool down, POINT point) {
         const auto code = static_cast<std::uint16_t>(button);
         if (buttons_.test(code) == down) return;
+        FlushPendingMove(true);
         const auto input = PointInput(down ? InputKind::button_down : InputKind::button_up, code, point, buttons_.any());
         if (!input) {
             if (!down) ReleaseViewerInput();
@@ -465,6 +570,7 @@ private:
             SetCursor(cursor);
         }
         if (!SendControl(*input)) return;
+        last_move_sent_ = {input->x, input->y};
         buttons_.set(code, down);
         if (down) SetCapture(surface_);
         else if (buttons_.none() && GetCapture() == surface_) ReleaseCapture();
@@ -475,6 +581,7 @@ private:
             if (down) SetFocus(window_);
             return;
         }
+        FlushPendingMove(true);
         const auto code = static_cast<std::uint16_t>((flags >> 16) & 0x1ff);
         if (!code || (keys_.test(code) == down && !down)) return;
         if (SendControl({down ? InputKind::key_down : InputKind::key_up, code})) keys_.set(code, down);
@@ -488,6 +595,8 @@ private:
 
     void ReleaseViewerInput() {
         if (!surface_) return;
+        pending_move_.reset();
+        last_move_sent_.reset();
         buttons_.reset();
         keys_.reset();
         if (GetCapture() == surface_) ReleaseCapture();
@@ -506,8 +615,12 @@ private:
             else KillTimer(window_, input_timer);
         }
         if (poll_cursor_) {
-            if (ready) winrt::check_bool(SetTimer(window_, cursor_timer, 33, nullptr) != 0);
-            else KillTimer(window_, cursor_timer);
+            if (ready) {
+                session_.PollCursor();
+                winrt::check_bool(SetTimer(window_, cursor_timer, 33, nullptr) != 0);
+            } else {
+                KillTimer(window_, cursor_timer);
+            }
         }
         return true;
     }
@@ -545,6 +658,12 @@ private:
             if (SendMessageW(low_latency_, BM_GETCHECK, 0, 0) == BST_CHECKED) frame_rate = StreamFrameRate::fps60;
         }
         previous_ = {};
+        video_width_ = video_height_ = 0;
+        pending_move_.reset();
+        last_move_sent_.reset();
+        last_move_qpc_ = 0;
+        last_local_cursor_active_ = false;
+        last_local_cursor_ = nullptr;
         rate_text_.clear();
         session_.Start(monitor, surface_, frame_rate);
         Update();
@@ -660,6 +779,12 @@ private:
         const auto state = session_.State();
         if (state == StreamState::waiting || state == StreamState::reconnecting) {
             previous_ = {};
+            video_width_ = video_height_ = 0;
+            pending_move_.reset();
+            last_move_sent_.reset();
+            last_move_qpc_ = 0;
+            last_local_cursor_active_ = false;
+            last_local_cursor_ = nullptr;
             rate_text_.clear();
             up_rate_.clear();
             down_rate_.clear();
@@ -668,6 +793,10 @@ private:
         }
         const auto active = IsActive(state);
         const auto stats = session_.Statistics();
+        if (stats.width && stats.height) {
+            video_width_ = stats.width;
+            video_height_ = stats.height;
+        }
         if (session_.DesktopControl() && !hotkey_) {
             hotkey_ = RegisterHotKey(window_, stop_control_hotkey, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F11);
         } else if (!session_.DesktopControl() && hotkey_) {
@@ -793,6 +922,13 @@ private:
     bool video_visible_{};
     bool input_ready_{};
     bool hotkey_{};
+    mutable unsigned video_width_{};
+    mutable unsigned video_height_{};
+    std::optional<InputPacket> pending_move_;
+    std::optional<std::pair<std::uint16_t, std::uint16_t>> last_move_sent_;
+    std::int64_t last_move_qpc_{};
+    bool last_local_cursor_active_{};
+    HCURSOR last_local_cursor_{};
     std::bitset<4> buttons_;
     std::bitset<512> keys_;
     std::vector<HMONITOR> monitors_;

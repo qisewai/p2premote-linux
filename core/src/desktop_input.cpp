@@ -29,28 +29,41 @@ INPUT Mouse(DWORD flags, LONG x = 0, LONG y = 0, DWORD delta = 0) {
     return input;
 }
 
-std::optional<INPUT> Move(HMONITOR monitor, const InputPacket& input) {
-    MONITORINFO info{sizeof(info)};
-    if (!GetMonitorInfoW(monitor, &info)) return std::nullopt;
-    const auto width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    const auto height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (width <= 0 || height <= 0) return std::nullopt;
-
-    const auto& bounds = info.rcMonitor;
-    const auto x = bounds.left - GetSystemMetrics(SM_XVIRTUALSCREEN) + MulDiv(input.x, bounds.right - bounds.left - 1, 65535);
-    const auto y = bounds.top - GetSystemMetrics(SM_YVIRTUALSCREEN) + MulDiv(input.y, bounds.bottom - bounds.top - 1, 65535);
-    // Aim at the center of the target pixel within the virtual desktop.
-    const auto absolute = [](LONG pixel, int extent) {
-        return static_cast<LONG>((2 * static_cast<std::int64_t>(pixel) + 1) * 32768 / extent);
-    };
-    return Mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, absolute(x, width), absolute(y, height));
-}
-
 bool Inject(INPUT input) {
     return SendInput(1, &input, sizeof(input)) == 1;
 }
 
 } // namespace
+
+std::optional<INPUT> DesktopInput::BuildMove(const InputPacket& input) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!metrics_.valid || now - metrics_.updated >= std::chrono::milliseconds(500)) {
+        MONITORINFO info{sizeof(info)};
+        const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (!GetMonitorInfoW(monitor_, &info) || width <= 0 || height <= 0) {
+            metrics_.valid = false;
+            return std::nullopt;
+        }
+        metrics_.monitor_bounds = info.rcMonitor;
+        metrics_.virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        metrics_.virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        metrics_.virtual_width = width;
+        metrics_.virtual_height = height;
+        metrics_.updated = now;
+        metrics_.valid = true;
+    }
+
+    const auto& bounds = metrics_.monitor_bounds;
+    const auto x = bounds.left - metrics_.virtual_left + MulDiv(input.x, bounds.right - bounds.left - 1, 65535);
+    const auto y = bounds.top - metrics_.virtual_top + MulDiv(input.y, bounds.bottom - bounds.top - 1, 65535);
+    // Aim at the center of the target pixel within the virtual desktop.
+    const auto absolute = [](LONG pixel, int extent) {
+        return static_cast<LONG>((2 * static_cast<std::int64_t>(pixel) + 1) * 32768 / extent);
+    };
+    return Mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        absolute(x, metrics_.virtual_width), absolute(y, metrics_.virtual_height));
+}
 
 DesktopInput::DesktopInput(HMONITOR monitor, LatencyTrace* trace)
     : monitor_(monitor), trace_(trace), worker_([this](std::stop_token stop) { Run(stop); }) {}
@@ -120,7 +133,7 @@ void DesktopInput::Apply(const InputPacket& input) {
         if (keys_.test(input.code) && Inject(Key(input.code, true))) keys_.reset(input.code);
         return;
     case InputKind::move: {
-        const auto position = Move(monitor_, input);
+        const auto position = BuildMove(input);
         const bool injected = position && Inject(*position);
         if (trace_) trace_->Pointer(injected ? "input_injected" : "input_injection_failed", input);
         return;
@@ -134,7 +147,7 @@ void DesktopInput::Apply(const InputPacket& input) {
         const auto flags = wheel ? MOUSEEVENTF_WHEEL : (down ? button_down[input.code] : button_up[input.code]);
         const auto delta = wheel ? static_cast<DWORD>(std::bit_cast<std::int16_t>(input.code)) : 0;
         const auto action = Mouse(flags, 0, 0, delta);
-        if (auto position = Move(monitor_, input)) {
+        if (auto position = BuildMove(input)) {
             std::array events{*position, action};
             const bool injected = SendInput(static_cast<UINT>(events.size()), events.data(), sizeof(INPUT)) == events.size();
             if (trace_) trace_->Pointer(injected ? "input_injected" : "input_injection_failed", input);

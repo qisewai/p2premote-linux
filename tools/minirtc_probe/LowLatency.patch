@@ -476,3 +476,17 @@ index 9bf1de1..b48bfda 100644
        next_process_time_ = next_send_time;
      } else {
        LOG_WARN("Pacer process task rejected: task queue is stopped");
+diff --git a/src/transport/video_frame_cadence.h b/src/transport/video_frame_cadence.h
+--- a/src/transport/video_frame_cadence.h
++++ b/src/transport/video_frame_cadence.h
+@@ -17,8 +17,9 @@ namespace minirtc {
+ class VideoFrameCadence {
+  public:
+   bool Accept(int64_t now_us, int frame_rate) {
+-    if (now_us + 1000 < next_frame_us_) return false;
+     const int64_t interval_us = 1000000 / frame_rate;
++    const int64_t jitter_us = std::min<int64_t>(4000, interval_us / 4);
++    if (now_us + jitter_us < next_frame_us_) return false;
+     next_frame_us_ =
+         next_frame_us_ == 0
+             ? now_us + interval_us

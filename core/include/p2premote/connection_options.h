@@ -25,7 +25,7 @@ struct ConnectionOptions {
     bool relay_only{};
     bool auto_control{};
     bool fixed_cadence{};
-    bool desktop_duplication{};
+    bool desktop_duplication{true};
     bool video_cursor{};
     bool test_present_immediate{};
 

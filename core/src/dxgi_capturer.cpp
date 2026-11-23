@@ -43,8 +43,8 @@ public:
         : monitor_(monitor), duplication_(DuplicateOutput(monitor, device)) {
         winrt::check_pointer(timer_.get());
         LARGE_INTEGER first_poll{};
-        first_poll.QuadPart = -20'000;
-        winrt::check_bool(SetWaitableTimer(timer_.get(), &first_poll, 2, nullptr, nullptr, FALSE));
+        first_poll.QuadPart = -10'000;
+        winrt::check_bool(SetWaitableTimer(timer_.get(), &first_poll, 1, nullptr, nullptr, FALSE));
     }
 
     HANDLE ReadyEvent() const noexcept override { return timer_.get(); }
