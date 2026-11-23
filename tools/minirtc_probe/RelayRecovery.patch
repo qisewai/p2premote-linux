@@ -1,0 +1,421 @@
+diff --git a/src/qos/nack_requester.cc b/src/qos/nack_requester.cc
+index c1696ca..90974a2 100644
+--- a/src/qos/nack_requester.cc
++++ b/src/qos/nack_requester.cc
+@@ -26,8 +26,8 @@ constexpr int kMaxNackRetries = 100;
+ constexpr int kMaxReorderedPackets = 128;
+ constexpr int kNumReorderingBuckets = 10;
+ constexpr TimeDelta kFailedSendRetryDelay = TimeDelta::Millis(20);
+-// constexpr TimeDelta kDefaultSendNackDelay = TimeDelta::Zero();
+-constexpr TimeDelta kDefaultSendNackDelay = TimeDelta::Millis(10);
++constexpr TimeDelta kDefaultSendNackDelay = TimeDelta::Zero();
++constexpr TimeDelta kReorderedTimerNackGrace = TimeDelta::Millis(5);
+ }  // namespace
+ 
+ NackRequester::NackInfo::NackInfo(uint16_t seq_num, uint16_t send_at_seq_num,
+@@ -194,7 +194,14 @@ std::vector<uint16_t> NackRequester::GetNackBatch(NackFilterOptions options) {
+       ++it;
+       continue;
+     }
+-    bool delay_timed_out = now - it->second.created_at_time >= send_nack_delay_;
++    const bool first_nack = it->second.sent_at_time.IsInfinite();
++    const TimeDelta effective_nack_delay =
++        first_nack && options == kTimeOnly &&
++                reordering_histogram_.NumValues() > 0
++            ? kReorderedTimerNackGrace
++            : send_nack_delay_;
++    bool delay_timed_out =
++        now - it->second.created_at_time >= effective_nack_delay;
+     TimeDelta retry_delay = rtt_;
+     if (it->second.retries > 0) {
+       retry_delay =
+diff --git a/src/qos/nack_requester.h b/src/qos/nack_requester.h
+index 713da46..bc0a185 100644
+--- a/src/qos/nack_requester.h
++++ b/src/qos/nack_requester.h
+@@ -53,11 +53,13 @@ class NackRequester {
+                        bool send_successful);
+   bool ConsumeKeyFrameRequest();
+   bool HasPendingNacks() const { return !nack_list_.empty(); }
++  size_t PendingNackCount() const { return nack_list_.size(); }
+   bool HasPendingNacksUpTo(uint16_t seq_num) const;
+   int64_t RttMs() const { return rtt_.ms(); }
+   bool HasRttSample() const { return has_rtt_sample_; }
+   void UpdateRtt(int64_t rtt_ms);
+   void ClearUpTo(uint16_t seq_num);
++  void ClearPending() { nack_list_.clear(); }
+ 
+  private:
+   void AddPacketsToNack(uint16_t seq_num_start, uint16_t seq_num_end);
+diff --git a/src/qos/video_recovery_timing.h b/src/qos/video_recovery_timing.h
+index 93ef009..9c87555 100644
+--- a/src/qos/video_recovery_timing.h
++++ b/src/qos/video_recovery_timing.h
+@@ -8,6 +8,7 @@
+ #define _VIDEO_RECOVERY_TIMING_H_
+ 
+ #include <algorithm>
++#include <cstddef>
+ #include <cstdint>
+ 
+ namespace minirtc {
+@@ -34,7 +35,7 @@ constexpr int NackRetryRttMultiplier(bool has_rtt_sample,
+ }
+ 
+ constexpr int64_t SoftFrameRecoveryDeadlineMs(int64_t rtt_ms) {
+-  return std::clamp<int64_t>(2 * rtt_ms + 30, 100, 500);
++  return std::clamp<int64_t>(2 * rtt_ms + 25, 90, 360);
+ }
+ 
+ constexpr int64_t SoftFirConfirmationDelayMs(int64_t rtt_ms) {
+@@ -43,17 +44,31 @@ constexpr int64_t SoftFirConfirmationDelayMs(int64_t rtt_ms) {
+   // before requesting a large key frame.  Bound the delay so low-RTT paths do
+   // not emit FIR for a packet that was already in flight, while high-RTT paths
+   // still retain useful time before the hard deadline.
+-  return std::clamp<int64_t>(rtt_ms, 75, 150);
++  return std::clamp<int64_t>(rtt_ms, 55, 120);
+ }
+ 
+ constexpr int64_t HardFrameRecoveryDeadlineMs(int64_t rtt_ms) {
+-  // The measured-RTT retry schedule sends at approximately 0x, 1x, 2x and 4x
+-  // RTT.  Reserve one more RTT plus processing margin for the final RTX to
+-  // return before abandoning the frame.  The previous 4x+80 deadline could
+-  // expire before that last recovery response arrived.
+-  return std::clamp<int64_t>(5 * rtt_ms + 80, 350, 1000);
++  // Keep enough room after Soft + Confirmation for a keyframe response while
++  // capping high-RTT stalls instead of holding broken frames for a full second.
++  return std::clamp<int64_t>(4 * rtt_ms + 90, 300, 650);
+ }
+ 
++constexpr int64_t FirRetryIntervalMs(int64_t rtt_ms) {
++  // Retry promptly if an RTCP FIR is lost during an outage, while leaving
++  // enough time for an in-flight keyframe to be encoded and delivered.
++  return std::clamp<int64_t>(4 * rtt_ms + 200, 450, 1200);
++}
++
++constexpr int64_t PostKeyframeFirCooldownMs(int64_t rtt_ms) {
++  return std::clamp<int64_t>(2 * rtt_ms, 150, 300);
++}
++
++// Once a burst outage leaves this many delta packets missing across a
++// multi-frame gap, retransmitting all stale packets costs as much or more
++// bandwidth than requesting a fresh synchronization point.
++constexpr size_t kBurstKeyFrameNackThreshold = 28;
++constexpr int64_t kBurstKeyFrameMediaGapMs = 100;
++
+ }  // namespace video_recovery
+ }  // namespace minirtc
+ 
+diff --git a/src/transport/channel/rtp_video_receiver.cpp b/src/transport/channel/rtp_video_receiver.cpp
+index 78e8a21..d6f609d 100644
+--- a/src/transport/channel/rtp_video_receiver.cpp
++++ b/src/transport/channel/rtp_video_receiver.cpp
+@@ -168,9 +168,11 @@ bool RtpVideoReceiver::RestoreMediaPacketFromRtx(RtpPacket& rtx_packet,
+ }
+ 
+ void RtpVideoReceiver::TrackPendingFramePacket(uint32_t timestamp,
+-                                               uint16_t sequence_number) {
++                                               uint16_t sequence_number,
++                                               bool is_keyframe) {
+   std::lock_guard<std::mutex> lock(pending_frames_mtx_);
+   PendingFrame& pending_frame = pending_frames_[timestamp];
++  pending_frame.is_keyframe |= is_keyframe;
+   if (pending_frame.arrival_time == 0) {
+     pending_frame.arrival_time = clock_->CurrentTime().ms();
+   }
+@@ -452,13 +454,13 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+     receive_side_congestion_controller_.OnReceivedPacket(
+         rtp_packet_received, MediaType::VIDEO);
+   }
+-  if (RtxEnabled()) {
++  if (RtxEnabled() && !is_recovered) {
+     std::vector<uint16_t> nack_batch;
+     bool request_keyframe_for_nack_overflow = false;
+     {
+       std::lock_guard<std::mutex> lock(nack_mtx_);
+       nack_batch = nack_->OnReceivedPacket(media_packet->SequenceNumber(),
+-                                           is_recovered);
++                                           false);
+       request_keyframe_for_nack_overflow = nack_->ConsumeKeyFrameRequest();
+     }
+     SendPreparedNackBatch(std::move(nack_batch));
+@@ -471,11 +473,27 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+     return;
+   }
+ 
++  // Retire recovered (RTX/FEC) sequence numbers only after the packet has been
++  // tracked/assembled into pending_frames_. Otherwise Process() can observe
++  // has_blocking_nacks == false before a single-packet or previously unseen
++  // recovered frame enters pending_frames_, emitting a newer delta frame out
++  // of order and triggering a decoder reference error.
++  auto retire_recovered_nack = [&]() {
++    if (RtxEnabled() && is_recovered) {
++      {
++        std::lock_guard<std::mutex> lock(nack_mtx_);
++        nack_->OnReceivedPacket(media_packet->SequenceNumber(), true);
++      }
++      Wake();
++    }
++  };
++
+   if (payload_type == rtp::PAYLOAD_TYPE::AV1) {
+     RtpPacketAv1 rtp_packet_av1;
+     if (!rtp_packet_av1.Build(media_packet->Buffer().data(),
+                               media_packet->Size()) ||
+         !rtp_packet_av1.GetFrameHeaderInfo()) {
++      retire_recovered_nack();
+       LOG_WARN("Invalid AV1 RTP payload at sequence {}",
+                media_packet->SequenceNumber());
+       RequestKeyFrame();
+@@ -494,6 +512,7 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+     if (!rtp_packet_h264.Build(media_packet->Buffer().data(),
+                                media_packet->Size()) ||
+         !rtp_packet_h264.GetFrameHeaderInfo()) {
++      retire_recovered_nack();
+       LOG_WARN("Invalid H264 RTP payload at sequence {}",
+                media_packet->SequenceNumber());
+       RequestKeyFrame();
+@@ -508,6 +527,7 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+       ProcessH264RtpPacket(rtp_packet_h264);
+     }
+   }
++  retire_recovered_nack();
+ }
+ 
+ void RtpVideoReceiver::ProcessH264RtpPacket(RtpPacketH264& rtp_packet_h264) {
+@@ -556,7 +576,10 @@ bool RtpVideoReceiver::CheckIsH264FrameCompleted(RtpPacketH264& rtp_packet_h264,
+   uint16_t start_seq, end_seq;
+   uint32_t packet_count;
+ 
+-  TrackPendingFramePacket(timestamp, seq);
++  const bool is_keyframe = rtp_packet_h264.FuNalUnitType() == 5 ||
++      (is_start && IsH264KeyFrame(rtp_packet_h264.Payload(),
++                                  rtp_packet_h264.PayloadSize()));
++  TrackPendingFramePacket(timestamp, seq, is_keyframe);
+ 
+   if (is_start) {
+     fua_start_sequence_numbers_[timestamp] = seq;
+@@ -636,7 +659,9 @@ bool RtpVideoReceiver::CheckIsAv1FrameCompleted(RtpPacketAv1& rtp_packet_av1) {
+   uint16_t start_seq, end_seq;
+   uint32_t packet_count;
+ 
+-  TrackPendingFramePacket(timestamp, seq);
++  TrackPendingFramePacket(
++      timestamp, seq,
++      rtp_packet_av1.Av1FrameStart() && rtp_packet_av1.IsKeyFrame());
+ 
+   if (rtp_packet_av1.Av1FrameStart()) {
+     fua_start_sequence_numbers_[timestamp] = seq;
+@@ -785,6 +810,7 @@ RtpVideoReceiver::GetFrameRecoveryTiming() {
+     return {200, 100, 600};
+   }
+   const int64_t rtt_ms = std::max<int64_t>(nack_->RttMs(), 1);
++  last_rtt_ms_.store(rtt_ms, std::memory_order_relaxed);
+   const int64_t soft_deadline_ms =
+       video_recovery::SoftFrameRecoveryDeadlineMs(rtt_ms);
+   const int64_t soft_fir_confirmation_delay_ms =
+@@ -802,6 +828,8 @@ void RtpVideoReceiver::OnRttUpdate(int64_t rtt_ms) {
+   std::lock_guard<std::mutex> lock(nack_mtx_);
+   if (nack_) {
+     nack_->UpdateRtt(rtt_ms);
++    last_rtt_ms_.store(std::max<int64_t>(nack_->RttMs(), 1),
++                       std::memory_order_relaxed);
+   }
+ }
+ 
+@@ -939,6 +967,17 @@ void RtpVideoReceiver::MaybeRetryKeyFrameRequest() {
+ }
+ 
+ void RtpVideoReceiver::OnCompleteKeyFrame(int64_t now_ms) {
++  const int64_t rtt_ms = std::max<int64_t>(
++      last_rtt_ms_.load(std::memory_order_relaxed), 1);
++  const int64_t capped_next_ms =
++      now_ms + video_recovery::PostKeyframeFirCooldownMs(rtt_ms);
++  int64_t current_next_ms =
++      next_keyframe_request_ms_.load(std::memory_order_relaxed);
++  while (current_next_ms > capped_next_ms &&
++         !next_keyframe_request_ms_.compare_exchange_weak(
++             current_next_ms, capped_next_ms, std::memory_order_relaxed)) {
++  }
++
+   if (!keyframe_request_pending_.exchange(false,
+                                            std::memory_order_acq_rel)) {
+     return;
+@@ -1020,6 +1059,7 @@ bool RtpVideoReceiver::Process() {
+   while (true) {
+     std::unique_ptr<ReceivedFrame> completed_frame;
+     uint32_t dropped_timestamp = 0;
++    std::vector<uint32_t> burst_dropped_timestamps;
+     bool dropped_frame = false;
+     bool recovery_timed_out = false;
+     bool soft_stall_started = false;
+@@ -1048,18 +1088,40 @@ bool RtpVideoReceiver::Process() {
+       const bool is_older_than_decoded_frame =
+           last_complete_frame_ts_.has_value() &&
+           !webrtc::AheadOf(it->first, *last_complete_frame_ts_);
++      const bool complete_keyframe =
++          it->second.is_complete && it->second.is_keyframe;
++      const bool blocked = !it->second.is_complete || has_blocking_nacks;
+       bool newer_complete_keyframe_available = false;
+-      if ((awaiting_keyframe_ || it->second.recovery_escalated) &&
+-          !(it->second.is_complete && it->second.is_keyframe)) {
+-        for (auto keyframe_it = std::next(it);
+-             keyframe_it != pending_frames_.end(); ++keyframe_it) {
+-          if (keyframe_it->second.is_complete &&
+-              keyframe_it->second.is_keyframe) {
++      bool any_pending_keyframe = it->second.is_keyframe;
++      for (auto keyframe_it = std::next(it);
++           keyframe_it != pending_frames_.end(); ++keyframe_it) {
++        if (keyframe_it->second.is_keyframe) {
++          any_pending_keyframe = true;
++          if (keyframe_it->second.is_complete) {
+             newer_complete_keyframe_available = true;
+             break;
+           }
+         }
+       }
++      if (!(awaiting_keyframe_ || it->second.recovery_escalated || blocked) ||
++          complete_keyframe) {
++        newer_complete_keyframe_available = false;
++      }
++
++      const int64_t missing_media_span_ms =
++          last_complete_frame_ts_.has_value() &&
++                  webrtc::AheadOf(it->first, *last_complete_frame_ts_)
++              ? static_cast<int64_t>(
++                    static_cast<uint32_t>(it->first -
++                                          *last_complete_frame_ts_)) /
++                    90
++              : 0;
++      const bool severe_burst_loss =
++          !awaiting_keyframe_ && blocked && !any_pending_keyframe && nack_ &&
++          nack_->PendingNackCount() >=
++              video_recovery::kBurstKeyFrameNackThreshold &&
++          (pending_frames_.size() >= 2 ||
++           missing_media_span_ms >= video_recovery::kBurstKeyFrameMediaGapMs);
+ 
+       if (is_older_than_decoded_frame) {
+         dropped_timestamp = it->first;
+@@ -1067,13 +1129,15 @@ bool RtpVideoReceiver::Process() {
+         pending_frames_.erase(it);
+       } else if (newer_complete_keyframe_available) {
+         // A complete synchronization point is already available. Do not let
+-        // an older incomplete delta frame hold it behind another timeout.
++        // an older blocked delta frame hold it behind another timeout.
+         awaiting_keyframe_ = true;
+         dropped_timestamp = it->first;
+         dropped_frame = true;
++        MarkFrameDiscardedLocked(dropped_timestamp);
+         pending_frames_.erase(it);
+-      } else if (it->second.is_complete && awaiting_keyframe_ &&
+-                 it->second.is_keyframe) {
++      } else if (complete_keyframe) {
++        // A complete key frame is self-contained and supersedes all older
++        // lost packets on every path, whether or not awaiting_keyframe_ is set.
+         soft_fir_avoided = it->second.recovery_escalated &&
+                            !it->second.soft_fir_requested;
+         awaiting_keyframe_ = false;
+@@ -1087,6 +1151,10 @@ bool RtpVideoReceiver::Process() {
+       } else if (it->second.is_complete && awaiting_keyframe_) {
+         dropped_timestamp = it->first;
+         dropped_frame = true;
++        if (nack_ && it->second.last_sequence_number.has_value()) {
++          nack_->ClearUpTo(*it->second.last_sequence_number);
++        }
++        MarkFrameDiscardedLocked(dropped_timestamp);
+         pending_frames_.erase(it);
+       } else if (it->second.is_complete && !has_blocking_nacks) {
+         soft_fir_avoided = it->second.recovery_escalated &&
+@@ -1095,6 +1163,20 @@ bool RtpVideoReceiver::Process() {
+         completed_keyframe = it->second.is_keyframe;
+         completed_frame = std::move(it->second.frame);
+         pending_frames_.erase(it);
++      } else if (severe_burst_loss) {
++        // A multi-frame burst has left more packets missing than a fresh key
++        // frame would cost. Abandon the dead delta backlog and clear obsolete
++        // NACKs immediately so the requested key frame is not delayed behind
++        // dozens of stale retransmissions.
++        awaiting_keyframe_ = true;
++        recovery_timed_out = true;
++        burst_dropped_timestamps.reserve(pending_frames_.size());
++        for (const auto& [ts, _] : pending_frames_) {
++          burst_dropped_timestamps.push_back(ts);
++          MarkFrameDiscardedLocked(ts);
++        }
++        pending_frames_.clear();
++        nack_->ClearPending();
+       } else if (frame_age_ms > recovery_timing.hard_deadline_ms) {
+         dropped_timestamp = it->first;
+         dropped_frame = true;
+@@ -1125,7 +1207,7 @@ bool RtpVideoReceiver::Process() {
+         break;
+       }
+ 
+-      if (recovery_timed_out) {
++      if (recovery_timed_out && dropped_frame) {
+         // A hard timeout is an explicit decision to abandon this timestamp.
+         // Remember it before releasing the lock so late fragments cannot
+         // recreate the same pending frame and time out a second time.
+@@ -1133,6 +1215,14 @@ bool RtpVideoReceiver::Process() {
+       }
+     }
+ 
++    if (!burst_dropped_timestamps.empty()) {
++      recovery_discarded_frames_.fetch_add(burst_dropped_timestamps.size(),
++                                           std::memory_order_relaxed);
++      for (uint32_t ts : burst_dropped_timestamps) {
++        DropFrameAssembly(ts);
++      }
++    }
++
+     if (dropped_frame) {
+       recovery_discarded_frames_.fetch_add(1, std::memory_order_relaxed);
+       DropFrameAssembly(dropped_timestamp);
+@@ -1367,11 +1457,11 @@ bool RtpVideoReceiver::SendKeyFrameRequest(bool enter_awaiting_state) {
+ 
+   std::lock_guard<std::mutex> lock(rtcp_sender_mtx_);
+   const int64_t now_ms = clock_->CurrentTime().ms();
+-  // Most successful TURN keyframes in the field complete within 300-1400 ms.
+-  // A 1.5 s retry avoids generating a second large frame while the first is
+-  // still being encoded or relayed, while retaining bounded loss recovery.
+-  constexpr int64_t kFirRetryIntervalMs = 1500;
+-  constexpr int64_t kFailedFirRetryIntervalMs = 500;
++  const int64_t rtt_ms = std::max<int64_t>(
++      last_rtt_ms_.load(std::memory_order_relaxed), 1);
++  const int64_t fir_retry_interval_ms =
++      video_recovery::FirRetryIntervalMs(rtt_ms);
++  constexpr int64_t kFailedFirRetryIntervalMs = 250;
+   if (now_ms <
+       next_keyframe_request_ms_.load(std::memory_order_relaxed)) {
+     recovery_fir_suppressed_.fetch_add(1, std::memory_order_relaxed);
+@@ -1399,7 +1489,7 @@ bool RtpVideoReceiver::SendKeyFrameRequest(bool enter_awaiting_state) {
+     keyframe_request_started_ms_.store(now_ms, std::memory_order_relaxed);
+     keyframe_request_pending_.store(true, std::memory_order_release);
+   }
+-  next_keyframe_request_ms_.store(now_ms + kFirRetryIntervalMs,
++  next_keyframe_request_ms_.store(now_ms + fir_retry_interval_ms,
+                                   std::memory_order_relaxed);
+   recovery_fir_sent_.fetch_add(1, std::memory_order_relaxed);
+   return true;
+diff --git a/src/transport/channel/rtp_video_receiver.h b/src/transport/channel/rtp_video_receiver.h
+index 46e57ac..6917e39 100644
+--- a/src/transport/channel/rtp_video_receiver.h
++++ b/src/transport/channel/rtp_video_receiver.h
+@@ -104,7 +104,8 @@ class RtpVideoReceiver : public ThreadBase {
+                         uint32_t packet_count, uint32_t timestamp);
+   bool RestoreMediaPacketFromRtx(RtpPacket& rtx_packet,
+                                  RtpPacket* media_packet);
+-  void TrackPendingFramePacket(uint32_t timestamp, uint16_t sequence_number);
++  void TrackPendingFramePacket(uint32_t timestamp, uint16_t sequence_number,
++                               bool is_keyframe);
+   bool GetFrameSequenceRange(uint32_t timestamp, const char* codec_name,
+                              uint16_t* start_sequence_number,
+                              uint16_t* end_sequence_number,
+@@ -214,6 +215,7 @@ class RtpVideoReceiver : public ThreadBase {
+   std::atomic<bool> keyframe_request_pending_{false};
+   std::atomic<int64_t> keyframe_request_started_ms_{0};
+   std::atomic<int64_t> next_keyframe_request_ms_{0};
++  std::atomic<int64_t> last_rtt_ms_{100};
+   int64_t last_recovery_stats_log_ms_ = 0;
+   std::atomic<bool> is_running_;
+ 

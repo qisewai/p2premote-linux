@@ -1,9 +1,6 @@
 #include "d3d11_video.h"
 #include "qpc.h"
 
-#include "api/video/i420_buffer.h"
-#include "libyuv/convert.h"
-
 #include <d3dcompiler.h>
 #include <utility>
 
@@ -41,37 +38,6 @@ void main(uint3 thread : SV_DispatchThreadID, uint index : SV_GroupIndex) {
 )";
 
 } // namespace
-
-Nv12Frame::Nv12Frame(winrt::com_ptr<ID3D11Texture2D> texture, UINT subresource, int width, int height,
-    winrt::com_ptr<IUnknown> lease)
-    : lease_(std::move(lease)), texture_(std::move(texture)), subresource_(subresource), width_(width), height_(height) {}
-
-webrtc::scoped_refptr<webrtc::I420BufferInterface> Nv12Frame::ToI420() {
-    winrt::com_ptr<ID3D11Device> device;
-    texture_->GetDevice(device.put());
-    winrt::com_ptr<ID3D11DeviceContext> context;
-    device->GetImmediateContext(context.put());
-    D3D11_TEXTURE2D_DESC desc{};
-    texture_->GetDesc(&desc);
-    desc.ArraySize = desc.MipLevels = 1;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = desc.MiscFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    winrt::com_ptr<ID3D11Texture2D> readback;
-    if (FAILED(device->CreateTexture2D(&desc, nullptr, readback.put()))) return nullptr;
-    context->CopySubresourceRegion(readback.get(), 0, 0, 0, 0, texture_.get(), subresource_, nullptr);
-    D3D11_MAPPED_SUBRESOURCE map{};
-    if (FAILED(context->Map(readback.get(), 0, D3D11_MAP_READ, 0, &map))) return nullptr;
-    const auto* y = static_cast<const uint8_t*>(map.pData);
-    const auto* uv = y + static_cast<std::size_t>(map.RowPitch) * desc.Height;
-    auto output = webrtc::I420Buffer::Create(width_, height_);
-    const auto pitch = static_cast<int>(map.RowPitch);
-    const auto converted = libyuv::NV12ToI420(y, pitch, uv, pitch, output->MutableDataY(), output->StrideY(),
-        output->MutableDataU(), output->StrideU(), output->MutableDataV(), output->StrideV(), width_, height_);
-    context->Unmap(readback.get(), 0);
-    if (converted) return nullptr;
-    return output;
-}
 
 D3d11VideoConverter::D3d11VideoConverter(ID3D11Device* device) {
     device_.copy_from(device);

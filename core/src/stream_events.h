@@ -18,43 +18,25 @@
 
 namespace p2premote {
 
-struct IceCheckStats {
-    std::uint64_t requests_sent{};
-    std::uint64_t requests_received{};
-    std::uint64_t responses_received{};
-    std::string dtls_state;
-};
-
 struct RtcCounters {
     std::uint64_t received{};
     std::uint64_t decoded{};
-    std::uint64_t encoded{};
-    double decode_seconds{};
-    double encode_seconds{};
-    std::uint64_t rtc_frames_dropped{};
-    std::uint64_t jitter_buffer_frames{};
     std::uint64_t sent_packets{};
-    std::uint64_t bytes_sent{};
-    std::uint64_t bytes_received{};
     std::uint64_t video_packets_received{};
-    std::int64_t video_packets_lost{};
     std::string video_codec;
-    double jitter_buffer_seconds{};
     double packet_send_queue_seconds{};
     IcePath ice_path{};
     std::string ice_protocol;
-    std::string relay_protocol;
     std::optional<double> ice_rtt_ms;
-    std::optional<IceCheckStats> ice_checks;
-    IceDiagnostics ice_diagnostics;
     std::optional<std::uint32_t> upload_bps;
     std::optional<std::uint32_t> download_bps;
     std::optional<double> video_loss_fraction;
     bool srtp_active{};
 };
 
-enum class StreamEventType { signal, signal_lost, media_lost, error, gathered, local_set, remote_set,
-    ice_candidate, connected, stats, input_ready, input, cursor, minirtc_signal, video_settings };
+enum class StreamEventType {
+    signal, signal_lost, media_lost, error, connected, stats, input_ready, input, cursor, minirtc_signal, video_settings
+};
 
 struct StreamEvent {
     StreamEventType type;
@@ -63,7 +45,6 @@ struct StreamEvent {
     RtcCounters counters{};
     InputPacket input{};
     bool retryable{};
-    bool minirtc{};
 };
 
 class StreamEvents {
@@ -92,7 +73,7 @@ public:
 
     void PushInput(const InputPacket& input) {
         const std::lock_guard lock(mutex_);
-        if (desktop_ && input.kind != InputKind::set_quality && input.kind != InputKind::cursor_ready) {
+        if (desktop_ && input.kind != InputKind::cursor_ready) {
             if (const auto accepted = desktop_input_state_.Accept(input, GetTickCount64())) desktop_->Submit(*accepted);
         } else if (input.kind != InputKind::move) {
             Enqueue({StreamEventType::input, {}, {}, {}, input});

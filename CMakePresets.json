@@ -14,9 +14,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded",
-        "CMAKE_TRY_COMPILE_CONFIGURATION": "Release",
-        "P2PREMOTE_BUILD_WEBRTC_PROBE": "ON",
-        "P2PREMOTE_BUILD_STREAMING": "ON"
+        "CMAKE_TRY_COMPILE_CONFIGURATION": "Release"
       }
     }
   ],

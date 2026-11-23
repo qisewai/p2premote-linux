@@ -164,18 +164,18 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 	if len(states) != 2 || states[a.Device.ID] != "busy" || states[b.Device.ID] != "online" {
 		t.Fatalf("unexpected presence: %+v", states)
 	}
-	if err := write(ctx, host, message{Type: "accept"}); err != nil {
+	if err := write(ctx, host, message{Type: "accept", Payload: "control"}); err != nil {
 		t.Fatal(err)
 	}
 	expect(viewer, "accepted")
-	if err := write(ctx, host, message{Type: "offer", Payload: "SDP"}); err != nil {
+	if err := write(ctx, viewer, message{Type: "minirtc", Payload: `{"type":"join_transmission"}`}); err != nil {
 		t.Fatal(err)
 	}
-	expect(viewer, "offer")
-	if err := write(ctx, host, message{Type: "ice", Payload: "candidate"}); err != nil {
+	expect(host, "minirtc")
+	if err := write(ctx, host, message{Type: "minirtc", Payload: `{"type":"offer","sdp":"v=0"}`}); err != nil {
 		t.Fatal(err)
 	}
-	expect(viewer, "ice")
+	expect(viewer, "minirtc")
 	call("POST", "logout", a.Token, nil, 204, nil)
 	expect(viewer, "ended")
 	call("GET", "devices", a.Token, nil, 401, nil)

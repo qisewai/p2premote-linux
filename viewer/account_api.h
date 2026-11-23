@@ -26,7 +26,7 @@ struct AccountLogin {
 };
 
 AccountLogin SignIn(std::stop_token stop, const std::wstring& server, const std::wstring& user,
-    const std::wstring& password, bool create_account, bool compatible_http);
+    const std::wstring& password, bool create_account, bool compatible_http, bool relay_only);
 std::vector<AccountDevice> AccountDevices(std::stop_token stop, const AccountLogin& login);
 void SignOut(std::stop_token stop, const AccountLogin& login);
 

@@ -2,8 +2,11 @@
 
 #include "stream_events.h"
 
+#include <p2premote/service_identity.h>
+
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Networking.Sockets.h>
 #include <winrt/Windows.Storage.Streams.h>
 
@@ -30,12 +33,10 @@ void Await(const Operation& operation, std::stop_token stop, std::chrono::second
     operation.GetResults();
 }
 
-void Write(const DataWriter& writer, std::stop_token stop, const std::string& kind, const std::string& payload,
-    bool minirtc) {
+void Write(const DataWriter& writer, std::stop_token stop, const std::string& kind, const std::string& payload) {
     JsonObject object;
     object.SetNamedValue(L"type", JsonValue::CreateStringValue(winrt::to_hstring(kind)));
     object.SetNamedValue(L"payload", JsonValue::CreateStringValue(winrt::to_hstring(payload)));
-    if (minirtc) object.SetNamedValue(L"minirtc", JsonValue::CreateBooleanValue(true));
     writer.WriteString(object.Stringify());
     Await(writer.StoreAsync(), stop);
 }
@@ -43,13 +44,13 @@ void Write(const DataWriter& writer, std::stop_token stop, const std::string& ki
 } // namespace
 
 SignalSocket::SignalSocket(std::shared_ptr<StreamEvents> events, std::wstring endpoint, std::string kind, std::string payload,
-                           std::wstring token, bool managed, bool minirtc)
+                           std::wstring token)
     : events_(std::move(events)), worker_([this, endpoint = std::move(endpoint), kind = std::move(kind),
-                                          payload = std::move(payload), token = std::move(token), managed, minirtc](std::stop_token stop) {
+                                          payload = std::move(payload), token = std::move(token)](std::stop_token stop) {
         try {
             winrt::init_apartment();
             try {
-                Run(stop, endpoint, kind, payload, token, managed, minirtc);
+                Run(stop, endpoint, kind, payload, token);
             } catch (...) {
                 winrt::uninit_apartment();
                 throw;
@@ -66,23 +67,31 @@ SignalSocket::SignalSocket(std::shared_ptr<StreamEvents> events, std::wstring en
         }
     }) {}
 
-void SignalSocket::Send(std::string kind, std::string payload, bool minirtc) {
+void SignalSocket::Send(std::string kind, std::string payload) {
     {
         const std::lock_guard lock(mutex_);
         if (pending_.size() >= 64) {
             throw std::runtime_error("信令发送队列已满");
         }
-        pending_.emplace_back(std::move(kind), std::move(payload), minirtc);
+        pending_.emplace_back(std::move(kind), std::move(payload));
     }
     changed_.notify_one();
 }
 
 void SignalSocket::Run(std::stop_token stop, const std::wstring& endpoint, const std::string& kind,
-                       const std::string& payload, const std::wstring& token, bool managed, bool minirtc) {
+                       const std::string& payload, const std::wstring& token) {
     MessageWebSocket socket;
     const Uri address(endpoint);
+    if (IsWuhanService(address)) {
+        socket.ServerCustomValidationRequested([](const MessageWebSocket&,
+            const WebSocketServerCustomValidationRequestedEventArgs& args) {
+            if (!MatchesWuhanServerKey(args.ServerCertificate())) args.Reject();
+        });
+        socket.Control().IgnorableServerCertificateErrors().Append(
+            winrt::Windows::Security::Cryptography::Certificates::ChainValidationResult::Untrusted);
+    }
     if (!token.empty()) {
-        const bool local_account_server = managed && address.SchemeName() == L"ws" && address.Host() == L"127.0.0.1";
+        const bool local_account_server = address.SchemeName() == L"ws" && address.Host() == L"127.0.0.1";
         if (address.SchemeName() != L"wss" && !local_account_server) {
             throw std::invalid_argument("公网访问密钥只能通过 WSS 发送");
         }
@@ -105,7 +114,7 @@ void SignalSocket::Run(std::stop_token stop, const std::wstring& endpoint, const
                 const auto json = JsonObject::Parse(text);
                 events->Push({StreamEventType::signal, winrt::to_string(json.GetNamedString(L"type")),
                     winrt::to_string(json.GetNamedString(L"payload", L"")), {}, {},
-                    json.GetNamedBoolean(L"retryable", false), json.GetNamedBoolean(L"minirtc", false)});
+                    json.GetNamedBoolean(L"retryable", false)});
             } catch (...) {
                 events->Push({StreamEventType::error, {}, "收到无效的信令消息"});
             }
@@ -120,15 +129,15 @@ void SignalSocket::Run(std::stop_token stop, const std::wstring& endpoint, const
     const DataWriter writer(socket.OutputStream());
     try {
         if (!stop.stop_requested()) {
-            Write(writer, stop, kind, payload, minirtc);
+            Write(writer, stop, kind, payload);
         }
         for (;;) {
             std::unique_lock lock(mutex_);
             if (!changed_.wait(lock, stop, [this] { return !pending_.empty(); }) || stop.stop_requested()) break;
-            auto [next_kind, next_payload, next_minirtc] = std::move(pending_.front());
+            auto [next_kind, next_payload] = std::move(pending_.front());
             pending_.pop_front();
             lock.unlock();
-            Write(writer, stop, next_kind, next_payload, next_minirtc);
+            Write(writer, stop, next_kind, next_payload);
         }
     } catch (...) {
         if (!stop.stop_requested()) throw;

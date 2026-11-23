@@ -147,7 +147,6 @@ void DesktopInput::Apply(const InputPacket& input) {
         return;
     }
     case InputKind::text:
-    case InputKind::set_quality:
     case InputKind::set_video_settings:
     case InputKind::video_settings_reply:
     case InputKind::cursor_ready:

@@ -1,14 +1,22 @@
 #pragma once
 
-#include <p2premote/preview_session.h>
-
 #include <d3d11.h>
+#include <windows.h>
 #include <winrt/Windows.Graphics.Capture.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 
 namespace p2premote {
+
+struct FrameMetadata {
+    std::uint64_t frame_id{};
+    std::int64_t capture_qpc{};
+    unsigned width{};
+    unsigned height{};
+    std::int64_t source_qpc{};
+};
 
 struct CapturedFrame {
     FrameMetadata metadata;

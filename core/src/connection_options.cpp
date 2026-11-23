@@ -4,10 +4,8 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 
-#include <algorithm>
-#include <fstream>
-#include <string_view>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace p2premote {
@@ -16,18 +14,6 @@ namespace {
 using winrt::Windows::Data::Json::JsonObject;
 using winrt::Windows::Foundation::Uri;
 
-std::string ReadConfig(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) throw std::runtime_error("无法打开公网连接配置");
-    const auto size = file.tellg();
-    if (size <= 0 || size > 65536) throw std::runtime_error("公网连接配置大小无效");
-    std::string text(static_cast<std::size_t>(size), '\0');
-    file.seekg(0);
-    if (!file.read(text.data(), static_cast<std::streamsize>(size))) throw std::runtime_error("无法读取公网连接配置");
-    if (text.starts_with("\xef\xbb\xbf")) text.erase(0, 3);
-    return text;
-}
-
 bool ValidToken(std::wstring_view token) {
     constexpr std::wstring_view alphabet = L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     return token.size() == 43 && token.find_first_not_of(alphabet) == std::wstring_view::npos;
@@ -35,18 +21,12 @@ bool ValidToken(std::wstring_view token) {
 
 } // namespace
 
-ConnectionOptions ReadInternetConfig(const std::filesystem::path& path) {
-    return ParseInternetConfig(winrt::to_hstring(ReadConfig(path)), false);
-}
-
-ConnectionOptions ParseInternetConfig(std::wstring_view text, bool managed) {
+ConnectionOptions ParseInternetConfig(std::wstring_view text) {
     try {
         const auto json = JsonObject::Parse(winrt::hstring(text));
         ConnectionOptions result;
-        result.mode = ConnectionMode::internet;
-        result.managed = managed;
         const Uri endpoint(json.GetNamedString(L"signalUrl"));
-        const bool local = managed && endpoint.SchemeName() == L"ws" && endpoint.Host() == L"127.0.0.1";
+        const bool local = endpoint.SchemeName() == L"ws" && endpoint.Host() == L"127.0.0.1";
         if ((!local && endpoint.SchemeName() != L"wss") || endpoint.Host().empty() || endpoint.Path() != L"/signal"
             || !endpoint.UserName().empty() || !endpoint.Password().empty() || !endpoint.Query().empty()
             || !endpoint.Fragment().empty()) {

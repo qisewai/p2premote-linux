@@ -1,6 +1,8 @@
 #include "account_api.h"
 #include "stream_window.h"
 
+#include <p2premote/service_identity.h>
+
 #include <winrt/base.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -22,7 +24,6 @@ using p2premote::AccountDevice;
 using p2premote::AccountLogin;
 
 constexpr wchar_t account_class[] = L"P2PRemote.Account";
-constexpr wchar_t default_service_address[] = L"https://remote.pipisime88.net";
 constexpr UINT account_result = WM_APP + 1;
 constexpr UINT stream_error = WM_APP + 2;
 constexpr UINT_PTR refresh_timer = 1;
@@ -65,6 +66,7 @@ struct IceOverrides {
     std::filesystem::path latency_trace_directory;
     std::string stun_url;
     bool stun_only{};
+    bool relay_only{};
 };
 
 class AccountWindow {
@@ -203,7 +205,7 @@ private:
         server_label_ = Control(L"STATIC", L"服务地址");
         user_label_ = Control(L"STATIC", L"账号");
         password_label_ = Control(L"STATIC", L"密码");
-        server_ = Control(L"EDIT", default_service_address, edit, server_field);
+        server_ = Control(L"EDIT", p2premote::wuhan_service_address, edit, server_field);
         user_ = Control(L"EDIT", L"", edit, user_field);
         password_ = Control(L"EDIT", L"", edit | ES_PASSWORD, password_field);
         SendMessageW(server_, EM_SETLIMITTEXT, 256, 0);
@@ -317,9 +319,10 @@ private:
         }
         SetWindowTextW(password_, L"");
         SetStatus(create ? L"正在注册并登记本机…" : L"正在登录并登记本机…");
-        Request([server, user, password = std::move(password), create, compatible_http = compatible_http_](std::stop_token stop) {
+        Request([server, user, password = std::move(password), create, compatible_http = compatible_http_,
+                 relay_only = ice_.relay_only](std::stop_token stop) {
             Result r;
-            r.login = p2premote::SignIn(stop, server, user, password, create, compatible_http);
+            r.login = p2premote::SignIn(stop, server, user, password, create, compatible_http, relay_only);
             return r;
         });
     }
@@ -412,7 +415,7 @@ private:
                 const Apartment apartment(winrt::apartment_type::single_threaded);
                 connection.auto_control = host;
                 RunStreamWindow(instance_, host ? SW_HIDE : SW_SHOWNORMAL, host,
-                    StreamLaunchOptions{host, std::move(connection), !host, stop});
+                    StreamLaunchOptions{std::move(connection), !host, stop});
             } catch (const winrt::hresult_error& error) {
                 error_text = error.message();
             } catch (const std::exception& error) {
@@ -508,6 +511,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 compatible_http = true;
             } else if (option == L"--stun-only") {
                 ice.stun_only = true;
+            } else if (option == L"--relay-only") {
+                ice.relay_only = true;
             } else if (option == L"--ice-trace" || option == L"--latency-trace") {
                 if (++i >= count || !*args.get()[i] || std::wstring_view(args.get()[i]).starts_with(L"--")) {
                     throw std::runtime_error(winrt::to_string(winrt::hstring(option)) + " 需要指定日志目录");
@@ -524,6 +529,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                     throw std::runtime_error("--stun 需要以 stun: 开头");
                 }
             }
+        }
+        if (ice.stun_only && ice.relay_only) {
+            throw std::invalid_argument("--stun-only 和 --relay-only 不能同时使用");
         }
         return AccountWindow(instance, compatible_http, std::move(ice)).Run(show);
     } catch (const winrt::hresult_error& error) {

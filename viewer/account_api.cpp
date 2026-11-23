@@ -1,5 +1,7 @@
 #include "account_api.h"
 
+#include <p2premote/service_identity.h>
+
 #include <windows.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
@@ -96,8 +98,18 @@ AccountResponse WindowsAccountRequest(std::stop_token stop, const std::wstring& 
     const std::wstring& token, const JsonObject& body) {
     const Filters::HttpBaseProtocolFilter filter;
     filter.AllowAutoRedirect(false);
+    const Uri address(endpoint);
+    if (IsWuhanService(address)) {
+        filter.UseProxy(false);
+        filter.ServerCustomValidationRequested([](const Filters::HttpBaseProtocolFilter&,
+            const Filters::HttpServerCustomValidationRequestedEventArgs& args) {
+            if (!MatchesWuhanServerKey(args.ServerCertificate())) args.Reject();
+        });
+        filter.IgnorableServerCertificateErrors().Append(
+            winrt::Windows::Security::Cryptography::Certificates::ChainValidationResult::Untrusted);
+    }
     const HttpClient client(filter);
-    const HttpRequestMessage request(method, Uri(endpoint));
+    const HttpRequestMessage request(method, address);
     if (!token.empty()) request.Headers().Append(L"Authorization", L"Bearer " + token);
     if (body) {
         request.Content(HttpStringContent(body.Stringify(),
@@ -142,6 +154,13 @@ AccountResponse CurlAccountRequest(std::stop_token stop, const std::wstring& end
     CheckCurl(curl_easy_setopt(curl, CURLOPT_URL, url.c_str()));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, secure ? "https" : "http"));
     if (!secure) CheckCurl(curl_easy_setopt(curl, CURLOPT_NOPROXY, "127.0.0.1"));
+    if (IsWuhanService(Uri(endpoint))) {
+        curl_blob authority{const_cast<char*>(wuhan_ca_certificate), sizeof(wuhan_ca_certificate) - 1, CURL_BLOB_COPY};
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_NOPROXY, "111.170.34.243"));
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &authority));
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, wuhan_public_key_pin));
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT)));
+    }
     CheckCurl(curl_easy_setopt(curl, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1_2)));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, static_cast<long>(CURL_HTTP_VERSION_1_1)));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 8'000L));
@@ -193,7 +212,7 @@ winrt::hstring AccountRequest(std::stop_token stop, bool compatible_http, const 
 } // namespace
 
 AccountLogin SignIn(std::stop_token stop, const std::wstring& server, const std::wstring& user,
-    const std::wstring& password, bool create_account, bool compatible_http) {
+    const std::wstring& password, bool create_account, bool compatible_http, bool relay_only) {
     const auto origin = AccountOrigin(server);
     const JsonObject body;
     body.SetNamedValue(L"username", JsonValue::CreateStringValue(user));
@@ -207,8 +226,8 @@ AccountLogin SignIn(std::stop_token stop, const std::wstring& server, const std:
     const bool secure = signal.starts_with(L"https:");
     signal.replace(0, secure ? 5 : 4, secure ? L"wss" : L"ws");
     auth.SetNamedValue(L"signalUrl", JsonValue::CreateStringValue(signal + L"/signal"));
-    auto connection = ParseInternetConfig(auth.Stringify(), true);
-    connection.hardware_video = true;
+    if (relay_only) auth.SetNamedValue(L"iceTransportPolicy", JsonValue::CreateStringValue(L"relay"));
+    auto connection = ParseInternetConfig(auth.Stringify());
     return {origin, std::wstring(auth.GetNamedObject(L"device").GetNamedString(L"id")), std::move(connection), compatible_http};
 }
 

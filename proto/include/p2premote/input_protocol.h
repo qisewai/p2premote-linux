@@ -8,7 +8,7 @@
 namespace p2premote {
 
 enum class InputKind : std::uint8_t {
-    move = 1, button_down, button_up, wheel, key_down, key_up, text, reset, heartbeat, set_quality, cursor_ready,
+    move = 1, button_down, button_up, wheel, key_down, key_up, text, reset, heartbeat, cursor_ready,
     set_video_settings, video_settings_reply
 };
 

@@ -33,11 +33,6 @@ int main() {
     passed &= check(DecodeInput(EncodeInput({InputKind::wheel, 0xff88, 0, 0, 1, 1})).has_value(), "Rejected negative wheel delta");
     passed &= check(DecodeInput(EncodeInput({InputKind::text, u'字', 0, 0, 1, 1})).has_value(), "Rejected UTF-16 character");
     const auto hd = static_cast<std::uint16_t>(p2premote::StreamQuality::p1080);
-    const auto quality = DecodeInput(EncodeInput({InputKind::set_quality, hd, 0, 0, 1, 1}));
-    passed &= check(quality && quality->kind == InputKind::set_quality && quality->code == hd,
-        "Could not round-trip the requested streaming quality");
-    passed &= check(!DecodeInput(EncodeInput({InputKind::set_quality, 0xffff, 0, 0, 1, 1})),
-        "Accepted an unsupported streaming quality");
     const auto economy = static_cast<std::uint16_t>(p2premote::VideoBitratePreset::economy);
     const auto request = DecodeInput(EncodeInput({InputKind::set_video_settings, hd, economy, 0, 27, 50}));
     passed &= check(request && request->kind == InputKind::set_video_settings && request->code == hd
@@ -46,7 +41,8 @@ int main() {
     const auto reply = DecodeInput(EncodeInput({InputKind::video_settings_reply, hd, economy, 1, 27, 50}));
     passed &= check(reply && reply->kind == InputKind::video_settings_reply && reply->sequence == 27 && reply->y == 1,
         "Could not decode a correlated video settings rejection");
-    passed &= check(!DecodeInput(EncodeInput({InputKind::set_video_settings, hd, 0, 0, 27, 50}))
+    passed &= check(!DecodeInput(EncodeInput({InputKind::set_video_settings, 0xffff, economy, 0, 27, 50}))
+        && !DecodeInput(EncodeInput({InputKind::set_video_settings, hd, 0, 0, 27, 50}))
         && !DecodeInput(EncodeInput({InputKind::set_video_settings, hd, economy, 1, 27, 50}))
         && !DecodeInput(EncodeInput({InputKind::video_settings_reply, hd, economy, 2, 27, 50})),
         "Accepted malformed video settings");

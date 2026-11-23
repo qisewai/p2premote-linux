@@ -1,11 +1,5 @@
 #include "minirtc_call.h"
 
-#include "api/video/i420_buffer.h"
-#include "api/video/nv12_buffer.h"
-#include "libyuv/convert.h"
-#include "libyuv/convert_from.h"
-#include "rtc_base/time_utils.h"
-
 #include "cursor_shape.h"
 #include "minirtc_desktop_video.h"
 #include "qpc.h"
@@ -31,34 +25,7 @@ constexpr char controls_name[] = "control";
 constexpr char motion_name[] = "pointer";
 constexpr char cursor_name[] = "cursor";
 
-class MiniRtcNv12Buffer : public webrtc::NV12BufferInterface {
-public:
-    explicit MiniRtcNv12Buffer(const MiniRtcNativeVideoFrame& frame) : frame_(frame) {
-        frame_.retain(frame_.owner);
-    }
-    ~MiniRtcNv12Buffer() override { frame_.release(frame_.owner); }
-
-    int width() const override { return static_cast<int>(frame_.width); }
-    int height() const override { return static_cast<int>(frame_.height); }
-    int StrideY() const override { return static_cast<int>(frame_.payload.cpu_nv12.y_stride); }
-    int StrideUV() const override { return static_cast<int>(frame_.payload.cpu_nv12.uv_stride); }
-    const std::uint8_t* DataY() const override { return frame_.payload.cpu_nv12.y_plane; }
-    const std::uint8_t* DataUV() const override { return frame_.payload.cpu_nv12.uv_plane; }
-
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> ToI420() override {
-        auto pixels = webrtc::I420Buffer::Create(width(), height());
-        if (libyuv::NV12ToI420(DataY(), StrideY(), DataUV(), StrideUV(), pixels->MutableDataY(), pixels->StrideY(),
-                pixels->MutableDataU(), pixels->StrideU(), pixels->MutableDataV(), pixels->StrideV(), width(), height()) != 0) {
-            return nullptr;
-        }
-        return pixels;
-    }
-
-private:
-    const MiniRtcNativeVideoFrame frame_;
-};
-
-webrtc::scoped_refptr<webrtc::NV12BufferInterface> RetainNv12(const MiniRtcVideoFrame& frame) {
+std::optional<DecodedFrame> RetainNv12(const MiniRtcVideoFrame& frame, std::int64_t queued_qpc) {
     if (const auto* native = frame.native_frame; native && native->struct_size >= sizeof(*native)
             && native->type == MiniRtcNativeVideoFrameCpuNv12 && native->width == frame.width
             && native->height == frame.height && native->owner && native->retain && native->release) {
@@ -66,17 +33,41 @@ webrtc::scoped_refptr<webrtc::NV12BufferInterface> RetainNv12(const MiniRtcVideo
         constexpr auto max_stride = static_cast<std::uint32_t>(std::numeric_limits<int>::max());
         if (planes.y_plane && planes.uv_plane && planes.y_stride >= frame.width && planes.y_stride <= max_stride
                 && planes.uv_stride >= frame.width && planes.uv_stride <= max_stride) {
-            return webrtc::make_ref_counted<MiniRtcNv12Buffer>(*native);
+            native->retain(native->owner);
+            auto owner = std::shared_ptr<void>(native->owner, [release = native->release](void* ptr) noexcept {
+                release(ptr);
+            });
+            return DecodedFrame{
+                static_cast<int>(native->width),
+                static_cast<int>(native->height),
+                static_cast<int>(planes.y_stride),
+                static_cast<int>(planes.uv_stride),
+                planes.y_plane,
+                planes.uv_plane,
+                std::move(owner),
+                queued_qpc
+            };
         }
     }
 
     const auto luma = static_cast<std::size_t>(frame.width) * frame.height;
-    if (!frame.data || frame.size < luma + luma / 2) return nullptr;
+    const auto total = luma + luma / 2;
+    if (!frame.data || frame.size < total) return std::nullopt;
+    auto storage = std::make_shared<std::vector<std::uint8_t>>(total);
+    std::memcpy(storage->data(), frame.data, total);
+    const auto* y_plane = storage->data();
+    const auto* uv_plane = y_plane + luma;
     const auto width = static_cast<int>(frame.width);
-    auto pixels = webrtc::NV12Buffer::Create(width, static_cast<int>(frame.height), width, width);
-    std::memcpy(pixels->MutableDataY(), frame.data, luma);
-    std::memcpy(pixels->MutableDataUV(), frame.data + luma, luma / 2);
-    return pixels;
+    return DecodedFrame{
+        width,
+        static_cast<int>(frame.height),
+        width,
+        width,
+        y_plane,
+        uv_plane,
+        std::move(storage),
+        queued_qpc
+    };
 }
 
 const native_minirtc::Api* NativeApi() {
@@ -140,8 +131,6 @@ TurnMode TurnPolicy(const ConnectionOptions& options) {
 } // namespace
 
 bool MiniRtcCall::Available(const ConnectionOptions& options) {
-    // This libnice integration supports TURN over UDP/TCP. The legacy
-    // backend handles configurations that also require TLS TURN.
     return NativeApi() && std::all_of(options.ice_servers.begin(), options.ice_servers.end(), [](const auto& server) {
         return std::none_of(server.urls.begin(), server.urls.end(), [](const auto& url) {
             return url.starts_with("turns:");
@@ -152,13 +141,14 @@ bool MiniRtcCall::Available(const ConnectionOptions& options) {
 MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
     bool allow_input, unsigned frame_rate)
     : host_(host), allow_input_(allow_input), events_(std::move(events)), api_(NativeApi()), ice_(options.ice_servers) {
-    if (!api_) throw std::runtime_error("MiniRTC module is unavailable");
+    if (!api_) throw std::runtime_error("MiniRTC 模块不可用，请确认 p2premote_minirtc.dll 位于程序目录");
+    if (!Available(options)) throw std::runtime_error("当前 MiniRTC 模块不支持 turns: 协议");
     Params params{};
     const auto dir = options.ice_trace_dir.empty() ?
         std::filesystem::temp_directory_path() / L"P2PRemote" / L"MiniRTC" : options.ice_trace_dir;
     std::filesystem::create_directories(dir);
     const auto log = dir.string();
-    if (log.size() >= sizeof(params.log_path)) throw std::runtime_error("MiniRTC log directory is too long");
+    if (log.size() >= sizeof(params.log_path)) throw std::runtime_error("MiniRTC 日志目录过长");
     std::copy(log.begin(), log.end(), params.log_path);
     params.user_id = host_ ? "host" : "viewer";
     params.user_data = this;
@@ -176,7 +166,7 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
     if (!peer || api_->add_video(peer.get(), video_name) != 0 || api_->add_data(peer.get(), controls_name, true) != 0 ||
         api_->add_data(peer.get(), motion_name, false) != 0 || api_->add_data(peer.get(), cursor_name, true) != 0 ||
         api_->init(peer.get(), SignalOut, this) != 0 || (!host_ && api_->join(peer.get(), "host") != 0)) {
-        throw std::runtime_error("MiniRTC initialization failed");
+        throw std::runtime_error("MiniRTC 初始化失败");
     }
     peer_ = peer.release();
 }
@@ -193,7 +183,6 @@ void MiniRtcCall::SignalOut(const char* data, size_t size, void* context) noexce
 }
 
 bool MiniRtcCall::IsSessionSignal(const std::string& payload) {
-    // Account signaling owns presence, reconnect and session authorization.
     const auto json = JsonObject::Parse(winrt::to_hstring(payload));
     const auto type = json.GetNamedString(L"type");
     return type == L"join_transmission" || type == L"offer" || type == L"answer" ||
@@ -208,7 +197,7 @@ void MiniRtcCall::ReceiveSignal(const std::string& payload) {
     }
     const auto wire = winrt::to_string(message.Stringify());
     if (api_->receive_signal(peer_, wire.data(), wire.size()) != 0) {
-        throw std::runtime_error("Invalid MiniRTC session signaling");
+        throw std::runtime_error("收到无效的 MiniRTC 信令");
     }
 }
 
@@ -223,7 +212,7 @@ void MiniRtcCall::Status(ConnectionStatus status, const char*, size_t, void* con
                status == IncorrectPassword || status == NoSuchTransmissionId || status == RemoteUnavailable) {
         self.connected_ = false;
         self.events_->Push({StreamEventType::input_ready, {}, {}});
-        self.events_->Push({StreamEventType::media_lost, {}, "MiniRTC connection closed"});
+        self.events_->Push({StreamEventType::media_lost, {}, "MiniRTC 连接已断开"});
     }
 }
 
@@ -287,10 +276,9 @@ void MiniRtcCall::Video(const MiniRtcVideoFrame* frame, const char*, size_t, con
     if (self.host_ || !source || std::string_view(source, source_size) != video_name || !frame ||
         !frame->width || !frame->height || ((frame->width | frame->height) & 1u) ||
         frame->width > 2560 || frame->height > 1440) return;
-    auto pixels = RetainNv12(*frame);
-    if (!pixels) return;
-    auto decoded = webrtc::VideoFrame::Builder().set_video_frame_buffer(pixels).set_timestamp_us(webrtc::TimeMicros()).build();
     const auto queued = QpcNow();
+    auto decoded = RetainNv12(*frame, queued);
+    if (!decoded) return;
     if (const auto& trace = self.events_->Trace()) {
         // MiniRTC's Windows clock and the application both use QPC.
         constexpr auto max_timestamp_us = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max() / 10);
@@ -309,25 +297,38 @@ void MiniRtcCall::Video(const MiniRtcVideoFrame* frame, const char*, size_t, con
     {
         const std::lock_guard lock(self.mutex_);
         self.replaced_ += self.latest_.has_value();
-        self.latest_.emplace(DecodedFrame{std::move(decoded), queued});
+        self.latest_.emplace(std::move(*decoded));
         ++self.counters_.received;
         ++self.counters_.decoded;
     }
     self.events_->Notify();
 }
 
-void MiniRtcCall::Submit(const webrtc::VideoFrame& frame) {
+void MiniRtcCall::Submit(const Nv12Frame& frame) {
     if (!host_ || !connected_) return;
-    const auto pixels = frame.video_frame_buffer()->ToI420();
-    if (!pixels) return;
-    const int width = pixels->width(), height = pixels->height();
-    const auto luma = static_cast<size_t>(width) * height;
-    nv12_.resize(luma * 3 / 2);
-    if (libyuv::I420ToNV12(pixels->DataY(), pixels->StrideY(), pixels->DataU(), pixels->StrideU(),
-            pixels->DataV(), pixels->StrideV(), nv12_.data(), width, nv12_.data() + luma, width, width, height) != 0) return;
+    const int width = frame.width, height = frame.height;
+    if (width <= 0 || height <= 0 || ((width | height) & 1)) return;
+    const auto luma = static_cast<std::size_t>(width) * height;
+    const char* payload = nullptr;
+    if (frame.IsTightlyPacked()) {
+        payload = reinterpret_cast<const char*>(frame.DataY());
+    } else {
+        nv12_.resize(luma * 3 / 2);
+        auto* dst_y = nv12_.data();
+        auto* dst_uv = dst_y + luma;
+        for (int row = 0; row < height; ++row) {
+            std::memcpy(dst_y + static_cast<std::size_t>(row) * width,
+                frame.DataY() + static_cast<std::size_t>(row) * frame.stride_y, width);
+        }
+        for (int row = 0; row < height / 2; ++row) {
+            std::memcpy(dst_uv + static_cast<std::size_t>(row) * width,
+                frame.DataUV() + static_cast<std::size_t>(row) * frame.stride_uv, width);
+        }
+        payload = reinterpret_cast<const char*>(nv12_.data());
+    }
     MiniRtcVideoFrame input{};
-    input.data = reinterpret_cast<const char*>(nv12_.data());
-    input.size = nv12_.size();
+    input.data = payload;
+    input.size = luma * 3 / 2;
     input.width = width;
     input.height = height;
     api_->send_video(peer_, &input, video_name);
@@ -337,8 +338,8 @@ bool MiniRtcCall::SetVideoBitrate(int bitrate) {
     return host_ && connected_ && api_->set_bitrate(peer_, "viewer", 6, bitrate) == 0;
 }
 
-void MiniRtcCall::RequestStats(bool negotiating) {
-    if (negotiating || !connected_) return;
+void MiniRtcCall::RequestStats() {
+    if (!connected_) return;
     const std::lock_guard lock(mutex_);
     events_->Push({StreamEventType::stats, {}, {}, counters_});
 }

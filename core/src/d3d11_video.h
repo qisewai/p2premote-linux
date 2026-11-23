@@ -4,29 +4,7 @@
 #include <optional>
 #include <winrt/base.h>
 
-#include "api/video/video_frame_buffer.h"
-
 namespace p2premote {
-
-class Nv12Frame : public webrtc::VideoFrameBuffer {
-public:
-    Nv12Frame(winrt::com_ptr<ID3D11Texture2D> texture, UINT subresource, int width, int height,
-        winrt::com_ptr<IUnknown> lease = {});
-
-    Type type() const override { return Type::kNative; }
-    int width() const override { return width_; }
-    int height() const override { return height_; }
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> ToI420() override;
-    ID3D11Texture2D* texture() const { return texture_.get(); }
-    UINT subresource() const { return subresource_; }
-
-private:
-    winrt::com_ptr<IUnknown> lease_;
-    winrt::com_ptr<ID3D11Texture2D> texture_;
-    UINT subresource_;
-    int width_;
-    int height_;
-};
 
 class D3d11VideoConverter {
 public:

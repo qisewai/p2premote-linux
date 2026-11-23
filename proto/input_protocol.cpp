@@ -41,7 +41,6 @@ bool ValidCode(InputKind kind, std::uint16_t code) {
         return (code & 0xff) != 0 && code < 512;
     case InputKind::text:
         return code == '\b' || code == '\r' || (code >= 32 && code != 127);
-    case InputKind::set_quality:
     case InputKind::set_video_settings:
     case InputKind::video_settings_reply:
         return code >= static_cast<std::uint16_t>(StreamQuality::p720)
