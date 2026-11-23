@@ -186,7 +186,8 @@ void D3d11Preview::ResizeToWindow() {
 }
 
 void D3d11Preview::EnsureSource(unsigned width, unsigned height, bool nv12) {
-    if (width == source_width_ && height == source_height_ && (chroma_ != nullptr) == nv12) return;
+    if (width == source_width_ && height == source_height_ && (chroma_ != nullptr) == nv12
+            && chroma_.get() != source_.get()) return;
 
     const auto create = [this](unsigned w, unsigned h, DXGI_FORMAT pixel_format) {
         D3D11_TEXTURE2D_DESC texture{};
@@ -251,6 +252,50 @@ bool D3d11Preview::UploadNv12(const std::uint8_t* y, unsigned y_stride, const st
     context_->UpdateSubresource(source_.get(), 0, nullptr, y, y_stride, 0);
     context_->UpdateSubresource(chroma_.get(), 0, nullptr, uv, uv_stride, 0);
     return true;
+}
+
+bool D3d11Preview::UploadNv12Texture(ID3D11Texture2D* texture, unsigned subresource,
+    unsigned width, unsigned height) {
+    if (nv12_texture_unavailable_ || !texture || !width || !height || ((width | height) & 1u)) return false;
+    D3D11_TEXTURE2D_DESC input{};
+    texture->GetDesc(&input);
+    winrt::com_ptr<ID3D11Device> input_device;
+    texture->GetDevice(input_device.put());
+    if (input_device.get() != device_.get() || input.Format != DXGI_FORMAT_NV12 ||
+        width > input.Width || height > input.Height || subresource >= input.MipLevels * input.ArraySize) return false;
+    try {
+        if (!nv12_shader_) {
+            const auto bytecode = CompileShader("ps_nv12", "ps_5_0");
+            winrt::check_hresult(device_->CreatePixelShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(),
+                nullptr, nv12_shader_.put()));
+        }
+        if (width != source_width_ || height != source_height_ || chroma_.get() != source_.get()) {
+            const D3D11_TEXTURE2D_DESC desc{width, height, 1, 1, DXGI_FORMAT_NV12, {1, 0}, D3D11_USAGE_DEFAULT,
+                D3D11_BIND_SHADER_RESOURCE, 0, 0};
+            winrt::com_ptr<ID3D11Texture2D> source;
+            winrt::check_hresult(device_->CreateTexture2D(&desc, nullptr, source.put()));
+            D3D11_SHADER_RESOURCE_VIEW_DESC plane{};
+            plane.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            plane.Texture2D.MipLevels = 1;
+            plane.Format = DXGI_FORMAT_R8_UNORM;
+            winrt::com_ptr<ID3D11ShaderResourceView> y, uv;
+            winrt::check_hresult(device_->CreateShaderResourceView(source.get(), &plane, y.put()));
+            plane.Format = DXGI_FORMAT_R8G8_UNORM;
+            winrt::check_hresult(device_->CreateShaderResourceView(source.get(), &plane, uv.put()));
+            source_ = source;
+            chroma_ = std::move(source);
+            source_view_ = std::move(y);
+            chroma_view_ = std::move(uv);
+            source_width_ = width;
+            source_height_ = height;
+        }
+        const D3D11_BOX visible{0, 0, 0, width, height, 1};
+        context_->CopySubresourceRegion(source_.get(), 0, 0, 0, 0, texture, subresource, &visible);
+        return true;
+    } catch (const winrt::hresult_error&) {
+        nv12_texture_unavailable_ = true;
+        return false;
+    }
 }
 
 ID3D11PixelShader* D3d11Preview::SelectPixelShader(bool enhance_text) {

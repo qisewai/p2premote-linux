@@ -29,6 +29,8 @@ public:
     void UploadBgra(const std::uint8_t* pixels, unsigned stride, unsigned width, unsigned height);
     [[nodiscard]] bool UploadNv12(const std::uint8_t* y, unsigned y_stride, const std::uint8_t* uv,
         unsigned uv_stride, unsigned width, unsigned height);
+    [[nodiscard]] bool UploadNv12Texture(ID3D11Texture2D* texture, unsigned subresource,
+        unsigned width, unsigned height);
     void Draw(bool enhance_text = false);
     [[nodiscard]] bool Present(unsigned sync_interval = 1);
 
@@ -55,6 +57,7 @@ private:
     winrt::com_ptr<ID3D11Texture2D> chroma_;
     winrt::com_ptr<ID3D11ShaderResourceView> chroma_view_;
     bool nv12_unavailable_{};
+    bool nv12_texture_unavailable_{};
     bool text_filter_unavailable_{};
     unsigned target_width_{};
     unsigned target_height_{};

@@ -27,6 +27,7 @@ struct StreamStatistics {
     std::uint64_t video_packets_received{};
     std::wstring video_codec;
     bool gpu_conversion{};
+    bool gpu_native{};
     unsigned width{};
     unsigned height{};
     unsigned target_fps{};

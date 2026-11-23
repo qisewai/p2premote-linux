@@ -711,7 +711,8 @@ private:
             if (!stats.video_codec.empty()) {
                 if (host_) text += L"  |  ";
                 text += stats.video_codec;
-                if (stats.gpu_conversion) text += L" · GPU 转换";
+                if (stats.gpu_native) text += L" · D3D11 纹理";
+                else if (stats.gpu_conversion) text += L" · GPU 转换";
             }
             text += std::format(L"  |  {} × {}  |  {} 帧\r\n{}", stats.width, stats.height,
                 host_ ? stats.submitted : stats.presented, rate_text_);

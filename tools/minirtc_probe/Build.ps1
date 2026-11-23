@@ -37,6 +37,12 @@ function Get-UpstreamText([string]$file) {
 
 $recipe=Get-UpstreamText 'xmake.lua'
 $recipe=$recipe.Replace('    add_requireconfs("libyuv", {configs = {toolchains = "clang-cl"}})', '    -- The Windows probe builds libyuv with MSVC.')
+$recipe=$recipe.Replace('    add_includedirs("src/media/audio/encode",', @'
+    if is_os("windows") then
+        add_files("src/media/video/windows/windows_h264.cpp")
+    end
+    add_includedirs("src/media/audio/encode",
+'@.TrimEnd())
 $recipe += @'
 
 target_end()
@@ -95,6 +101,7 @@ foreach ($patch in $patches) {
     git -C $source apply --ignore-whitespace $patch
     if ($LASTEXITCODE) {throw "MiniRTC patch did not match the pinned source: $patch"}
 }
+. (Join-Path $PSScriptRoot 'PatchHardware.ps1')
 
 # Allow the probe to vary ICE pacing independently of libnice debug logging.
 $ice=Get-UpstreamText 'src/ice/ice_agent.cpp'

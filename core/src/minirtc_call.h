@@ -21,7 +21,7 @@ class MiniRtcCall final {
 public:
     static bool Available(const ConnectionOptions& options);
     MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
-        bool allow_input, unsigned frame_rate);
+        bool allow_input, unsigned frame_rate, ID3D11Device* device);
     ~MiniRtcCall();
 
     void ReceiveSignal(const std::string& payload);
@@ -46,6 +46,7 @@ private:
 
     const bool host_, allow_input_;
     const std::shared_ptr<StreamEvents> events_;
+    winrt::com_ptr<ID3D11Device> device_;
     const native_minirtc::Api* api_{};
     PeerPtr* peer_{};
     std::vector<IceServerOptions> ice_;

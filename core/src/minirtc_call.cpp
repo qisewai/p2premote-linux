@@ -1,6 +1,7 @@
 #include "minirtc_call.h"
 
 #include "cursor_shape.h"
+#include "dxgi_nv12_frame.h"
 #include "minirtc_desktop_video.h"
 #include "qpc.h"
 
@@ -27,26 +28,29 @@ constexpr char cursor_name[] = "cursor";
 
 std::optional<DecodedFrame> RetainNv12(const MiniRtcVideoFrame& frame, std::int64_t queued_qpc) {
     if (const auto* native = frame.native_frame; native && native->struct_size >= sizeof(*native)
-            && native->type == MiniRtcNativeVideoFrameCpuNv12 && native->width == frame.width
+            && native->width == frame.width
             && native->height == frame.height && native->owner && native->retain && native->release) {
-        const auto& planes = native->payload.cpu_nv12;
-        constexpr auto max_stride = static_cast<std::uint32_t>(std::numeric_limits<int>::max());
-        if (planes.y_plane && planes.uv_plane && planes.y_stride >= frame.width && planes.y_stride <= max_stride
-                && planes.uv_stride >= frame.width && planes.uv_stride <= max_stride) {
+        const auto retain = [&] {
             native->retain(native->owner);
-            auto owner = std::shared_ptr<void>(native->owner, [release = native->release](void* ptr) noexcept {
+            return std::shared_ptr<void>(native->owner, [release = native->release](void* ptr) noexcept {
                 release(ptr);
             });
-            return DecodedFrame{
-                static_cast<int>(native->width),
-                static_cast<int>(native->height),
-                static_cast<int>(planes.y_stride),
-                static_cast<int>(planes.uv_stride),
-                planes.y_plane,
-                planes.uv_plane,
-                std::move(owner),
-                queued_qpc
-            };
+        };
+        const auto width = static_cast<int>(frame.width);
+        const auto height = static_cast<int>(frame.height);
+        if (native->type == MiniRtcNativeVideoFrameD3d11Nv12 && native->payload.d3d11_nv12.texture && native->copy_to_nv12) {
+            const auto& surface = native->payload.d3d11_nv12;
+            return DecodedFrame{width, height, 0, 0, nullptr, nullptr, retain(), queued_qpc,
+                static_cast<ID3D11Texture2D*>(surface.texture), surface.subresource, native->copy_to_nv12};
+        }
+        if (native->type == MiniRtcNativeVideoFrameCpuNv12) {
+            const auto& planes = native->payload.cpu_nv12;
+            constexpr auto max_stride = static_cast<std::uint32_t>(std::numeric_limits<int>::max());
+            if (planes.y_plane && planes.uv_plane && planes.y_stride >= frame.width && planes.y_stride <= max_stride
+                    && planes.uv_stride >= frame.width && planes.uv_stride <= max_stride) {
+                return DecodedFrame{width, height, static_cast<int>(planes.y_stride), static_cast<int>(planes.uv_stride),
+                    planes.y_plane, planes.uv_plane, retain(), queued_qpc};
+            }
         }
     }
 
@@ -139,8 +143,9 @@ bool MiniRtcCall::Available(const ConnectionOptions& options) {
 }
 
 MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
-    bool allow_input, unsigned frame_rate)
+    bool allow_input, unsigned frame_rate, ID3D11Device* device)
     : host_(host), allow_input_(allow_input), events_(std::move(events)), api_(NativeApi()), ice_(options.ice_servers) {
+    device_.copy_from(device);
     if (!api_) throw std::runtime_error("MiniRTC 模块不可用，请确认 p2premote_minirtc.dll 位于程序目录");
     if (!Available(options)) throw std::runtime_error("当前 MiniRTC 模块不支持 turns: 协议");
     Params params{};
@@ -155,6 +160,8 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
     params.turn_mode = TurnPolicy(options);
     params.enable_srtp = true;
     ConfigureMiniRtcDesktopVideo(params, frame_rate);
+    params.hardware_acceleration = device_ != nullptr;
+    params.windows_d3d11_device = device_.get();
     params.native_video_output = !host_;
     params.on_signal_status = [](SignalStatus, const char*, size_t, void*) {};
     params.on_connection_status = Status;
@@ -230,7 +237,7 @@ void MiniRtcCall::Network(const char*, size_t, TraversalMode route, const MiniRt
         self.counters_.ice_path = path == Path::HostUdp || path == Path::HostTcp ? IcePath::host : IcePath::nat;
         self.counters_.ice_protocol = path == Path::HostUdp || path == Path::DirectUdp ? "udp" : "tcp";
     }
-    self.counters_.video_codec = "H264 (MiniRTC)";
+    if (self.counters_.video_codec.empty()) self.counters_.video_codec = "H264 (MiniRTC)";
     if (stats->rtt_ms >= 0) self.counters_.ice_rtt_ms = stats->rtt_ms;
     else self.counters_.ice_rtt_ms.reset();
     self.counters_.srtp_active = stats->srtp_active;
@@ -296,6 +303,7 @@ void MiniRtcCall::Video(const MiniRtcVideoFrame* frame, const char*, size_t, con
     }
     {
         const std::lock_guard lock(self.mutex_);
+        self.counters_.video_codec = decoded->texture ? "H264 (DXVA)" : "H264 (MiniRTC)";
         self.replaced_ += self.latest_.has_value();
         self.latest_.emplace(std::move(*decoded));
         ++self.counters_.received;
@@ -309,6 +317,18 @@ void MiniRtcCall::Submit(const Nv12Frame& frame) {
     const int width = frame.width, height = frame.height;
     if (width <= 0 || height <= 0 || ((width | height) & 1)) return;
     const auto luma = static_cast<std::size_t>(width) * height;
+    MiniRtcVideoFrame input{};
+    input.size = luma * 3 / 2;
+    input.width = width;
+    input.height = height;
+    if (frame.texture) {
+        using native_minirtc::DxgiNv12Frame;
+        const auto native = std::unique_ptr<DxgiNv12Frame, decltype(&DxgiNv12Frame::Release)>(
+            new DxgiNv12Frame(frame.texture.get(), 0, width, height), &DxgiNv12Frame::Release);
+        input.native_frame = &native->descriptor;
+        api_->send_video(peer_, &input, video_name);
+        return;
+    }
     const char* payload = nullptr;
     if (frame.IsTightlyPacked()) {
         payload = reinterpret_cast<const char*>(frame.DataY());
@@ -326,11 +346,7 @@ void MiniRtcCall::Submit(const Nv12Frame& frame) {
         }
         payload = reinterpret_cast<const char*>(nv12_.data());
     }
-    MiniRtcVideoFrame input{};
     input.data = payload;
-    input.size = luma * 3 / 2;
-    input.width = width;
-    input.height = height;
     api_->send_video(peer_, &input, video_name);
 }
 

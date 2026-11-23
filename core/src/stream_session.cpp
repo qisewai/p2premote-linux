@@ -244,6 +244,7 @@ struct ActiveStream {
     bool dynamic_cadence{};
     std::unique_ptr<D3d11VideoConverter> converter;
     bool gpu_conversion_failed{};
+    bool gpu_texture_conversion_failed{};
     std::unique_ptr<D3d11Preview> renderer;
     std::vector<std::uint8_t> bgra;
     HMONITOR monitor{};
@@ -311,6 +312,22 @@ struct ActiveStream {
 
     void ResetInput() {
         if (desktop) desktop->Submit({InputKind::reset});
+    }
+
+    std::shared_ptr<Nv12Frame> ConvertToGpuNv12(const CapturedFrame& frame, int width, int height) {
+        if (gpu_texture_conversion_failed) return {};
+        try {
+            if (!converter) converter = std::make_unique<D3d11VideoConverter>(device.get());
+            auto nv12 = std::make_shared<Nv12Frame>();
+            nv12->width = width;
+            nv12->height = height;
+            nv12->texture = converter->Convert(frame.texture.get(), 0, frame.metadata.width, frame.metadata.height,
+                width, height, DXGI_FORMAT_NV12);
+            return nv12;
+        } catch (const winrt::hresult_error&) {
+            gpu_texture_conversion_failed = true;
+            return {};
+        }
     }
 
     std::shared_ptr<Nv12Frame> ConvertOnGpuToCpuNv12(const CapturedFrame& frame, int width, int height) {
@@ -441,7 +458,9 @@ void StreamSession::Approve(StreamInputMode input) {
     impl_->state = StreamState::negotiating;
     impl_->detail = L"已授权，正在建立视频连接";
     const bool allow_input = input == StreamInputMode::desktop;
-    active.rtc = std::make_unique<MiniRtcCall>(true, active.events, impl_->connection, allow_input, impl_->stats.target_fps);
+    active.device = CreateD3d11Device(true);
+    active.rtc = std::make_unique<MiniRtcCall>(true, active.events, impl_->connection, allow_input,
+        impl_->stats.target_fps, active.device.get());
     active.signal->Send("accept", allow_input ? "control" : "view");
 }
 
@@ -606,8 +625,9 @@ void StreamSession::ProcessEvents() {
                 impl_->state = StreamState::negotiating;
                 impl_->detail = L"Host 已允许，正在建立视频连接";
                 active.negotiation_start = QpcNow();
+                active.device = CreateD3d11Device(true);
                 active.rtc = std::make_unique<MiniRtcCall>(false, active.events, impl_->connection,
-                    event.payload == "control", 30);
+                    event.payload == "control", 30, active.device.get());
             } else if (active.rtc && event.name == "minirtc" &&
                 (impl_->state == StreamState::negotiating || impl_->state == StreamState::streaming)) {
                 active.rtc->ReceiveSignal(event.payload);
@@ -840,10 +860,12 @@ void StreamSession::Capture() {
 
     const auto limits = LimitsFor(active.quality);
     const auto [width, height] = ScaledSize(static_cast<int>(frame->metadata.width), static_cast<int>(frame->metadata.height), limits);
-    auto nv12 = active.ConvertOnGpuToCpuNv12(*frame, width, height);
+    auto nv12 = active.ConvertToGpuNv12(*frame, width, height);
+    if (!nv12) nv12 = active.ConvertOnGpuToCpuNv12(*frame, width, height);
     const bool gpu_converted = static_cast<bool>(nv12);
     if (!nv12) nv12 = active.pixels->ConvertNv12Cpu(*frame, width, height);
     impl_->stats.gpu_conversion = gpu_converted;
+    impl_->stats.gpu_native = nv12->texture != nullptr;
     if (active.dynamic_cadence) {
         active.last_video = nv12;
         active.last_video_quality = active.quality;
@@ -863,7 +885,7 @@ void StreamSession::Capture() {
 
 void StreamSession::Present() {
     auto& active = *impl_->active;
-    const auto frame = active.rtc->TakeFrame();
+    auto frame = active.rtc->TakeFrame();
     const auto begin = QpcNow();
     active.renderer->ResizeToWindow();
     if (frame) {
@@ -871,8 +893,19 @@ void StreamSession::Present() {
         if (frame->width <= 0 || frame->height <= 0 || frame->width > limits.width || frame->height > limits.height) {
             throw std::runtime_error("收到超出尺寸上限的视频帧");
         }
-        const bool nv12_uploaded = active.renderer->UploadNv12(frame->y_plane, static_cast<unsigned>(frame->stride_y),
-            frame->uv_plane, static_cast<unsigned>(frame->stride_uv),
+        const bool native_uploaded = frame->texture && active.renderer->UploadNv12Texture(frame->texture,
+            frame->subresource, static_cast<unsigned>(frame->width), static_cast<unsigned>(frame->height));
+        std::shared_ptr<Nv12Frame> readback;
+        if (frame->texture && !native_uploaded) {
+            readback = Nv12Frame::Create(frame->width, frame->height);
+            if (frame->copy_to_nv12(frame->owner.get(), readback->data.data(), readback->data.size()) != 0) return;
+            frame->y_plane = readback->DataY();
+            frame->uv_plane = readback->DataUV();
+            frame->stride_y = readback->stride_y;
+            frame->stride_uv = readback->stride_uv;
+        }
+        const bool nv12_uploaded = native_uploaded || active.renderer->UploadNv12(frame->y_plane,
+            static_cast<unsigned>(frame->stride_y), frame->uv_plane, static_cast<unsigned>(frame->stride_uv),
             static_cast<unsigned>(frame->width), static_cast<unsigned>(frame->height));
         if (!nv12_uploaded) {
             ConvertNv12ToBgraCpu(*frame, active.bgra);
@@ -880,6 +913,7 @@ void StreamSession::Present() {
                 static_cast<unsigned>(frame->width), static_cast<unsigned>(frame->height));
         }
         impl_->stats.gpu_conversion = nv12_uploaded;
+        impl_->stats.gpu_native = native_uploaded;
         impl_->stats.width = static_cast<unsigned>(frame->width);
         impl_->stats.height = static_cast<unsigned>(frame->height);
     }
@@ -975,7 +1009,7 @@ void StreamSession::ExportCsv(const std::filesystem::path& path) const {
            "capture_to_submit_mean_ms,draw_to_present_mean_ms,target_fps,"
            "packet_send_queue_mean_ms,decoded_frame_wait_mean_ms,decoded_replaced,"
            "ice_path,ice_rtt_ms,ice_protocol,video_packets_received,"
-           "upload_bps,download_bps,video_loss_fraction,srtp_active,video_bitrate_limit_bps\r\n";
+           "upload_bps,download_bps,video_loss_fraction,srtp_active,video_bitrate_limit_bps,gpu_native\r\n";
     csv << std::fixed << std::setprecision(3);
     const auto write_row = [&csv](const StreamStatistics& row) {
         csv << row.seconds << ',' << row.width << ',' << row.height << ',' << row.captured << ',' << row.submitted
@@ -996,7 +1030,7 @@ void StreamSession::ExportCsv(const std::filesystem::path& path) const {
         if (row.video_loss_fraction) csv << *row.video_loss_fraction;
         csv << ',' << row.srtp_active << ',';
         if (row.video_bitrate_limit_bps) csv << *row.video_bitrate_limit_bps;
-        csv << "\r\n";
+        csv << ',' << row.gpu_native << "\r\n";
     };
     for (const auto& row : impl_->samples) write_row(row);
     if (impl_->samples.empty() && impl_->stats.seconds > 0) write_row(impl_->stats);

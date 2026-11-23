@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <d3d11.h>
+#include <winrt/base.h>
 
 namespace p2premote {
 
@@ -13,6 +15,7 @@ struct Nv12Frame {
     int stride_y{};
     int stride_uv{};
     std::vector<std::uint8_t> data;
+    winrt::com_ptr<ID3D11Texture2D> texture;
 
     [[nodiscard]] const std::uint8_t* DataY() const noexcept { return data.data(); }
     [[nodiscard]] const std::uint8_t* DataUV() const noexcept {
@@ -50,6 +53,9 @@ struct DecodedFrame {
     const std::uint8_t* uv_plane{};
     std::shared_ptr<void> owner;
     std::int64_t queued_qpc{};
+    ID3D11Texture2D* texture{};
+    unsigned subresource{};
+    int (*copy_to_nv12)(void*, std::uint8_t*, std::size_t){};
 };
 
 } // namespace p2premote
