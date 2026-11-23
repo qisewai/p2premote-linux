@@ -579,6 +579,10 @@ HANDLE StreamSession::PresentEvent() const {
     return nullptr;
 }
 
+bool StreamSession::CanPresent() const noexcept {
+    return impl_->active && impl_->active->renderer && impl_->active->renderer->HasImage();
+}
+
 void StreamSession::ProcessEvents() {
     bool poll_cursor{};
     for (auto& event : impl_->active->events->Drain()) {
@@ -1078,6 +1082,11 @@ std::wstring StreamSession::Status() const {
 }
 
 StreamStatistics StreamSession::Statistics() const { return impl_->stats; }
+
+void StreamSession::VideoDimensions(unsigned& width, unsigned& height) const noexcept {
+    width = impl_->stats.width;
+    height = impl_->stats.height;
+}
 
 void StreamSession::ExportCsv(const std::filesystem::path& path) const {
     std::ofstream csv(path, std::ios::binary);

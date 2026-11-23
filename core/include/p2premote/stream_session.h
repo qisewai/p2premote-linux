@@ -69,6 +69,7 @@ public:
     HANDLE Event() const noexcept;
     HANDLE CaptureEvent() const noexcept;
     HANDLE PresentEvent() const;
+    bool CanPresent() const noexcept;
     void ProcessEvents();
     void Capture();
     void Present();
@@ -86,6 +87,7 @@ public:
     StreamState State() const noexcept;
     std::wstring Status() const;
     StreamStatistics Statistics() const;
+    void VideoDimensions(unsigned& width, unsigned& height) const noexcept;
     void ExportCsv(const std::filesystem::path& path) const;
 
 private:

@@ -63,7 +63,7 @@ PUBLIC_IPV4='203.0.113.10'
 
 ## 构建与运行
 
-目标运行环境为 Windows 11 x64 的 SDR 桌面，显卡需支持 D3D11。构建需要 Visual Studio 2022 的「使用 C++ 的桌面开发」工作负载、Windows SDK 10.0.22621.0 或更新版本，以及 CMake 3.23 或更新版本。实验 A 仅依赖 Windows SDK，`vcpkg.json` 暂无待安装的包。
+目标运行环境为 Windows 11 x64 的 SDR 桌面，显卡需支持 D3D11。构建需要 Visual Studio 2022 的「使用 C++ 的桌面开发」工作负载、Windows SDK 10.0.22621.0 或更新版本，以及 CMake 3.23 或更新版本。Win32 预设无需 vcpkg 依赖，Qt 6 客户端使用独立预设。
 
 在 Visual Studio Developer PowerShell 中构建并启动预览。
 
@@ -323,6 +323,23 @@ MiniRTC 主控端直接上传解码后的 NV12 两个平面，由 D3D11 执行 B
 用 `p2premote.exe --latency-trace <目录>` 启动两端，正常断开后会写出延迟 CSV。按输入序号对齐移动、左键和滚轮事件。被控端按帧号记录采集及提交，主控端按本机帧标识对齐 `minirtc_frame_assembled`、`minirtc_decoder_complete`、`minirtc_frame_queued` 与 `frame_present_begin`、`frame_present_submitted`。这些时间戳适合计算各自主机内的耗时。跨机输入时间需对齐时钟，端到端回显也可用变色测试图在主控端计时。
 
 `minirtc_send_queue_interval` 统计该报告周期内成功发送的普通视频 RTP 包。`id` 为样本数，`aux` 为累计队列等待微秒数，`flags` 为第 95 百分位的毫秒分桶。最高桶包含 100 ms 及以上。`frame_present_called` 和 `frame_present_submitted` 分别记录 DXGI `Present` 调用前和返回时的时间，与面板实际显示分开测量。
+
+### Qt 6 客户端
+
+Qt Widgets 客户端使用 `p2premote_core.dll` 的 [C ABI](core/include/p2premote/core_api.h) 访问账号、会话、D3D11 视频和 Lua 插件。两者在 Windows x64 上分别使用动态与静态 MSVC 运行库。Qt 界面通过 Windows 等待句柄驱动采集和呈现。Win32 客户端 `p2premote.exe` 仍可单独构建和部署。
+
+在 x64 Visual Studio 开发终端中设置 `VCPKG_ROOT`，指向已完成 `bootstrap-vcpkg.bat` 的 vcpkg 仓库。以下预设通过 vcpkg 的 `qt-ui` 特性安装 Qt 6，再构建和安装两个客户端。当前验证使用 Qt 6.11.3 和 vcpkg 提交 `277978ad2eddc3b05ecf288dcd33071968cd2f79`。
+
+```powershell
+cmake --preset windows-x64-qt
+cmake --build --preset windows-x64-qt-release --parallel
+ctest --preset windows-x64-qt-release
+cmake --install out/build/windows-x64-qt --prefix out/portable/p2premote-qt-win64
+```
+
+在安装目录运行 `p2premote_qt.exe`。选择「记住密码」后，成功登录的凭据按服务地址写入 Windows 凭据管理器。主窗口关闭可收起到系统托盘，托盘菜单可停止接收或退出程序。远控时 F11 切换全屏，鼠标移到窗口顶边可打开工具栏。点击画面接管键鼠后，按 F12 释放。
+
+便携目录的 `licenses/` 包含 vcpkg 提供的 Qt 与其依赖许可。Qt Base 的对应源码归档可在 [Qt 下载站](https://download.qt.io/archive/qt/6.11/6.11.3/submodules/) 获取，构建补丁来自 [vcpkg qtbase port](https://github.com/microsoft/vcpkg/tree/277978ad2eddc3b05ecf288dcd33071968cd2f79/ports/qtbase)。
 
 ## 计时口径
 

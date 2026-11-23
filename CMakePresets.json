@@ -16,6 +16,18 @@
         "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded",
         "CMAKE_TRY_COMPILE_CONFIGURATION": "Release"
       }
+    },
+    {
+      "name": "windows-x64-qt",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/windows-x64-qt",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "P2PREMOTE_BUILD_QT": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-release",
+        "VCPKG_HOST_TRIPLET": "x64-windows-release"
+      }
     }
   ],
   "buildPresets": [
@@ -28,12 +40,23 @@
       "name": "windows-x64-webrtc-release",
       "configurePreset": "windows-x64-webrtc",
       "configuration": "Release"
+    },
+    {
+      "name": "windows-x64-qt-release",
+      "configurePreset": "windows-x64-qt",
+      "configuration": "Release"
     }
   ],
   "testPresets": [
     {
       "name": "windows-x64-webrtc-release",
       "configurePreset": "windows-x64-webrtc",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-x64-qt-release",
+      "configurePreset": "windows-x64-qt",
       "configuration": "Release",
       "output": { "outputOnFailure": true }
     }

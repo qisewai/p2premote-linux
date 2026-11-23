@@ -377,37 +377,11 @@ private:
     }
 
     void OpenStream(bool host, p2premote::ConnectionOptions connection) {
-        if (ice_.stun_only && connection.relay_only) {
-            throw std::runtime_error("服务要求通过 TURN 中继，此会话无法使用 --stun-only");
-        }
+        p2premote::ApplyIceOverrides(connection, ice_.stun_url, ice_.stun_only);
         auto& stream = host ? host_ : viewer_;
         Cancel(stream);
         connection.ice_trace_dir = ice_.trace_directory;
         connection.latency_trace_dir = ice_.latency_trace_directory;
-        if (!ice_.stun_url.empty()) {
-            bool replaced{};
-            for (auto& server : connection.ice_servers) {
-                for (auto& url : server.urls) {
-                    if (url.starts_with("stun:")) {
-                        url = ice_.stun_url;
-                        replaced = true;
-                    }
-                }
-            }
-            if (!replaced) {
-                p2premote::IceServerOptions stun;
-                stun.urls.push_back(ice_.stun_url);
-                connection.ice_servers.insert(connection.ice_servers.begin(), std::move(stun));
-            }
-        }
-        if (ice_.stun_only) {
-            for (auto& server : connection.ice_servers) {
-                std::erase_if(server.urls, [](const std::string& url) {
-                    return url.starts_with("turn:") || url.starts_with("turns:");
-                });
-            }
-            std::erase_if(connection.ice_servers, [](const auto& server) { return server.urls.empty(); });
-        }
         const auto parent = window_;
         stream = std::jthread([this, parent, host, connection = std::move(connection)](std::stop_token stop) mutable {
             std::wstring error_text;

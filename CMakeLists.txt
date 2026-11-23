@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.23)
+option(P2PREMOTE_BUILD_QT "Build the Qt 6 Widgets frontend" OFF)
+if(P2PREMOTE_BUILD_QT)
+    list(APPEND VCPKG_MANIFEST_FEATURES qt-ui)
+endif()
 project(p2premote VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -48,6 +52,7 @@ add_library(core STATIC
     core/src/latency_trace.cpp
     core/src/connection_options.cpp
     core/src/service_identity.cpp
+    core/src/viewer_input.cpp
 )
 target_include_directories(core PUBLIC core/include PRIVATE "${P2PREMOTE_MINIRTC_DIR}" tools/minirtc_probe)
 target_compile_features(core PUBLIC cxx_std_20)
@@ -56,12 +61,27 @@ target_compile_options(core PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(core PUBLIC input_protocol PRIVATE plugin_host d3d11 dxgi d3dcompiler dxguid crypt32 windowsapp)
 
 add_library(stream_window STATIC viewer/stream_window.cpp)
+target_include_directories(stream_window PRIVATE core/src)
 target_link_libraries(stream_window PUBLIC core PRIVATE comdlg32 shell32 uxtheme)
 target_compile_options(stream_window PRIVATE /W4 /permissive- /utf-8)
 
-add_executable(p2premote WIN32 viewer/account_main.cpp viewer/account_api.cpp)
 include(cmake/curl-target.cmake)
-target_link_libraries(p2premote PRIVATE stream_window advapi32 windowsapp CURL::libcurl)
+add_library(account_service STATIC core/src/account_api.cpp)
+target_include_directories(account_service PRIVATE core/include)
+target_compile_features(account_service PRIVATE cxx_std_20)
+target_compile_definitions(account_service PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(account_service PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(account_service PRIVATE advapi32 windowsapp CURL::libcurl)
+
+add_library(p2premote_core SHARED core/src/core_account_api.cpp core/src/core_stream_api.cpp)
+target_include_directories(p2premote_core INTERFACE core/include)
+target_compile_definitions(p2premote_core PRIVATE P2PREMOTE_CORE_EXPORTS)
+target_compile_options(p2premote_core PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(p2premote_core PRIVATE core account_service comctl32)
+
+add_executable(p2premote WIN32 viewer/account_main.cpp)
+target_include_directories(p2premote PRIVATE core/src)
+target_link_libraries(p2premote PRIVATE stream_window account_service)
 target_compile_options(p2premote PRIVATE /W4 /permissive- /utf-8)
 target_link_options(p2premote PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 set_property(TARGET p2premote APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
@@ -73,7 +93,8 @@ add_custom_target(p2premote_minirtc_runtime
 add_dependencies(p2premote p2premote_minirtc_runtime)
 
 set(plugin_assets)
-foreach(plugin clipboard-sync shortcut-macros keyboard-sync adaptive-quality)
+set(P2PREMOTE_BUILTIN_PLUGINS clipboard-sync shortcut-macros keyboard-sync adaptive-quality)
+foreach(plugin IN LISTS P2PREMOTE_BUILTIN_PLUGINS)
     set(plugin_dir "${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}")
     set(plugin_output "$<TARGET_FILE_DIR:p2premote>/plugins/${plugin}")
     list(APPEND plugin_assets
@@ -87,6 +108,17 @@ add_custom_target(p2premote_plugins
         "${P2PREMOTE_LUA_NOTICE}" "$<TARGET_FILE_DIR:p2premote>/lua-notice.html"
     VERBATIM)
 add_dependencies(p2premote p2premote_plugins)
+add_dependencies(p2premote_core p2premote_minirtc_runtime p2premote_plugins)
+
+if(P2PREMOTE_BUILD_QT)
+    include(cmake/qt-frontend.cmake)
+endif()
+
+add_executable(core_api_test core/src/core_api_test.c)
+target_link_libraries(core_api_test PRIVATE p2premote_core)
+target_compile_options(core_api_test PRIVATE /W4 /utf-8)
+add_test(NAME core_api_test COMMAND core_api_test)
+set_tests_properties(core_api_test PROPERTIES TIMEOUT 12)
 
 add_executable(input_protocol_test proto/input_protocol_test.cpp)
 target_link_libraries(input_protocol_test PRIVATE input_protocol)

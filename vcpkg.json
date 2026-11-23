@@ -1,5 +1,12 @@
 {
   "name": "p2premote",
   "version-string": "0.1.0",
-  "dependencies": []
+  "features": {
+    "qt-ui": {
+      "description": "Qt 6 Widgets desktop frontend and Windows deployment tool",
+      "dependencies": [
+        { "name": "qtbase", "default-features": false, "features": ["widgets", "windeployqt"] }
+      ]
+    }
+  }
 }

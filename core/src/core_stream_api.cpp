@@ -1,0 +1,363 @@
+#include "core_api_internal.h"
+#include "viewer_input.h"
+
+#include <commctrl.h>
+#include <memory>
+
+using namespace p2premote;
+using namespace p2premote::abi;
+
+struct p2p_stream {
+    p2p_stream(bool host, ConnectionOptions connection, HWND parent)
+        : host(host), poll_cursor(host || !connection.video_cursor), session(host, std::move(connection)), input(session) {
+        if (host) return;
+        if (!parent || GetWindowThreadProcessId(parent, nullptr) != GetCurrentThreadId()) {
+            throw std::invalid_argument("视频窗口必须由当前线程创建");
+        }
+        move_timer.attach(CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_MODIFY_STATE | SYNCHRONIZE));
+        winrt::check_pointer(move_timer.get());
+        surface = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 0, 0,
+            parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+        winrt::check_pointer(surface);
+        if (!SetWindowSubclass(surface, SurfaceProc, 1, reinterpret_cast<DWORD_PTR>(this))) {
+            DestroyWindow(surface);
+            throw std::runtime_error("无法初始化视频窗口");
+        }
+        input.Attach(surface);
+        Resize(true);
+    }
+
+    ~p2p_stream() {
+        Guard([this] { session.Stop(L"已关闭"); });
+        if (surface) {
+            RemoveWindowSubclass(surface, SurfaceProc, 1);
+            DestroyWindow(surface);
+        }
+    }
+
+    void Resize(bool drawable) {
+        if (!surface) return;
+        RECT client{};
+        GetClientRect(GetParent(surface), &client);
+        SetWindowPos(surface, nullptr, 0, 0, client.right, client.bottom, SWP_NOACTIVATE | SWP_NOZORDER);
+        session.Resize(drawable && client.right > 0 && client.bottom > 0);
+    }
+
+    void SyncState() {
+        if (host) return;
+        input.RefreshReady();
+        input.RefreshLocalCursor();
+        const auto state = session.State();
+        if (state != surface_state) {
+            if (state == StreamState::waiting || state == StreamState::reconnecting) input.Reset();
+            surface_state = state;
+            if (surface) InvalidateRect(surface, nullptr, FALSE);
+        }
+    }
+
+    void SyncMoveTimer() {
+        if (!move_timer) return;
+        const auto delay = input.PendingMoveTimeoutMs();
+        if (delay == INFINITE) {
+            if (move_timer_armed) {
+                CancelWaitableTimer(move_timer.get());
+                move_timer_armed = false;
+            }
+            return;
+        }
+        if (move_timer_armed) return;
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(delay) * 10'000 - 1;
+        winrt::check_bool(SetWaitableTimer(move_timer.get(), &due, 0, nullptr, nullptr, FALSE));
+        move_timer_armed = true;
+    }
+
+    void PresentReadyFrame() {
+        if (host || pumping_video) return;
+        if (const auto present = session.PresentEvent();
+            present && WaitForSingleObject(present, 0) == WAIT_OBJECT_0) {
+            pumping_video = true;
+            try {
+                session.Present();
+            } catch (...) {
+                pumping_video = false;
+                throw;
+            }
+            pumping_video = false;
+        }
+    }
+
+    static LRESULT CALLBACK SurfaceProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+        UINT_PTR, DWORD_PTR context) {
+        auto& self = *reinterpret_cast<p2p_stream*>(context);
+        if (message == WM_NCDESTROY) {
+            self.surface = nullptr;
+            self.input.Attach(nullptr);
+            RemoveWindowSubclass(window, SurfaceProc, 1);
+        } else if (message == WM_NCHITTEST) {
+            // STATIC normally lets mouse input pass through to the Qt parent.
+            return DefWindowProcW(window, message, wparam, lparam);
+        } else if (message == WM_ERASEBKGND) {
+            return 1;
+        } else if (message == WM_PAINT) {
+            PAINTSTRUCT paint{};
+            const auto dc = BeginPaint(window, &paint);
+            unsigned width{}, height{};
+            self.session.VideoDimensions(width, height);
+            if (self.session.State() != StreamState::streaming || !width || !height) {
+                FillRect(dc, &paint.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            }
+            EndPaint(window, &paint);
+            return 0;
+        } else if ((message == WM_KEYDOWN || message == WM_KEYUP) && wparam == VK_F11) {
+            if (message == WM_KEYDOWN && !(lparam & (1L << 30))) {
+                PostMessageW(GetParent(window), P2P_VIDEO_FULLSCREEN_MESSAGE, 0, 0);
+            }
+            return 0;
+        } else {
+            try {
+                if (const auto result = self.input.OnSurfaceMessage(window, message, wparam, lparam)) {
+                    self.SyncMoveTimer();
+                    // Keep 60 fps frames presenting even while Qt drains a high-rate WM_MOUSEMOVE burst.
+                    if (message == WM_MOUSEMOVE) self.PresentReadyFrame();
+                    return *result;
+                }
+            } catch (...) {
+                ReportException();
+                Guard([&] {
+                    self.session.Stop(p2p_last_error());
+                    self.SyncState();
+                });
+                return 0;
+            }
+        }
+        return DefSubclassProc(window, message, wparam, lparam);
+    }
+
+    Apartment apartment{winrt::apartment_type::single_threaded};
+    bool host;
+    bool poll_cursor;
+    StreamSession session;
+    ViewerInput input;
+    HWND surface{};
+    StreamState surface_state{StreamState::idle};
+    winrt::handle move_timer;
+    bool move_timer_armed{};
+    bool pumping_video{};
+    std::wstring status, notice;
+    StreamStatistics stats;
+    std::vector<PluginMenuItem> menu;
+};
+
+p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host,
+    const wchar_t* remote_device, void* video_parent, const p2p_connection_options_v1* options) {
+    p2p_stream* stream{};
+    Guard([&] {
+        auto connection = GetConnection(account);
+        if (!host && (!remote_device || !*remote_device || !video_parent)) {
+            throw std::invalid_argument("请选择目标设备并创建视频窗口");
+        }
+        connection.auto_control = host && (!options || options->auto_control);
+        if (!host) connection.remote_device = remote_device;
+        if (options) {
+            if (options->ice_trace_directory && *options->ice_trace_directory) {
+                connection.ice_trace_dir = std::filesystem::absolute(options->ice_trace_directory);
+                std::filesystem::create_directories(connection.ice_trace_dir);
+            }
+            if (options->latency_trace_directory && *options->latency_trace_directory) {
+                connection.latency_trace_dir = std::filesystem::absolute(options->latency_trace_directory);
+                std::filesystem::create_directories(connection.latency_trace_dir);
+            }
+            ApplyIceOverrides(connection, options->stun_url ? options->stun_url : "", options->stun_only != 0);
+        }
+        stream = new p2p_stream(host != 0, std::move(connection), static_cast<HWND>(video_parent));
+    });
+    return stream;
+}
+
+void p2p_stream_destroy(p2p_stream* stream) { delete stream; }
+
+int32_t p2p_stream_start(p2p_stream* stream, void* monitor, uint32_t fps) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        if ((state.host && !monitor) || (!state.host && !state.surface) || (fps != 30 && fps != 60)) {
+            throw std::invalid_argument("无效的串流窗口、显示器或帧率");
+        }
+        state.session.Start(static_cast<HMONITOR>(monitor), state.surface, static_cast<StreamFrameRate>(fps));
+        state.SyncState();
+    });
+}
+
+int32_t p2p_stream_stop(p2p_stream* stream, const wchar_t* reason) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        state.session.Stop(reason ? reason : L"已断开");
+        state.SyncState();
+    });
+}
+
+int32_t p2p_stream_approve(p2p_stream* stream, int32_t desktop) {
+    return Guard([&] { Required(stream).session.Approve(desktop ? StreamInputMode::desktop : StreamInputMode::view_only); });
+}
+
+int32_t p2p_stream_quality(p2p_stream* stream, uint32_t quality) {
+    return Guard([&] {
+        if (quality < P2P_720P || quality > P2P_1440P) throw std::invalid_argument("无效的分辨率预设");
+        Required(stream).session.SetQuality(static_cast<StreamQuality>(quality));
+    });
+}
+
+int32_t p2p_stream_bitrate(p2p_stream* stream, uint32_t bitrate) {
+    return Guard([&] {
+        if (bitrate < P2P_ECONOMY || bitrate > P2P_DETAIL) throw std::invalid_argument("无效的画质预设");
+        Required(stream).session.SetVideoBitratePreset(static_cast<VideoBitratePreset>(bitrate));
+    });
+}
+
+int32_t p2p_stream_resize(p2p_stream* stream, int32_t drawable) {
+    return Guard([&] { Required(stream).Resize(drawable != 0); });
+}
+
+int32_t p2p_stream_display_changed(p2p_stream* stream) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        state.session.DisplayChanged();
+        if (state.session.DesktopControl()) state.session.Stop(L"显示配置已改变，已停止整桌面控制");
+        state.SyncState();
+    });
+}
+
+int32_t p2p_stream_tick(p2p_stream* stream) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        state.session.Tick();
+        if (!state.host) ViewerInput::UpdatePluginLocks(state.session);
+        state.SyncState();
+    });
+}
+
+int32_t p2p_stream_poll_cursor(p2p_stream* stream) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        if (state.poll_cursor && state.session.InputReady()) state.session.PollCursor();
+    });
+}
+
+int32_t p2p_stream_heartbeat(p2p_stream* stream) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        if (!state.host) state.input.Heartbeat();
+    });
+}
+
+int32_t p2p_stream_state(const p2p_stream* stream) {
+    return stream ? static_cast<int32_t>(stream->session.State()) : P2P_STOPPED;
+}
+
+int32_t p2p_stream_input_ready(const p2p_stream* stream) {
+    return stream && stream->session.InputReady();
+}
+
+void* p2p_stream_wait_handle(const p2p_stream* stream, uint32_t kind) {
+    HANDLE handle{};
+    Guard([&] {
+        const auto& state = Required(stream);
+        switch (kind) {
+        case P2P_WAIT_SESSION: handle = state.session.Event(); break;
+        case P2P_WAIT_CAPTURE: handle = state.session.CaptureEvent(); break;
+        case P2P_WAIT_PRESENT: handle = state.session.PresentEvent(); break;
+        case P2P_WAIT_INPUT: handle = state.move_timer.get(); break;
+        }
+    });
+    return handle;
+}
+
+int32_t p2p_stream_dispatch(p2p_stream* stream, uint32_t kind) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        switch (kind) {
+        case P2P_WAIT_SESSION:
+            if (state.session.Event()) {
+                state.session.ProcessEvents();
+                state.SyncState();
+                state.PresentReadyFrame();
+            }
+            break;
+        case P2P_WAIT_CAPTURE:
+            if (state.session.CaptureEvent()) state.session.Capture();
+            break;
+        case P2P_WAIT_PRESENT:
+            if (!state.pumping_video && (state.session.PresentEvent() || state.session.CanPresent())) {
+                state.pumping_video = true;
+                try {
+                    state.session.Present();
+                } catch (...) {
+                    state.pumping_video = false;
+                    throw;
+                }
+                state.pumping_video = false;
+            }
+            break;
+        case P2P_WAIT_INPUT:
+            state.move_timer_armed = false;
+            state.input.FlushPendingMove();
+            state.SyncMoveTimer();
+            break;
+        default: throw std::invalid_argument("无效的串流事件");
+        }
+    });
+}
+
+int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* snapshot) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        state.status = state.session.Status();
+        state.notice = state.session.PluginNotice();
+        auto& stats = state.stats;
+        stats = state.session.Statistics();
+        Required(snapshot) = {
+            state.status.c_str(), stats.video_codec.c_str(), state.notice.c_str(), stats.ice_protocol.c_str(),
+            stats.captured, stats.submitted, stats.received, stats.decoded, stats.presented,
+            stats.width, stats.height, stats.upload_bps.value_or(0), stats.download_bps.value_or(0),
+            static_cast<uint32_t>(stats.video_bitrate_limit_bps.value_or(0)),
+            static_cast<int32_t>(state.session.State()), static_cast<int32_t>(stats.ice_path),
+            state.session.DesktopControl(), state.session.InputReady(), state.session.HasPluginMenu(),
+            stats.srtp_active, stats.gpu_native, stats.gpu_conversion, stats.seconds, stats.ice_rtt_ms.value_or(-1),
+            stats.video_loss_fraction.value_or(-1), stats.capture_to_submit_ms, stats.draw_to_present_ms,
+            stats.packet_send_queue_ms.value_or(-1), stats.decoded_frame_wait_ms.value_or(-1)
+        };
+    });
+}
+
+size_t p2p_stream_read_menu(p2p_stream* stream) {
+    size_t size{};
+    Guard([&] {
+        auto& state = Required(stream);
+        state.menu = state.session.PluginMenu();
+        size = state.menu.size();
+    });
+    return size;
+}
+
+int32_t p2p_stream_menu_item(const p2p_stream* stream, size_t index, p2p_menu_item* item) {
+    return Guard([&] {
+        const auto& entry = Required(stream).menu.at(index);
+        Required(item) = {entry.label.c_str(), entry.id, entry.checked ? static_cast<int32_t>(*entry.checked) : -1};
+    });
+}
+
+int32_t p2p_stream_invoke_menu(p2p_stream* stream, uint32_t id) {
+    return Guard([&] {
+        auto& session = Required(stream).session;
+        ViewerInput::UpdatePluginLocks(session);
+        session.InvokePluginMenu(id);
+    });
+}
+
+int32_t p2p_stream_export_csv(p2p_stream* stream, const wchar_t* file) {
+    return Guard([&] {
+        if (!file || !*file) throw std::invalid_argument("缺少 CSV 文件路径");
+        Required(stream).session.ExportCsv(file);
+    });
+}

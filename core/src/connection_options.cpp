@@ -1,5 +1,7 @@
 #include <p2premote/connection_options.h>
 
+#include <algorithm>
+
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -74,6 +76,33 @@ ConnectionOptions ParseInternetConfig(std::wstring_view text) {
         return result;
     } catch (const winrt::hresult_error&) {
         throw std::invalid_argument("公网连接配置格式无效，请检查 signalUrl、accessToken 和 iceServers");
+    }
+}
+
+void ApplyIceOverrides(ConnectionOptions& connection, const std::string& stun_url, bool stun_only) {
+    if (stun_only && connection.relay_only) {
+        throw std::invalid_argument("服务要求通过 TURN 中继，此会话无法使用 --stun-only");
+    }
+    if (!stun_url.empty()) {
+        if (!stun_url.starts_with("stun:")) throw std::invalid_argument("--stun 需要以 stun: 开头");
+        bool replaced{};
+        for (auto& server : connection.ice_servers) {
+            for (auto& url : server.urls) {
+                if (url.starts_with("stun:")) {
+                    url = stun_url;
+                    replaced = true;
+                }
+            }
+        }
+        if (!replaced) connection.ice_servers.insert(connection.ice_servers.begin(), {{stun_url}, {}, {}});
+    }
+    if (stun_only) {
+        for (auto& server : connection.ice_servers) {
+            std::erase_if(server.urls, [](const std::string& url) {
+                return url.starts_with("turn:") || url.starts_with("turns:");
+            });
+        }
+        std::erase_if(connection.ice_servers, [](const auto& server) { return server.urls.empty(); });
     }
 }
 

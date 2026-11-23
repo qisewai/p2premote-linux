@@ -35,5 +35,6 @@ struct ConnectionOptions {
 };
 
 ConnectionOptions ParseInternetConfig(std::wstring_view text);
+void ApplyIceOverrides(ConnectionOptions& connection, const std::string& stun_url, bool stun_only);
 
 } // namespace p2premote
