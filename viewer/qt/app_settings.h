@@ -7,6 +7,7 @@
 #include <QStringList>
 #include <QVariant>
 #include <QVector>
+#include <optional>
 
 struct AppSettingsData {
     // Appearance
@@ -73,6 +74,8 @@ public:
     static QVector<PluginSettingSpec> discoverPlugins();
     static QJsonObject loadPluginConfig(const QString& plugin_id);
     static bool savePluginConfig(const QString& plugin_id, const QJsonObject& config);
+    static std::optional<bool> overlayVisibility(const QString& plugin_id);
+    static void setOverlayVisibility(const QString& plugin_id, bool visible);
 
 signals:
     void changed(const AppSettingsData& settings);

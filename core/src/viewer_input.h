@@ -2,6 +2,7 @@
 
 #include <p2premote/stream_session.h>
 
+#include <imm.h>
 #include <bitset>
 
 namespace p2premote {
@@ -9,8 +10,9 @@ namespace p2premote {
 class ViewerInput {
 public:
     explicit ViewerInput(StreamSession& session) : session_(session) {}
+    ~ViewerInput() { Attach(nullptr); }
 
-    void Attach(HWND surface) noexcept { surface_ = surface; }
+    void Attach(HWND surface) noexcept;
     void Reset();
     bool RefreshReady();
     void Heartbeat();
@@ -21,6 +23,8 @@ public:
     static void UpdatePluginLocks(StreamSession& session);
 
 private:
+    void BeginDirectKeyboardInput();
+    void EndDirectKeyboardInput() noexcept;
     void ReleaseViewerInput();
     void QueueMouseMove(const InputPacket& input);
     std::optional<InputPacket> PointInput(InputKind kind, std::uint16_t code, POINT point, bool clamp) const;
@@ -30,6 +34,8 @@ private:
 
     StreamSession& session_;
     HWND surface_{};
+    HKL previous_layout_{};
+    HIMC previous_ime_{};
     bool input_ready_{};
     std::optional<InputPacket> pending_move_;
     std::optional<std::pair<std::uint16_t, std::uint16_t>> last_move_sent_;

@@ -185,7 +185,7 @@ bool MiniRtcCall::Available(const ConnectionOptions& options) {
 }
 
 MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
-    bool allow_input, unsigned frame_rate, ID3D11Device* device)
+    bool allow_input, unsigned frame_rate, ID3D11Device* device, std::shared_ptr<PluginOverlays> overlays)
     : host_(host), allow_input_(allow_input), events_(std::move(events)), api_(NativeApi()), ice_(options.ice_servers) {
     device_.copy_from(device);
     if (!api_) throw std::runtime_error("MiniRTC 模块不可用，请确认 p2premote_minirtc.dll 位于程序目录");
@@ -215,7 +215,8 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
         try {
             plugins_ = std::make_unique<PluginHost>(host_, [this](std::string_view frame) {
                 return connected_.load() && api_->send_reliable(peer_, frame.data(), frame.size(), plugin_name) == 0;
-            }, std::filesystem::path{}, [events = events_] { events->Notify(); });
+            }, std::filesystem::path{}, [events = events_] { events->Notify(); }, std::filesystem::path{}, false,
+                std::move(overlays));
         } catch (...) {
             OutputDebugStringW(L"P2PRemote: could not start plugin worker\n");
         }

@@ -43,7 +43,7 @@ flowchart TB
 ### 防回环与隔离机制
 - **C++ 层防回环**：`ClipboardBridge` 写入剪贴板后记录 `GetClipboardSequenceNumber()`。进程内的插件会更新文本缓存，并跳过该序号的变更回调。
 - **Lua 层去重**：插件记录最近同步内容的 SHA-256 哈希，并在收到相同的本地文本时跳过写入。
-- **会话权限**：仅在已授权桌面控制、双端协商了插件轨道和数据 SRTP 时运行插件。
+- **会话权限**：跨端插件只在已授权桌面控制、双端协商了插件轨道和数据 SRTP 时运行。本地浮层插件在主控端运行，也适用于仅查看会话。
 - **路由隔离**：`PluginHost` 强制校验插件只能发送 `plugin_id == 自身 ID` 的消息，收到远端消息时仅投递给对应 `plugin_id` 的插件。
 
 ---
@@ -124,6 +124,18 @@ plugins/
 输入和菜单回调经有界队列跨线程传递。组合键最多 8 个键，文本最多 256 个 UTF-16 代码单元。两端在加密插件通道中确认批量输入能力，再通过可靠控制通道发送输入。Windows 前台应用和输入法决定实际可用的状态及注入行为。配置按插件 ID 和端角色保存到 `%LOCALAPPDATA%\P2PRemote\plugin-config\`，每份 JSON 上限 16 KiB。
 
 ### Phase 3（后续增量扩展）
+
+在主控插件清单中声明 `"roles": ["viewer"]` 和 `"permissions": ["overlay"]` 即可使用浮层 API。可选的 `overlay` 对象接受 `anchor`、`priority`、`default_visible`。锚点为 `top-left`、`top-center`、`top-right`、`bottom-left`、`bottom-center`、`bottom-right`。优先级数值越小，越先靠画面边缘排放。
+
+```lua
+p2p.overlay.set_text("连接状态") -- 本插件的 default slot
+p2p.overlay.set("clock", {text = "00:01:24.5", anchor = "top-right",
+    priority = 10, font_size = 12, opacity = 190, monospace = true,
+    text_color = "#ffffff", bg_color = "#27292d", visible = true})
+p2p.overlay.clear("clock") -- 省略参数时清除本插件的所有 slot
+```
+
+每插件最多 4 个 slot，每会话最多 16 个，单条 UTF-8 文本最多 1024 字节。`set` 和 `set_text` 返回是否接受更新。传入空文本或 `visible=false` 会隐藏当前 slot。脚本可以通过 `p2p.session.stats()` 读取本地视频和网络指标。带 `config` 权限时，主控浮层使用设置中心写入的插件配置。带 `channel` 权限的浮层插件走正常的跨端授权和通道，与本地浮层共享同一会话容量。
 
 - **`p2p.fs`（`"fs"`）**：受限下载目录流式读写 + 拖放事件（支撑文件传输插件）。
 - **`p2p.clipboard` 图片扩展**：支持 `CF_DIB` / PNG 截图同步与自动分片。

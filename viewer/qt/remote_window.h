@@ -55,7 +55,7 @@ private:
     QVBoxLayout* layout_{};
     QFrame* topbar_{};
     QTabBar* tabs_{};
-    QPushButton *add_tab_{}, *perf_pill_{};
+    QPushButton* add_tab_{};
     QPushButton *display_menu_{}, *audio_menu_{}, *plugins_menu_{}, *actions_menu_{}, *fullscreen_{};
     QPushButton *win_min_{}, *win_max_{}, *win_close_{};
     QStackedWidget* stack_{};
@@ -66,6 +66,5 @@ private:
     bool dwm_applied_{};
     bool fullscreen_mode_{};
     bool was_maximized_{};
-    bool show_diagnostics_{true};
     std::vector<RemoteSessionTab*> sessions_;
 };

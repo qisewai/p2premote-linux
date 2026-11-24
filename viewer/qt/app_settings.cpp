@@ -208,3 +208,15 @@ bool AppSettings::savePluginConfig(const QString& plugin_id, const QJsonObject& 
     emit instance().pluginConfigChanged(plugin_id);
     return true;
 }
+
+std::optional<bool> AppSettings::overlayVisibility(const QString& plugin_id) {
+    if (!isValidPluginId(plugin_id)) return std::nullopt;
+    const auto value = QSettings().value(QStringLiteral("overlay/%1/visible").arg(plugin_id));
+    return value.isValid() ? std::optional<bool>(value.toBool()) : std::nullopt;
+}
+
+void AppSettings::setOverlayVisibility(const QString& plugin_id, bool visible) {
+    if (!isValidPluginId(plugin_id)) return;
+    QSettings().setValue(QStringLiteral("overlay/%1/visible").arg(plugin_id), visible);
+    emit instance().pluginConfigChanged(plugin_id);
+}

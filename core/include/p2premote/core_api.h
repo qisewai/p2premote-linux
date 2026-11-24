@@ -145,6 +145,22 @@ P2P_CORE_API void* p2p_stream_wait_handle(const p2p_stream* stream, uint32_t kin
 P2P_CORE_API int32_t p2p_stream_dispatch(p2p_stream* stream, uint32_t kind);
 /* Snapshot text views expire at the next snapshot call or destruction. */
 P2P_CORE_API int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* snapshot);
+/* Text is owned by the stream until the next overlay text call or destruction. */
+P2P_CORE_API const wchar_t* p2p_stream_overlay_text(p2p_stream* stream);
+enum p2p_overlay_anchor {
+    P2P_OVERLAY_TOP_LEFT, P2P_OVERLAY_TOP_CENTER, P2P_OVERLAY_TOP_RIGHT,
+    P2P_OVERLAY_BOTTOM_LEFT, P2P_OVERLAY_BOTTOM_CENTER, P2P_OVERLAY_BOTTOM_RIGHT
+};
+typedef struct p2p_overlay_item_v1 {
+    const wchar_t *id, *plugin_id, *title, *text;
+    int32_t anchor, priority, font_size;
+    uint32_t bg_rgb, text_rgb; /* 0xRRGGBB, UINT32_MAX selects the default color. */
+    uint8_t opacity, monospace, visible, default_visible;
+} p2p_overlay_item_v1;
+/* Indexes, revision and text refer to the last read_overlays snapshot. */
+P2P_CORE_API size_t p2p_stream_read_overlays(p2p_stream* stream);
+P2P_CORE_API uint64_t p2p_stream_overlay_revision(const p2p_stream* stream);
+P2P_CORE_API int32_t p2p_stream_overlay_item(const p2p_stream* stream, size_t index, p2p_overlay_item_v1* item);
 P2P_CORE_API size_t p2p_stream_read_menu(p2p_stream* stream);
 /* Menu text views expire at the next read_menu call or destruction. */
 P2P_CORE_API int32_t p2p_stream_menu_item(const p2p_stream* stream, size_t index, p2p_menu_item* item);

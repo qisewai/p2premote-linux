@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <locale>
@@ -237,6 +238,8 @@ struct ActiveStream {
     std::shared_ptr<StreamEvents> events;
     std::unique_ptr<SignalSocket> signal;
     std::unique_ptr<MiniRtcCall> rtc;
+    std::unique_ptr<PluginHost> overlay_plugin;
+    std::shared_ptr<PluginOverlays> overlays;
     std::unique_ptr<AudioCapture> audio_capture;
     std::unique_ptr<AudioPlayer> audio_player;
     bool remote_speaker_enabled{true};
@@ -245,6 +248,7 @@ struct ActiveStream {
     std::unique_ptr<DesktopInput> desktop;
     winrt::com_ptr<ID3D11Device> device;
     std::unique_ptr<IVideoCapturer> capture;
+    std::unique_ptr<IVideoCapturer> dxgi_probe;
     std::unique_ptr<CapturePixels> pixels;
     std::unique_ptr<D3d11FrameDifference> frame_difference;
     std::shared_ptr<Nv12Frame> last_video;
@@ -268,6 +272,10 @@ struct ActiveStream {
     bool dxgi_capture{};
     bool dxgi_attempted{};
     bool dxgi_fallback_wgc{};
+    HRESULT dxgi_source_error{S_OK};
+    HRESULT dxgi_open_error{S_OK};
+    ULONGLONG dxgi_probe_due{};
+    ULONGLONG dxgi_probe_deadline{};
     ULONGLONG capture_retry_due{};
     ULONGLONG last_desktop_check{};
     bool redraw{};
@@ -325,8 +333,18 @@ struct ActiveStream {
         return true;
     }
 
-    const wchar_t* SharingStatus() const {
-        return dxgi_capture ? L"正在共享所选显示器 · DXGI 桌面复制" : L"正在共享所选显示器 · WGC";
+    std::wstring SharingStatus() const {
+        if (dxgi_capture) return L"正在共享所选显示器 · DXGI 桌面复制";
+        if (dxgi_fallback_wgc) return L"正在共享所选显示器 · WGC（DXGI 无法分离光标）";
+        if (FAILED(dxgi_source_error)) {
+            return std::format(L"正在共享所选显示器 · WGC（DXGI 采集源失效 0x{:08X}）",
+                static_cast<std::uint32_t>(dxgi_source_error));
+        }
+        if (FAILED(dxgi_open_error)) {
+            return std::format(L"正在共享所选显示器 · WGC（DXGI 初始化失败 0x{:08X}）",
+                static_cast<std::uint32_t>(dxgi_open_error));
+        }
+        return L"正在共享所选显示器 · WGC";
     }
 
     void ResetInput() {
@@ -401,25 +419,37 @@ struct StreamSession::Impl {
         return connection.desktop_duplication && !stream.dxgi_fallback_wgc;
     }
 
+    void UseDxgi(ActiveStream& stream, std::unique_ptr<IVideoCapturer> capture) noexcept {
+        stream.capture = std::move(capture);
+        stream.dxgi_capture = true;
+        stream.dxgi_fallback_wgc = false;
+        stream.dxgi_source_error = stream.dxgi_open_error = S_OK;
+        stream.dxgi_probe_due = 0;
+        stream.next_capture = 0;
+        stream.capture_retry_due = 0;
+    }
+
     bool TryStartDxgi(ActiveStream& stream, bool capture_cursor) noexcept {
         stream.dxgi_attempted = true;
+        stream.dxgi_probe.reset();
         if (stream.dxgi_capture) {
             // DXGI allows only one duplication per output in this process.
             stream.capture.reset();
             stream.dxgi_capture = false;
         }
         try {
-            stream.capture = StartDesktopDuplication(stream.monitor, stream.device.get(), capture_cursor);
-            stream.dxgi_capture = true;
-            stream.next_capture = 0;
-            stream.capture_retry_due = 0;
+            UseDxgi(stream, StartDesktopDuplication(stream.monitor, stream.device.get(), capture_cursor));
             return true;
+        } catch (const winrt::hresult_error& error) {
+            stream.dxgi_open_error = error.code().value;
         } catch (...) {
-            return false;
+            stream.dxgi_open_error = E_FAIL;
         }
+        return false;
     }
 
     bool StartBestCapture(ActiveStream& stream, bool capture_cursor, bool prefer_dxgi) noexcept {
+        stream.dxgi_probe.reset();
         SyncThreadToInputDesktop(attached_desktop, desktop_name);
         const bool secure = IsSecureDesktopName(desktop_name);
         if (prefer_dxgi || secure) {
@@ -429,6 +459,9 @@ struct StreamSession::Impl {
             try {
                 StartWgc(stream, capture_cursor);
                 stream.capture_retry_due = 0;
+                if (connection.desktop_duplication && stream.dxgi_open_error != DXGI_ERROR_UNSUPPORTED) {
+                    stream.dxgi_probe_due = GetTickCount64() + 2'000;
+                }
                 return true;
             } catch (...) {
                 capture_item = nullptr;
@@ -439,6 +472,30 @@ struct StreamSession::Impl {
         stream.capture.reset();
         stream.dxgi_capture = false;
         stream.capture_retry_due = GetTickCount64() + 200;
+        return false;
+    }
+
+    bool PollDxgiRecovery(ActiveStream& stream, ULONGLONG now_ms) noexcept {
+        if (!stream.capture || stream.dxgi_capture || !stream.dxgi_probe_due || now_ms < stream.dxgi_probe_due)
+            return false;
+        try {
+            if (!stream.dxgi_probe) {
+                stream.dxgi_probe = StartDesktopDuplication(stream.monitor, stream.device.get(), !stream.cursor_separate);
+                stream.dxgi_probe_deadline = now_ms + 3'000;
+            }
+            auto& probe = *stream.dxgi_probe;
+            probe.SetCursorCapture(!stream.cursor_separate);
+            probe.Poll();
+            if (!probe.IsSourceClosed() && probe.HasFrame() && probe.CanRestoreDxgi()) {
+                UseDxgi(stream, std::move(stream.dxgi_probe));
+                return true;
+            }
+            if (!probe.IsSourceClosed() && now_ms < stream.dxgi_probe_deadline) return false;
+        } catch (...) {
+            // Keep streaming WGC if the parallel DXGI probe fails.
+        }
+        stream.dxgi_probe.reset();
+        stream.dxgi_probe_due = now_ms + 8'000;
         return false;
     }
 
@@ -770,8 +827,9 @@ void StreamSession::ProcessEvents() {
                 impl_->detail = L"Host 已允许，正在建立视频连接";
                 active.negotiation_start = QpcNow();
                 active.device = CreateD3d11Device(true);
+                active.overlays = std::make_shared<PluginOverlays>();
                 active.rtc = std::make_unique<MiniRtcCall>(false, active.events, impl_->connection,
-                    event.payload == "control", 60, active.device.get());
+                    event.payload == "control", 60, active.device.get(), active.overlays);
             } else if (active.rtc && event.name == "minirtc" &&
                 (impl_->state == StreamState::negotiating || impl_->state == StreamState::streaming)) {
                 active.rtc->ReceiveSignal(event.payload);
@@ -796,6 +854,13 @@ void StreamSession::ProcessEvents() {
                     }
                 } else {
                     active.renderer = std::make_unique<D3d11Preview>(active.surface, active.device);
+                    try {
+                        active.overlay_plugin = std::make_unique<PluginHost>(false, PluginHost::SendFrame{},
+                            std::filesystem::path{}, PluginHost::Notify{}, std::filesystem::path{}, true, active.overlays);
+                        active.overlay_plugin->SetConnected(true);
+                    } catch (...) {
+                        OutputDebugStringW(L"P2PRemote: could not start connection status plugin\n");
+                    }
                 }
                 impl_->start = QpcNow();
                 impl_->state = StreamState::streaming;
@@ -838,15 +903,17 @@ void StreamSession::ProcessEvents() {
             stats.ice_path = rtc.ice_path;
             stats.ice_protocol = rtc.ice_protocol;
             stats.ice_rtt_ms = rtc.ice_rtt_ms;
-            if (const auto* call = active.rtc.get(); call && call->Plugins()) {
-                call->Plugins()->UpdateMetrics({stats.ice_path, stats.ice_rtt_ms, stats.video_loss_fraction, stats.download_bps});
-            }
             if (impl_->state == StreamState::streaming) {
                 if (!impl_->host) stats.decoded_replaced = active.rtc->ReplacedFrames();
                 stats.seconds = QpcMilliseconds(QpcNow() - impl_->start) / 1000;
                 impl_->samples.push_back(stats);
                 if (impl_->samples.size() > 3600) impl_->samples.pop_front();
             }
+            const PluginMetrics metrics{stats.ice_path, stats.ice_rtt_ms, stats.video_loss_fraction, stats.download_bps,
+                stats.upload_bps, stats.decoded_frame_wait_ms, stats.ice_protocol, stats.width, stats.height,
+                stats.seconds, stats.presented};
+            if (active.rtc && active.rtc->Plugins()) active.rtc->Plugins()->UpdateMetrics(metrics);
+            if (active.overlay_plugin) active.overlay_plugin->UpdateMetrics(metrics);
             break;
         }
         case StreamEventType::input_ready:
@@ -998,6 +1065,20 @@ std::wstring_view StreamSession::PluginNotice() const noexcept {
     return {};
 }
 
+std::wstring StreamSession::OverlayText() const {
+    const auto* active = impl_->active.get();
+    return active && active->overlay_plugin ? active->overlay_plugin->OverlayText() : std::wstring{};
+}
+
+void StreamSession::ReadOverlays(PluginOverlaySnapshot& snapshot) const {
+    const auto* active = impl_->active.get();
+    if (active && active->overlays && impl_->state == StreamState::streaming) {
+        active->overlays->Read(snapshot);
+    } else if (snapshot.revision) {
+        snapshot = {};
+    }
+}
+
 void StreamSession::ProcessPluginActions() {
     if (impl_->host || !InputReady()) return;
     auto& active = *impl_->active;
@@ -1095,8 +1176,13 @@ void StreamSession::Capture() {
     auto& active = *impl_->active;
     if (!active.capture) return;
     if (active.capture->IsSourceClosed()) {
-        if (active.dxgi_capture && active.capture->PreferFallbackCapture()) {
-            active.dxgi_fallback_wgc = true;
+        if (active.dxgi_capture) {
+            active.dxgi_fallback_wgc = active.capture->PreferFallbackCapture();
+            active.dxgi_source_error = active.capture->SourceError();
+            if (const auto& trace = active.events->Trace()) {
+                trace->Record("capture_dxgi_failed", static_cast<std::uint32_t>(active.dxgi_source_error),
+                    active.dxgi_fallback_wgc);
+            }
         }
         if (impl_->StartBestCapture(active, !active.cursor_separate, impl_->PreferDxgi(active))) {
             impl_->detail = active.SharingStatus();
@@ -1109,7 +1195,8 @@ void StreamSession::Capture() {
         const auto tolerance = active.capture_interval / 8;
         if (QpcNow() + tolerance < active.next_capture) return;
     }
-    impl_->stats.captured += active.capture->Poll().acquired;
+    // A recovered DXGI source already has a verified frame from the parallel probe.
+    impl_->stats.captured += active.capture->HasFrame() ? 1 : active.capture->Poll().acquired;
     const auto frame = active.capture->TakeFrame();
     if (!frame) {
         if (active.dxgi_capture && active.dynamic_cadence && active.last_video
@@ -1262,6 +1349,7 @@ void StreamSession::Tick() {
                 impl_->capture_monitor = nullptr;
                 active.dxgi_fallback_wgc = false;
                 active.dxgi_attempted = false;
+                active.dxgi_source_error = active.dxgi_open_error = S_OK;
                 if (impl_->StartBestCapture(active, !active.cursor_separate, impl_->PreferDxgi(active))) {
                     impl_->detail = active.SharingStatus();
                 } else {
@@ -1279,6 +1367,10 @@ void StreamSession::Tick() {
             if (impl_->StartBestCapture(active, !active.cursor_separate, impl_->PreferDxgi(active))) {
                 impl_->detail = active.SharingStatus();
             }
+        }
+        if (impl_->host && impl_->PollDxgiRecovery(active, now_ms)) {
+            impl_->detail = active.SharingStatus();
+            if (const auto& trace = active.events->Trace()) trace->Record("capture_dxgi_recovered", 0);
         }
         if (active.last_video && active.last_video_quality == active.quality
             && now - active.last_submit_qpc >= QpcFrequency() * 9 / 10) {

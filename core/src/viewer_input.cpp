@@ -4,12 +4,45 @@
 #include <p2premote/video_viewport.h>
 
 #include <windowsx.h>
+#include <algorithm>
 #include <utility>
+#include <vector>
 
 namespace p2premote {
 namespace {
 constexpr std::int64_t mouse_move_min_interval_ms = 4;
 constexpr std::int64_t drag_tail_delay_ms = 24;
+}
+
+void ViewerInput::Attach(HWND surface) noexcept {
+    if (surface_ == surface) return;
+    EndDirectKeyboardInput();
+    surface_ = surface;
+}
+
+void ViewerInput::BeginDirectKeyboardInput() {
+    if (previous_layout_ || !surface_) return;
+    previous_layout_ = GetKeyboardLayout(0);
+    previous_ime_ = ImmAssociateContext(surface_, nullptr);
+
+    const auto is_english = [](HKL layout) {
+        return PRIMARYLANGID(LOWORD(reinterpret_cast<ULONG_PTR>(layout))) == LANG_ENGLISH && !ImmIsIME(layout);
+    };
+    if (is_english(previous_layout_)) return;
+    const int count = GetKeyboardLayoutList(0, nullptr);
+    if (count <= 0) return;
+    std::vector<HKL> layouts(static_cast<std::size_t>(count));
+    layouts.resize(GetKeyboardLayoutList(count, layouts.data()));
+    const auto english = std::ranges::find_if(layouts, is_english);
+    if (english != layouts.end()) ActivateKeyboardLayout(*english, 0);
+}
+
+void ViewerInput::EndDirectKeyboardInput() noexcept {
+    const auto layout = std::exchange(previous_layout_, nullptr);
+    if (!layout) return;
+    if (GetKeyboardLayout(0) != layout) ActivateKeyboardLayout(layout, 0);
+    const auto ime = std::exchange(previous_ime_, nullptr);
+    if (IsWindow(surface_) && ime) ImmAssociateContext(surface_, ime);
 }
 
 void ViewerInput::Reset() {
@@ -23,8 +56,13 @@ bool ViewerInput::RefreshReady() {
     const auto ready = session_.InputReady();
     if (ready == input_ready_) return false;
     input_ready_ = ready;
-    if (ready) session_.SubmitInput({InputKind::heartbeat});
-    else ReleaseViewerInput();
+    if (ready) {
+        if (surface_ && GetFocus() == surface_) BeginDirectKeyboardInput();
+        session_.SubmitInput({InputKind::heartbeat});
+    } else {
+        EndDirectKeyboardInput();
+        ReleaseViewerInput();
+    }
     return true;
 }
 
@@ -89,7 +127,16 @@ void ViewerInput::RefreshLocalCursor() {
 
 std::optional<LRESULT> ViewerInput::OnSurfaceMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
+    case WM_SETFOCUS:
+        if (input_ready_) BeginDirectKeyboardInput();
+        break;
     case WM_KILLFOCUS:
+        EndDirectKeyboardInput();
+        ReleaseViewerInput();
+        break;
+    case WM_NCDESTROY:
+        Attach(nullptr);
+        break;
     case WM_CANCELMODE:
         ReleaseViewerInput();
         break;

@@ -40,6 +40,8 @@ public:
     [[nodiscard]] virtual HANDLE ReadyEvent() const noexcept = 0;
     [[nodiscard]] virtual bool IsSourceClosed() const noexcept = 0;
     [[nodiscard]] virtual bool PreferFallbackCapture() const noexcept { return false; }
+    [[nodiscard]] virtual HRESULT SourceError() const noexcept { return S_OK; }
+    [[nodiscard]] virtual bool CanRestoreDxgi() const noexcept { return false; }
     [[nodiscard]] virtual bool HasFrame() const noexcept = 0;
     virtual bool SetCursorCapture(bool enabled) noexcept = 0;
     virtual CaptureProgress Poll() = 0;

@@ -31,6 +31,7 @@ struct p2p_stream {
     }
 
     ~p2p_stream() {
+        input.Attach(nullptr);
         Guard([this] { session.Stop(L"已关闭"); });
         if (surface) {
             RemoveWindowSubclass(surface, SurfaceProc, 1);
@@ -42,6 +43,9 @@ struct p2p_stream {
         if (!surface) return;
         RECT client{};
         GetClientRect(GetParent(surface), &client);
+        if ((!drawable || client.right <= 0 || client.bottom <= 0) && GetFocus() == surface) {
+            SetFocus(GetAncestor(surface, GA_ROOT));
+        }
         SetWindowPos(surface, nullptr, 0, 0, client.right, client.bottom, SWP_NOACTIVATE | SWP_NOZORDER);
         session.Resize(drawable && client.right > 0 && client.bottom > 0);
     }
@@ -150,7 +154,8 @@ struct p2p_stream {
     bool move_timer_armed{};
     std::int64_t move_timer_deadline{};
     bool pumping_video{};
-    std::wstring status, notice;
+    std::wstring status, notice, overlay;
+    PluginOverlaySnapshot overlays;
     StreamStatistics stats;
     std::vector<PluginMenuItem> menu;
     std::deque<PluginUiCommand> ui_commands;
@@ -347,6 +352,39 @@ int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* snapshot
             stats.video_loss_fraction.value_or(-1), stats.capture_to_submit_ms, stats.draw_to_present_ms,
             stats.packet_send_queue_ms.value_or(-1), stats.decoded_frame_wait_ms.value_or(-1)
         };
+    });
+}
+
+const wchar_t* p2p_stream_overlay_text(p2p_stream* stream) {
+    const wchar_t* text = L"";
+    Guard([&] {
+        auto& state = Required(stream);
+        state.overlay = state.session.OverlayText();
+        text = state.overlay.c_str();
+    });
+    return text;
+}
+
+size_t p2p_stream_read_overlays(p2p_stream* stream) {
+    size_t size{};
+    Guard([&] {
+        auto& state = Required(stream);
+        state.session.ReadOverlays(state.overlays);
+        size = state.overlays.items.size();
+    });
+    return size;
+}
+
+uint64_t p2p_stream_overlay_revision(const p2p_stream* stream) {
+    return stream ? stream->overlays.revision : 0;
+}
+
+int32_t p2p_stream_overlay_item(const p2p_stream* stream, size_t index, p2p_overlay_item_v1* item) {
+    return Guard([&] {
+        const auto& entry = Required(stream).overlays.items.at(index);
+        Required(item) = {entry.id.c_str(), entry.plugin_id.c_str(), entry.title.c_str(), entry.text.c_str(),
+            static_cast<int32_t>(entry.anchor), entry.priority, entry.font_size, entry.bg_rgb, entry.text_rgb,
+            entry.opacity, entry.monospace, entry.visible, entry.default_visible};
     });
 }
 

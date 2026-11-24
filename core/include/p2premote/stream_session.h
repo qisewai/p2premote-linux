@@ -94,6 +94,8 @@ public:
     void UpdatePluginLockState(bool caps, bool num);
     bool PluginCapturesLockKeys() const noexcept;
     std::wstring_view PluginNotice() const noexcept;
+    std::wstring OverlayText() const;
+    void ReadOverlays(PluginOverlaySnapshot& snapshot) const;
 
     StreamState State() const noexcept;
     std::wstring Status() const;

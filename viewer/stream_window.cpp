@@ -66,10 +66,6 @@ const wchar_t* NetworkPath(IcePath path) {
     }
 }
 
-std::wstring Milliseconds(std::optional<double> value) {
-    return value ? std::format(L"{:.1f} ms", *value) : std::wstring(L"—");
-}
-
 BOOL CALLBACK AddScreen(HMONITOR monitor, HDC, LPRECT, LPARAM context) noexcept {
     try {
         reinterpret_cast<std::vector<HMONITOR>*>(context)->push_back(monitor);
@@ -158,10 +154,8 @@ public:
             input_.Attach(surface_);
             SetWindowLongPtrW(surface_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
             ShowWindow(surface_, SW_HIDE);
-            overlay_toggle_ = Control(L"BUTTON", L"诊断", BS_AUTOCHECKBOX | WS_TABSTOP, overlay_toggle);
+            overlay_toggle_ = Control(L"BUTTON", L"浮层", BS_AUTOCHECKBOX | WS_TABSTOP, overlay_toggle);
             SendMessageW(overlay_toggle_, BM_SETCHECK, BST_CHECKED, 0);
-            overlay_ = p2premote::viewer::CreateConnectionOverlay(surface_);
-            winrt::check_pointer(overlay_);
         }
 
         Layout();
@@ -479,27 +473,16 @@ private:
     }
 
     void UpdateOverlay(const StreamStatistics& stats) {
-        if (!overlay_) return;
+        if (host_) return;
         if (session_.State() != StreamState::streaming || IsIconic(window_)
             || SendMessageW(overlay_toggle_, BM_GETCHECK, 0, 0) != BST_CHECKED) {
-            ShowWindow(overlay_, SW_HIDE);
+            overlays_.Hide();
             return;
         }
-        p2premote::viewer::PlaceConnectionOverlay(overlay_, stats.width, stats.height, 200, 174);
-
-        const auto seconds = static_cast<std::uint64_t>(stats.seconds);
-        const auto fps = presented_fps_ ? std::format(L"{:.1f}", *presented_fps_) : std::wstring(L"—");
-        const auto loss = loss_rate_ ? std::format(L"{:.1f}%", *loss_rate_) : std::wstring(L"—");
-        auto text = std::format(L"{:02}:{:02}:{:02}\r\n{} {}\r\n{} fps\r\n↓ {}\r\n↑ {}\r\n"
-                                L"RTT {}\r\n帧等待 {}\r\n丢包 {}\r\n{} × {}",
-            seconds / 3600, seconds / 60 % 60, seconds % 60, NetworkProtocol(stats.ice_protocol), NetworkPath(stats.ice_path),
-            fps, down_rate_.empty() ? L"—" : down_rate_, up_rate_.empty() ? L"—" : up_rate_, Milliseconds(stats.ice_rtt_ms),
-            Milliseconds(stats.decoded_frame_wait_ms), loss, stats.width, stats.height);
-        if (text != visible_overlay_) {
-            SetWindowTextW(overlay_, text.c_str());
-            visible_overlay_ = std::move(text);
-            InvalidateRect(overlay_, nullptr, FALSE);
-        }
+        session_.ReadOverlays(overlay_snapshot_);
+        auto items = overlay_snapshot_.items;
+        for (auto& item : items) item.visible = item.visible && item.default_visible;
+        overlays_.Render(surface_, stats.width, stats.height, items);
     }
 
     bool Measure() {
@@ -674,14 +657,14 @@ private:
     HWND placeholder_{};
     HWND overlay_toggle_{};
     HWND plugins_{};
-    HWND overlay_{};
+    p2premote::viewer::OverlayManager overlays_;
     bool video_visible_{};
     bool input_ready_{};
     bool hotkey_{};
     std::vector<HMONITOR> monitors_;
     StreamStatistics previous_;
     std::wstring visible_status_;
-    std::wstring visible_overlay_;
+    p2premote::PluginOverlaySnapshot overlay_snapshot_;
     std::wstring rate_text_;
     std::wstring up_rate_;
     std::wstring down_rate_;

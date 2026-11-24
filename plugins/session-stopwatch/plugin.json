@@ -1,0 +1,27 @@
+{
+  "id": "session-stopwatch",
+  "name": "会话秒表",
+  "version": "1.0.0",
+  "description": "显示本次连接的实际经过时间。",
+  "enabled": true,
+  "roles": ["viewer"],
+  "permissions": ["overlay"],
+  "entry": "main.lua",
+  "overlay": { "anchor": "top-right", "priority": 10, "default_visible": false },
+  "settings": [
+    { "key": "font_size", "type": "int", "label": "字号", "min": 9, "max": 20, "default": 12, "suffix": " px" },
+    { "key": "opacity", "type": "int", "label": "不透明度", "min": 0, "max": 255, "default": 190 },
+    {
+      "key": "anchor", "type": "select", "label": "显示位置", "default": "plugin",
+      "options": [
+        { "value": "plugin", "label": "跟随插件" },
+        { "value": "top-left", "label": "左上" },
+        { "value": "top-center", "label": "上方居中" },
+        { "value": "top-right", "label": "右上" },
+        { "value": "bottom-left", "label": "左下" },
+        { "value": "bottom-center", "label": "下方居中" },
+        { "value": "bottom-right", "label": "右下" }
+      ]
+    }
+  ]
+}

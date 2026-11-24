@@ -74,24 +74,6 @@ QIcon statusDotIcon(const QColor& color) {
     return QIcon(pix);
 }
 
-QString route(int path) {
-    switch (path) {
-    case P2P_ICE_HOST: return QStringLiteral("主机直连");
-    case P2P_ICE_NAT: return QStringLiteral("NAT 直连");
-    case P2P_ICE_RELAY: return QStringLiteral("TURN 中继");
-    default: return QStringLiteral("获取链路中");
-    }
-}
-
-QString milliseconds(double value) {
-    return value < 0 ? QStringLiteral("—") : QStringLiteral("%1 ms").arg(value, 0, 'f', 1);
-}
-
-QString bandwidth(uint32_t value) {
-    if (value < 1000000) return QStringLiteral("%1 Kbps").arg(value / 1000.0, 0, 'f', 1);
-    return QStringLiteral("%1 Mbps").arg(value / 1000000.0, 0, 'f', 1);
-}
-
 } // namespace
 
 class RemoteSessionTab final : public QWidget {
@@ -115,16 +97,21 @@ public:
             state_ = P2P_STOPPED;
             return;
         }
-        overlay_ = p2premote::viewer::CreateConnectionOverlay(reinterpret_cast<HWND>(video_->winId()));
-        if (!overlay_) qWarning("Unable to create connection overlay (error %lu)", GetLastError());
-
         const auto& defaults = AppSettings::instance().data();
         quality_index_ = defaults.default_quality;
         bitrate_index_ = defaults.default_bitrate;
         speaker_enabled_ = defaults.speaker_enabled;
         speaker_volume_ = static_cast<float>(defaults.speaker_volume) / 100.0f;
         mic_fallback_ = defaults.mic_fallback;
-        show_overlay_ = defaults.show_diagnostics;
+        connect(&overlay_timer_, &QTimer::timeout, this, [this] {
+            updateConnectionOverlays(false);
+        });
+        connect(&AppSettings::instance(), &AppSettings::changed, this, [this](const AppSettingsData&) {
+            updateConnectionOverlays();
+        });
+        connect(&AppSettings::instance(), &AppSettings::pluginConfigChanged, this, [this](const QString& id) {
+            if (overlay_configs_.erase(id.toStdWString())) updateConnectionOverlays();
+        });
 
         dialogs_ = new PluginDialogManager(dialog_parent, this);
         connect(driver_.get(), &StreamDriver::changed, this, [this](const p2p_stream_snapshot_v1& snap) {
@@ -156,17 +143,28 @@ public:
     bool micFallback() const { return mic_fallback_; }
     const QString& statusText() const { return status_text_; }
     const QString& noticeText() const { return notice_text_; }
-    const QString& pillText() const { return pill_text_; }
 
-    void showDiagnostics(bool enabled) {
-        show_overlay_ = enabled;
-        if (!overlay_) return;
-        if (!enabled || overlay_text_.isEmpty()) {
-            ShowWindow(overlay_, SW_HIDE);
-            return;
+    bool refreshOverlayItems() {
+        using namespace p2premote;
+        if (!handle()) return false;
+        const auto count = p2p_stream_read_overlays(handle());
+        const auto revision = p2p_stream_overlay_revision(handle());
+        if (revision == overlay_revision_) return false;
+        overlay_revision_ = revision;
+        overlay_dirty_ = true;
+        overlay_items_.clear();
+        for (std::size_t i = 0; i < count; ++i) {
+            p2p_overlay_item_v1 item{};
+            if (p2p_stream_overlay_item(handle(), i, &item) == P2P_OK) {
+                overlay_items_.push_back({item.id, item.plugin_id, item.title, item.text,
+                    static_cast<OverlayAnchor>(item.anchor), item.priority, item.font_size, item.bg_rgb, item.text_rgb,
+                    item.opacity, item.monospace != 0, item.visible != 0, item.default_visible != 0});
+            }
         }
-        p2premote::viewer::PlaceConnectionOverlay(overlay_, width_, height_, 146, 192);
+        return true;
     }
+
+    const auto& overlayItems() const { return overlay_items_; }
 
     QString tabTitle() const {
         if (playing() && width_ && height_) {
@@ -248,7 +246,7 @@ public:
 
     void syncVideo() {
         if (driver_) driver_->resize(video_->isVisible() && !window()->isMinimized());
-        showDiagnostics(show_overlay_);
+        updateConnectionOverlays();
     }
 
 protected:
@@ -261,6 +259,34 @@ protected:
     }
 
 private:
+    void updateConnectionOverlays(bool force = true) {
+        if (!AppSettings::instance().data().show_diagnostics || !playing() || !video_->isVisible() || window()->isMinimized()) {
+            overlay_timer_.stop();
+            overlays_.Hide();
+            return;
+        }
+        if (!overlay_timer_.isActive()) overlay_timer_.start(100);
+        refreshOverlayItems();
+        if (!overlay_dirty_ && !force) return;
+        auto items = overlay_items_;
+        for (auto& item : items) {
+            const auto [it, added] = overlay_configs_.try_emplace(item.plugin_id);
+            if (added) {
+                const auto id = QString::fromStdWString(item.plugin_id);
+                it->second = {AppSettings::loadPluginConfig(id), AppSettings::overlayVisibility(id)};
+            }
+            const auto& [settings, enabled] = it->second;
+            item.visible = item.visible && enabled.value_or(item.default_visible);
+            if (const auto anchor = p2premote::ParseOverlayAnchor(settings.value(QStringLiteral("anchor")).toString().toStdString())) {
+                item.anchor = *anchor;
+            }
+            item.font_size = std::clamp(settings.value(QStringLiteral("font_size")).toInt(item.font_size), 9, 20);
+            item.opacity = static_cast<std::uint8_t>(std::clamp(settings.value(QStringLiteral("opacity")).toInt(item.opacity), 0, 255));
+        }
+        overlays_.Render(reinterpret_cast<HWND>(video_->winId()), width_, height_, items);
+        overlay_dirty_ = false;
+    }
+
     void onSnapshot(const p2p_stream_snapshot_v1& snapshot) {
         state_ = snapshot.state;
         seconds_ = snapshot.seconds;
@@ -277,42 +303,7 @@ private:
         if (snapshot.input_ready) status_text_ += QStringLiteral("  ·  点击画面接管键鼠，F12 释放");
         notice_text_ = *snapshot.plugin_notice ? QString::fromWCharArray(snapshot.plugin_notice) : QString{};
 
-        QString overlay_text;
-        pill_text_.clear();
-        if (playing() && snapshot.width && snapshot.height) {
-            if (snapshot.seconds > previous_seconds_ && snapshot.presented >= previous_frames_) {
-                fps_ = (snapshot.presented - previous_frames_) / (snapshot.seconds - previous_seconds_);
-                previous_frames_ = snapshot.presented;
-                previous_seconds_ = snapshot.seconds;
-            }
-            const auto protocol = QString::fromUtf8(snapshot.ice_protocol).toUpper();
-            const auto path = protocol.isEmpty() ? route(snapshot.ice_path)
-                : protocol + QStringLiteral(" ") + route(snapshot.ice_path);
-            const auto loss = snapshot.loss_fraction < 0 ? QStringLiteral("—")
-                : QStringLiteral("%1%").arg(snapshot.loss_fraction * 100.0, 0, 'f', 1);
-            pill_text_ = QStringLiteral("%1×%2 · %3 fps · %4")
-                .arg(snapshot.width).arg(snapshot.height).arg(fps_, 0, 'f', 0).arg(milliseconds(snapshot.rtt_ms));
-            const auto elapsed = static_cast<quint64>(snapshot.seconds);
-            const auto duration = QStringLiteral("%1:%2:%3").arg(elapsed / 3600, 2, 10, QLatin1Char('0'))
-                .arg(elapsed / 60 % 60, 2, 10, QLatin1Char('0')).arg(elapsed % 60, 2, 10, QLatin1Char('0'));
-            const auto missing = QStringLiteral("—");
-            overlay_text = QStringLiteral("%1\r\n%2\r\n%3 fps\r\n↓ %4\r\n↑ %5\r\nRTT %6\r\n帧等待 %7\r\n丢包 %8\r\n%9 × %10")
-                .arg(duration, path, snapshot.seconds > 0 ? QString::number(fps_, 'f', 0) : missing,
-                    snapshot.seconds > 0 ? bandwidth(snapshot.download_bps) : missing,
-                    snapshot.seconds > 0 ? bandwidth(snapshot.upload_bps) : missing, milliseconds(snapshot.rtt_ms),
-                    milliseconds(snapshot.decoded_frame_wait_ms), loss)
-                .arg(snapshot.width).arg(snapshot.height);
-            if (*snapshot.codec) overlay_text += QStringLiteral("\r\n") + QString::fromWCharArray(snapshot.codec);
-        } else {
-            previous_seconds_ = fps_ = 0;
-            previous_frames_ = 0;
-        }
-        if (overlay_ && overlay_text_ != overlay_text) {
-            overlay_text_ = std::move(overlay_text);
-            SetWindowTextW(overlay_, reinterpret_cast<LPCWSTR>(overlay_text_.utf16()));
-            InvalidateRect(overlay_, nullptr, FALSE);
-        }
-        showDiagnostics(show_overlay_);
+        updateConnectionOverlays();
         if (on_changed_) on_changed_();
     }
 
@@ -333,14 +324,14 @@ private:
     float speaker_volume_{1.0f};
     bool mic_fallback_{true};
     bool tab_focused_{true};
-    double previous_seconds_{}, fps_{};
-    uint64_t previous_frames_{};
     QString status_text_{QStringLiteral("正在连接设备…")};
     QString notice_text_;
-    HWND overlay_{};
-    bool show_overlay_{true};
-    QString overlay_text_;
-    QString pill_text_;
+    QTimer overlay_timer_;
+    p2premote::viewer::OverlayManager overlays_;
+    std::uint64_t overlay_revision_{};
+    bool overlay_dirty_{};
+    std::vector<p2premote::PluginOverlayItem> overlay_items_;
+    std::map<std::wstring, std::pair<QJsonObject, std::optional<bool>>> overlay_configs_;
 };
 
 RemoteWindow::RemoteWindow(QWidget* parent)
@@ -350,7 +341,6 @@ RemoteWindow::RemoteWindow(QWidget* parent)
     setWindowTitle(QStringLiteral("P2P Remote"));
     setMinimumSize(820, 480);
     resize(1160, 720);
-    show_diagnostics_ = AppSettings::instance().data().show_diagnostics;
 
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
@@ -384,11 +374,6 @@ RemoteWindow::RemoteWindow(QWidget* parent)
     top->addWidget(add_tab_);
     top->addStretch(1);
 
-    perf_pill_ = new QPushButton(topbar_);
-    perf_pill_->setObjectName(QStringLiteral("perfPill"));
-    perf_pill_->setToolTip(QStringLiteral("显示或隐藏画面右下角的连接信息"));
-    perf_pill_->hide();
-    top->addWidget(perf_pill_);
 
     auto addMenuBtn = [&](const QString& label) {
         auto* btn = new QPushButton(label, topbar_);
@@ -450,10 +435,6 @@ RemoteWindow::RemoteWindow(QWidget* parent)
             owner->activateWindow();
         }
     });
-    connect(perf_pill_, &QPushButton::clicked, this, [this] {
-        show_diagnostics_ = !show_diagnostics_;
-        refreshChrome();
-    });
     connect(display_menu_, &QPushButton::clicked, this, &RemoteWindow::showDisplayMenu);
     connect(audio_menu_, &QPushButton::clicked, this, &RemoteWindow::showAudioMenu);
     connect(plugins_menu_, &QPushButton::clicked, this, &RemoteWindow::showPluginsMenu);
@@ -466,10 +447,6 @@ RemoteWindow::RemoteWindow(QWidget* parent)
         syncWindowControls();
     });
     connect(win_close_, &QPushButton::clicked, this, &QWidget::close);
-    connect(&AppSettings::instance(), &AppSettings::changed, this, [this](const AppSettingsData& next) {
-        show_diagnostics_ = next.show_diagnostics;
-        refreshChrome();
-    });
 
     auto* shortcut = new QShortcut(QKeySequence(Qt::Key_F11), this);
     shortcut->setAutoRepeat(false);
@@ -641,7 +618,6 @@ void RemoteWindow::refreshChrome() {
     auto* current = currentSession();
     if (!current) {
         setWindowTitle(QStringLiteral("P2P Remote"));
-        perf_pill_->hide();
         display_menu_->setEnabled(false);
         audio_menu_->setEnabled(false);
         plugins_menu_->setEnabled(false);
@@ -667,21 +643,11 @@ void RemoteWindow::refreshChrome() {
         audio_menu_->style()->polish(audio_menu_);
     }
 
-    const auto& pill = current->pillText();
-    if (!pill.isEmpty()) {
-        if (perf_pill_->text() != pill) perf_pill_->setText(pill);
-        perf_pill_->show();
-    } else {
-        perf_pill_->hide();
-    }
-
     QString left = current->statusText();
     if (!current->noticeText().isEmpty()) {
         left += QStringLiteral("  ·  ") + current->noticeText();
     }
     if (status_text_->text() != left) status_text_->setText(left);
-
-    current->showDiagnostics(show_diagnostics_);
 
     const bool need_statusbar = !fullscreen_mode_
         && (!current->playing() || !current->noticeText().isEmpty());
@@ -787,13 +753,29 @@ void RemoteWindow::showDisplayMenu() {
     }
 
     menu->addSeparator();
-    auto* diag = menu->addAction(QStringLiteral("显示右下角连接信息"));
-    diag->setCheckable(true);
-    diag->setChecked(show_diagnostics_);
-    connect(diag, &QAction::toggled, this, [this](bool checked) {
-        show_diagnostics_ = checked;
-        refreshChrome();
+    auto* overlays = menu->addMenu(QStringLiteral("画面浮层"));
+    auto* hide = overlays->addAction(QStringLiteral("隐藏全部浮层"));
+    hide->setCheckable(true);
+    hide->setChecked(!AppSettings::instance().data().show_diagnostics);
+    connect(hide, &QAction::toggled, this, [](bool checked) {
+        auto& settings = AppSettings::instance();
+        auto next = settings.data();
+        next.show_diagnostics = !checked;
+        settings.save(next);
     });
+    session->refreshOverlayItems();
+    std::map<std::wstring, const p2premote::PluginOverlayItem*> plugins;
+    for (const auto& item : session->overlayItems()) plugins.try_emplace(item.plugin_id, &item);
+    if (!plugins.empty()) overlays->addSeparator();
+    for (const auto& [plugin, item] : plugins) {
+        const auto id = QString::fromStdWString(plugin);
+        auto* toggle = overlays->addAction(QString::fromStdWString(item->title));
+        toggle->setCheckable(true);
+        toggle->setChecked(AppSettings::overlayVisibility(id).value_or(item->default_visible));
+        connect(toggle, &QAction::toggled, this, [id](bool checked) {
+            AppSettings::setOverlayVisibility(id, checked);
+        });
+    }
 
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
     menu->popup(display_menu_->mapToGlobal(QPoint(0, display_menu_->height())));

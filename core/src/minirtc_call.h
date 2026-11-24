@@ -21,12 +21,13 @@
 namespace p2premote {
 
 class PluginHost;
+class PluginOverlays;
 
 class MiniRtcCall final {
 public:
     static bool Available(const ConnectionOptions& options);
     MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
-        bool allow_input, unsigned frame_rate, ID3D11Device* device);
+        bool allow_input, unsigned frame_rate, ID3D11Device* device, std::shared_ptr<PluginOverlays> overlays = {});
     ~MiniRtcCall();
 
     void ReceiveSignal(const std::string& payload);

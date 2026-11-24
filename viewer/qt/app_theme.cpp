@@ -460,19 +460,6 @@ QTabBar#remoteTabs::tab:selected {
     border-top: 2px solid %ACCENT%;
     font-weight: 600;
 }
-QPushButton#perfPill {
-    background: %SURFACE_ALT%;
-    color: %TEXT_SEC%;
-    border: 1px solid %BORDER%;
-    border-radius: 11px;
-    padding: 2px 10px;
-    min-height: 18px;
-    font-size: 12px;
-}
-QPushButton#perfPill:hover {
-    background: %SURF_HOVER%;
-    color: %TEXT%;
-}
 QPushButton#barAddBtn {
     background: transparent;
     color: %TEXT_SEC%;

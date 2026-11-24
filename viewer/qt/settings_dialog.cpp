@@ -258,7 +258,7 @@ QWidget* SettingsDialog::buildStreamAudioPage() {
     vform->addRow(QStringLiteral("默认画质码率"), bitrate_combo_);
 
     video_layout->addLayout(vform);
-    show_diagnostics_ = new QCheckBox(QStringLiteral("默认显示画面右下角连接诊断信息（FPS / RTT / 丢包）"), video_card);
+    show_diagnostics_ = new QCheckBox(QStringLiteral("显示画面浮层"), video_card);
     video_layout->addWidget(show_diagnostics_);
     layout->addWidget(video_card);
 

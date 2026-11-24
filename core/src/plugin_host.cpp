@@ -5,6 +5,8 @@
 #include "plugin_settings.h"
 #include "pty_session.h"
 
+#include <charconv>
+
 #include <p2premote/plugin_protocol.h>
 
 #include <bcrypt.h>
@@ -33,6 +35,40 @@
 
 namespace p2premote {
 namespace {
+std::atomic_uint64_t overlay_revision{1};
+}
+
+bool PluginOverlays::Set(PluginOverlayItem item) {
+    const std::lock_guard lock(mutex_);
+    auto& items = snapshot_.items;
+    const auto existing = std::ranges::find(items, item.id, &PluginOverlayItem::id);
+    if (existing != items.end()) {
+        if (*existing == item) return true;
+        *existing = std::move(item);
+    } else {
+        if (items.size() >= 16 || std::ranges::count(items, item.plugin_id, &PluginOverlayItem::plugin_id) >= 4)
+            return false;
+        items.push_back(std::move(item));
+    }
+    snapshot_.revision = overlay_revision.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void PluginOverlays::Clear(std::wstring_view plugin_id, std::wstring_view id) {
+    const std::lock_guard lock(mutex_);
+    if (std::erase_if(snapshot_.items, [&](const auto& item) {
+            return item.plugin_id == plugin_id && (id.empty() || item.id == id);
+        })) {
+        snapshot_.revision = overlay_revision.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void PluginOverlays::Read(PluginOverlaySnapshot& snapshot) const {
+    const std::lock_guard lock(mutex_);
+    if (snapshot.revision != snapshot_.revision) snapshot = snapshot_;
+}
+
+namespace {
 
 using winrt::Windows::Data::Json::JsonObject;
 using winrt::Windows::Data::Json::IJsonObjectStatics;
@@ -60,6 +96,8 @@ struct Manifest {
     bool video{};
     bool fs{};
     bool pty{};
+    bool overlay{};
+    PluginOverlayItem overlay_defaults;
 };
 
 void Log(std::string_view id, std::string_view level, std::string_view message) noexcept {
@@ -125,7 +163,19 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
         else if (name == L"video") manifest.video = true;
         else if (name == L"fs") manifest.fs = true;
         else if (name == L"pty") manifest.pty = true;
+        else if (name == L"overlay") manifest.overlay = true;
         else throw std::runtime_error("Unknown plugin permission");
+    }
+    if (manifest.overlay) {
+        auto& item = manifest.overlay_defaults;
+        item.plugin_id.assign(manifest.id.begin(), manifest.id.end());
+        item.title = json.GetNamedString(L"name", winrt::to_hstring(manifest.id));
+        if (const auto settings = json.GetNamedObject(L"overlay", nullptr)) {
+            item.anchor = ParseOverlayAnchor(winrt::to_string(settings.GetNamedString(L"anchor", L"bottom-right")))
+                .value_or(OverlayAnchor::bottom_right);
+            item.priority = static_cast<int>(std::clamp(settings.GetNamedNumber(L"priority", 100), -1000.0, 1000.0));
+            item.default_visible = settings.GetNamedBoolean(L"default_visible", true);
+        }
     }
     const auto filename = winrt::to_string(json.GetNamedString(L"entry"));
     if (!filename.ends_with(".lua") || !IsPluginIdentifier(std::string_view(filename).substr(0, filename.size() - 4))) {
@@ -809,8 +859,10 @@ class LuaPlugin;
 class PluginRuntime {
 public:
     PluginRuntime(bool host, const PluginHost::SendFrame& send, const std::atomic_bool& connected,
-        Workspace& workspace, std::filesystem::path config_root, HANDLE wake)
-        : host(host), workspace(workspace), config_root(std::move(config_root)), wake(wake), send_(send), connected_(connected) {}
+        Workspace& workspace, std::filesystem::path config_root, HANDLE wake, bool local_overlay,
+        PluginOverlays& overlays)
+        : host(host), local_overlay(local_overlay), workspace(workspace), config_root(std::move(config_root)),
+          wake(wake), overlays(overlays), send_(send), connected_(connected) {}
 
     bool Connected() const noexcept { return connected_.load(); }
 
@@ -833,9 +885,11 @@ public:
     }
 
     const bool host;
+    const bool local_overlay;
     Workspace& workspace;
     const std::filesystem::path config_root;
     const HANDLE wake;
+    PluginOverlays& overlays;
     std::optional<ClipboardBridge> clipboard;
     std::optional<FileClipboard> file_clipboard;
     LuaPlugin* file_clipboard_owner{};
@@ -857,6 +911,7 @@ public:
     }
 
     ~LuaPlugin() {
+        if (manifest_.overlay && !runtime_.host) runtime_.overlays.Clear(manifest_.overlay_defaults.plugin_id);
         CaptureLockKeys(false);
         ClearMenu();
         ClearDialogs();
@@ -1937,15 +1992,117 @@ private:
         case IcePath::relay: route = "relay"; break;
         case IcePath::unknown: break;
         }
-        lua_createtable(state, 0, 4);
+        lua_createtable(state, 0, sample.width ? 11 : 4);
         lua_pushstring(state, route);
         lua_setfield(state, -2, "route");
         if (sample.rtt_ms) { lua_pushnumber(state, *sample.rtt_ms); lua_setfield(state, -2, "rtt_ms"); }
         if (sample.loss) { lua_pushnumber(state, *sample.loss); lua_setfield(state, -2, "loss"); }
         if (sample.download_bps) { lua_pushinteger(state, *sample.download_bps); lua_setfield(state, -2, "download_bps"); }
+        if (sample.upload_bps) { lua_pushinteger(state, *sample.upload_bps); lua_setfield(state, -2, "upload_bps"); }
+        if (sample.frame_wait_ms) { lua_pushnumber(state, *sample.frame_wait_ms); lua_setfield(state, -2, "frame_wait_ms"); }
+        if (sample.width && sample.height) {
+            PushString(state, sample.protocol); lua_setfield(state, -2, "protocol");
+            lua_pushinteger(state, sample.width); lua_setfield(state, -2, "width");
+            lua_pushinteger(state, sample.height); lua_setfield(state, -2, "height");
+            lua_pushnumber(state, sample.seconds); lua_setfield(state, -2, "seconds");
+            lua_pushinteger(state, static_cast<lua_Integer>(sample.presented)); lua_setfield(state, -2, "presented");
+        }
         return 1;
     }
 
+    struct OverlayOptions {
+        std::optional<OverlayAnchor> anchor;
+        std::optional<int> priority, font_size, opacity;
+        std::uint32_t background{overlay_default_color}, foreground{overlay_default_color};
+        bool monospace{}, visible{true};
+    };
+
+    static std::uint32_t OverlayColor(std::string_view value) {
+        if (value.size() != 7 || value.front() != '#') return overlay_default_color;
+        std::uint32_t rgb{};
+        const auto [end, error] = std::from_chars(value.data() + 1, value.data() + value.size(), rgb, 16);
+        return error == std::errc{} && end == value.data() + value.size() ? rgb : overlay_default_color;
+    }
+
+    bool PublishOverlay(std::string_view slot, std::string_view text, const OverlayOptions& options) noexcept {
+        if (!IsPluginIdentifier(slot) || text.size() > 1024 || !runtime_.Connected()) return false;
+        try {
+            auto wide = Utf8ToWide(text);
+            if (!wide) return false;
+            auto item = manifest_.overlay_defaults;
+            item.id = item.plugin_id + L":" + std::wstring(slot.begin(), slot.end());
+            item.text = std::move(*wide);
+            item.anchor = options.anchor.value_or(item.anchor);
+            item.priority = options.priority.value_or(item.priority);
+            item.font_size = options.font_size.value_or(item.font_size);
+            item.opacity = static_cast<std::uint8_t>(options.opacity.value_or(item.opacity));
+            item.text_rgb = options.foreground;
+            item.bg_rgb = options.background;
+            item.visible = options.visible;
+            item.monospace = options.monospace;
+            return runtime_.overlays.Set(std::move(item));
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static int SetOverlayText(lua_State* state) {
+        const auto text = CheckString(state, 1);
+        lua_pushboolean(state, Self(state).PublishOverlay("default", text, {}));
+        return 1;
+    }
+
+    static int SetOverlay(lua_State* state) {
+        const auto slot = CheckString(state, 1);
+        luaL_checktype(state, 2, LUA_TTABLE);
+        const auto field = [state](const char* name) {
+            lua_pushstring(state, name);
+            lua_rawget(state, 2);
+        };
+        const auto string = [state, &field](const char* name) {
+            field(name);
+            std::size_t size{};
+            const auto* data = lua_type(state, -1) == LUA_TSTRING ? lua_tolstring(state, -1, &size) : nullptr;
+            lua_pop(state, 1);
+            return data ? std::string_view(data, size) : std::string_view{};
+        };
+        const auto integer = [state, &field](const char* name, int low, int high) -> std::optional<int> {
+            field(name);
+            int valid{};
+            const auto value = lua_tointegerx(state, -1, &valid);
+            lua_pop(state, 1);
+            if (!valid) return std::nullopt;
+            return static_cast<int>(std::clamp<lua_Integer>(value, low, high));
+        };
+        const auto boolean = [state, &field](const char* name, bool fallback) {
+            field(name);
+            const bool value = lua_type(state, -1) == LUA_TBOOLEAN ? lua_toboolean(state, -1) != 0 : fallback;
+            lua_pop(state, 1);
+            return value;
+        };
+        const auto text = string("text");
+        const OverlayOptions options{ParseOverlayAnchor(string("anchor")), integer("priority", -1000, 1000),
+            integer("font_size", 9, 20), integer("opacity", 0, 255), OverlayColor(string("bg_color")),
+            OverlayColor(string("text_color")), boolean("monospace", false), boolean("visible", true)};
+        lua_pushboolean(state, Self(state).PublishOverlay(slot, text, options));
+        return 1;
+    }
+
+    static int ClearOverlay(lua_State* state) {
+        auto& self = Self(state);
+        const auto& plugin_id = self.manifest_.overlay_defaults.plugin_id;
+        if (lua_isnoneornil(state, 1)) {
+            self.runtime_.overlays.Clear(plugin_id);
+        } else {
+            const auto slot = CheckString(state, 1);
+            if (IsPluginIdentifier(slot)) {
+                try {
+                    self.runtime_.overlays.Clear(plugin_id, plugin_id + L":" + std::wstring(slot.begin(), slot.end()));
+                } catch (...) {}
+            }
+        }
+        return 0;
+    }
     static int SetBitrate(lua_State* state) {
         auto& runtime = Self(state).runtime_;
         const auto name = CheckString(state, 1);
@@ -1963,7 +2120,10 @@ private:
     PluginSettings& Settings() {
         if (!settings_) {
             auto path = runtime_.config_root;
-            if (!path.empty()) path /= manifest_.id + (runtime_.host ? ".host.json" : ".viewer.json");
+            if (!path.empty()) {
+                const auto* extension = runtime_.host ? ".host.json" : (manifest_.overlay ? ".json" : ".viewer.json");
+                path /= manifest_.id + extension;
+            }
             settings_.emplace(std::move(path));
         }
         return *settings_;
@@ -2255,6 +2415,9 @@ private:
             {"open_dialog", OpenDialog}, {"update_dialog", UpdateDialog}, {"close_dialog", CloseDialog},
             {nullptr, nullptr}
         };
+        static const luaL_Reg overlay[] = {
+            {"set_text", SetOverlayText}, {"set", SetOverlay}, {"clear", ClearOverlay}, {nullptr, nullptr}
+        };
         static const luaL_Reg input[] = {{"send_keys", SendKeys}, {"send_text", SendText}, {"get_state", InputState},
             {"on_state_change", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.lock_state); return 0; }},
             {"set_lock", SetLocalLock}, {"set_ime", SetIme}, {"use_lock_sync", UseLockSync}, {nullptr, nullptr}};
@@ -2283,6 +2446,7 @@ private:
         if (manifest_.video) Namespace(state, "video", video);
         if (manifest_.fs) Namespace(state, "fs", fs);
         if (manifest_.pty) Namespace(state, "pty", pty);
+        if (manifest_.overlay && !runtime_.host) Namespace(state, "overlay", overlay);
         ReadOnly(state);
         lua_setglobal(state, "p2p");
     }
@@ -2373,6 +2537,10 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
             std::filesystem::path entry;
             auto manifest = ReadManifest(json_factory, directory.path(), runtime.host, entry);
             if (!manifest) continue;
+            const bool local_overlay = manifest->overlay && !manifest->channel;
+            if (local_overlay != runtime.local_overlay) continue;
+            if (local_overlay && (runtime.host || manifest->clipboard || manifest->file_clipboard
+                    || manifest->ui || manifest->input || manifest->video || manifest->fs || manifest->pty)) continue;
             if (restricted_host && (manifest->pty || manifest->fs || manifest->file_clipboard)) continue;
             const auto script = ReadFile(entry, 128 * 1024);
             if (manifest->clipboard || manifest->file_clipboard) {
@@ -2396,8 +2564,11 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
 } // namespace
 
 struct PluginHost::Impl {
-    Impl(bool host, SendFrame send, std::filesystem::path root, Notify notify, std::filesystem::path config_root)
-        : host(host), send(std::move(send)), root(std::move(root)), config_root(std::move(config_root)), workspace(std::move(notify)) {
+    Impl(bool host, SendFrame send, std::filesystem::path root, Notify notify, std::filesystem::path config_root,
+        bool local_overlay, std::shared_ptr<PluginOverlays> overlays)
+        : host(host), local_overlay(local_overlay), send(std::move(send)), root(std::move(root)),
+          config_root(std::move(config_root)), overlays(overlays ? std::move(overlays) : std::make_shared<PluginOverlays>()),
+          workspace(std::move(notify)) {
         winrt::check_pointer(wake.get());
         worker = std::jthread([this](std::stop_token stop) { Run(stop); });
     }
@@ -2416,9 +2587,10 @@ struct PluginHost::Impl {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
             PluginRuntime runtime(host, send, connected, workspace,
-                config_root.empty() ? DefaultPluginSettingsDirectory() : config_root, wake.get());
+                config_root.empty() ? DefaultPluginSettingsDirectory() : config_root, wake.get(), local_overlay, *overlays);
             std::vector<std::unique_ptr<LuaPlugin>> plugins;
             LoadPlugins(root.empty() ? PluginDirectory() : root, runtime, plugins);
+            if (local_overlay && plugins.empty()) return;
             for (const auto& plugin : plugins) {
                 if (connected.load()) plugin->ConnectionChanged(true);
             }
@@ -2500,9 +2672,11 @@ struct PluginHost::Impl {
     }
 
     const bool host;
+    const bool local_overlay;
     const SendFrame send;
     const std::filesystem::path root;
     const std::filesystem::path config_root;
+    std::shared_ptr<PluginOverlays> overlays;
     Workspace workspace;
     winrt::handle wake{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
     std::atomic_bool connected{};
@@ -2511,8 +2685,10 @@ struct PluginHost::Impl {
     std::jthread worker;
 };
 
-PluginHost::PluginHost(bool host, SendFrame send, std::filesystem::path root, Notify notify, std::filesystem::path config_root)
-    : impl_(std::make_unique<Impl>(host, std::move(send), std::move(root), std::move(notify), std::move(config_root))) {}
+PluginHost::PluginHost(bool host, SendFrame send, std::filesystem::path root, Notify notify,
+    std::filesystem::path config_root, bool local_overlay, std::shared_ptr<PluginOverlays> overlays)
+    : impl_(std::make_unique<Impl>(host, std::move(send), std::move(root), std::move(notify),
+        std::move(config_root), local_overlay, std::move(overlays))) {}
 PluginHost::~PluginHost() { Stop(); }
 
 void PluginHost::SetConnected(bool connected) noexcept {
@@ -2535,6 +2711,12 @@ void PluginHost::UpdateMetrics(PluginMetrics metrics) {
     impl_->workspace.metrics = std::move(metrics);
 }
 
+std::wstring PluginHost::OverlayText() const {
+    PluginOverlaySnapshot snapshot;
+    impl_->overlays->Read(snapshot);
+    const auto item = std::ranges::find(snapshot.items, L"connection-status:default", &PluginOverlayItem::id);
+    return item != snapshot.items.end() && item->visible ? item->text : std::wstring{};
+}
 void PluginHost::UpdateLockState(bool caps, bool num) {
     bool notify{};
     {

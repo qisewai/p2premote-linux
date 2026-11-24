@@ -2,6 +2,7 @@
 
 #include <p2premote/connection_options.h>
 #include <p2premote/input_protocol.h>
+#include <p2premote/overlay.h>
 
 #include <optional>
 #include <string>
@@ -19,6 +20,12 @@ struct PluginMetrics {
     std::optional<double> rtt_ms;
     std::optional<double> loss;
     std::optional<std::uint32_t> download_bps;
+    std::optional<std::uint32_t> upload_bps;
+    std::optional<double> frame_wait_ms;
+    std::string protocol;
+    unsigned width{}, height{};
+    double seconds{};
+    std::uint64_t presented{};
 };
 
 struct PluginAction {

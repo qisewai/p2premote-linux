@@ -319,7 +319,10 @@ private:
         SetNumber(api.get(), CODECAPI_AVEncCommonQualityVsSpeed, 70);
         SetNumber(api.get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         const auto fps = static_cast<UINT>(std::clamp(config_.max_frame_rate, 1, 60));
-        SetNumber(api.get(), CODECAPI_AVEncMPVGOPSize, fps * 2);
+        // Use a long GOP (matching MiniRTC's other encoders) and rely on on-demand
+        // PLI/FIR ForceIdr() for loss/join recovery to avoid periodic IDR stutters.
+        const auto gop = static_cast<UINT>(config_.key_frame_interval > 0 ? config_.key_frame_interval : 3000);
+        SetNumber(api.get(), CODECAPI_AVEncMPVGOPSize, gop);
         if (config_.video_content_type == VideoContentType::ScreenContent && config_.init_bitrate > 0) {
             SetDesktopBufferSize(api.get(), config_.init_bitrate);
             SetNumber(api.get(), CODECAPI_AVEncCommonMeanBitRate, config_.init_bitrate);

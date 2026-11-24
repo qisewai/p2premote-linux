@@ -1,0 +1,35 @@
+{
+  "id": "connection-status",
+  "name": "连接状态",
+  "version": "1.0.0",
+  "description": "在远程画面右下角显示连接时长、画面和网络指标。",
+  "enabled": true,
+  "roles": ["viewer"],
+  "permissions": ["overlay"],
+  "overlay": { "anchor": "bottom-right", "priority": 20, "default_visible": true },
+  "entry": "main.lua",
+  "settings": [
+    {
+      "key": "font_size",
+      "type": "int",
+      "label": "浮层字号",
+      "min": 9,
+      "max": 20,
+      "default": 11,
+      "suffix": " px"
+    },
+    { "key": "opacity", "type": "int", "label": "不透明度", "min": 0, "max": 255, "default": 190 },
+    {
+      "key": "anchor", "type": "select", "label": "显示位置", "default": "plugin",
+      "options": [
+        { "value": "plugin", "label": "跟随插件" },
+        { "value": "top-left", "label": "左上" },
+        { "value": "top-center", "label": "上方居中" },
+        { "value": "top-right", "label": "右上" },
+        { "value": "bottom-left", "label": "左下" },
+        { "value": "bottom-center", "label": "下方居中" },
+        { "value": "bottom-right", "label": "右下" }
+      ]
+    }
+  ]
+}

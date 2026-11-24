@@ -1,4 +1,5 @@
 #include "dxgi_capturer.h"
+#include "dxgi_cursor_check.h"
 
 #include "qpc.h"
 
@@ -57,10 +58,14 @@ public:
     HANDLE ReadyEvent() const noexcept override { return timer_.get(); }
     bool IsSourceClosed() const noexcept override { return failed_; }
     bool PreferFallbackCapture() const noexcept override { return fallback_to_wgc_; }
+    HRESULT SourceError() const noexcept override { return source_error_; }
+    bool CanRestoreDxgi() const noexcept override { return capture_cursor_ || pointer_visible_; }
     bool HasFrame() const noexcept override { return pending_.has_value(); }
 
     bool SetCursorCapture(bool enabled) noexcept override {
+        if (capture_cursor_ == enabled) return true;
         capture_cursor_ = enabled;
+        cursor_check_ = {};
         if (!enabled) {
             desktop_copy_ = nullptr;
             composed_ = nullptr;
@@ -81,6 +86,7 @@ public:
         if (result == DXGI_ERROR_WAIT_TIMEOUT) return {};
         if (FAILED(result)) {
             failed_ = true;
+            source_error_ = result;
             fallback_to_wgc_ = false;
             return {};
         }
@@ -103,13 +109,16 @@ public:
         }
 
         // The Viewer can draw the local pointer only when it is separable from the desktop.
-        CURSORINFO cursor{sizeof(cursor)};
-        if (!capture_cursor_ && info.LastMouseUpdateTime.QuadPart && !info.PointerPosition.Visible
-                && GetCursorInfo(&cursor) && (cursor.flags & CURSOR_SHOWING)
-                && MonitorFromPoint(cursor.ptScreenPos, MONITOR_DEFAULTTONULL) == monitor_) {
-            failed_ = true;
-            fallback_to_wgc_ = true;
-            return {};
+        if (!capture_cursor_ && info.LastMouseUpdateTime.QuadPart) {
+            CURSORINFO cursor{sizeof(cursor)};
+            const bool possibly_embedded = !pointer_visible_ && GetCursorInfo(&cursor)
+                && (cursor.flags & CURSOR_SHOWING)
+                && MonitorFromPoint(cursor.ptScreenPos, MONITOR_DEFAULTTONULL) == monitor_;
+            if (cursor_check_.Observe(possibly_embedded, GetTickCount64())) {
+                failed_ = true;
+                fallback_to_wgc_ = true;
+                return {};
+            }
         }
 
         const bool desktop_updated = info.LastPresentTime.QuadPart != 0;
@@ -183,6 +192,7 @@ private:
         }
         if (hr == DXGI_ERROR_ACCESS_LOST) {
             failed_ = true;
+            source_error_ = hr;
             fallback_to_wgc_ = false;
             return false;
         }
@@ -359,10 +369,12 @@ private:
     bool pointer_drawn_{};
     bool has_desktop_copy_{};
     bool capture_cursor_{true};
+    DxgiCursorCheck cursor_check_;
     std::optional<CapturedFrame> pending_;
     std::uint64_t frame_id_{};
     bool failed_{};
     bool fallback_to_wgc_{};
+    HRESULT source_error_{S_OK};
 };
 
 } // namespace

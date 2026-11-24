@@ -26,6 +26,7 @@ add_executable(p2premote_qt WIN32
     viewer/qt/plugin_dialog.h
     viewer/qt/remote_window.cpp
     viewer/qt/remote_window.h
+    viewer/connection_overlay.cpp
     viewer/qt/service_control.cpp
     viewer/qt/service_control.h
     viewer/qt/settings_dialog.cpp

@@ -987,6 +987,73 @@ void TestRemoteTerminal(const std::filesystem::path& source_plugins) {
     Check(std::chrono::steady_clock::now() - closing < 3s, "ConPTY shutdown did not cancel blocked I/O");
 }
 
+void TestConnectionStatus(const std::filesystem::path& root) {
+    Fixture fixture;
+    fixture.CopyPlugin(root / "connection-status");
+    fixture.CopyPlugin(root / "session-stopwatch");
+    fixture.Plugin("overlay-test", R"lua(
+        assert(p2p.channel == nil and p2p.config ~= nil)
+        assert(p2p.overlay.set_text("legacy"))
+        assert(p2p.overlay.set("debug", {text="value", anchor="top-center", priority=7,
+            font_size=15, opacity=150, monospace=true, text_color="#000000"}))
+        assert(p2p.overlay.set("third", {text="third"}))
+        assert(p2p.overlay.set("fourth", {text="fourth", visible=false}))
+        assert(not p2p.overlay.set("fifth", {text="refused"}))
+        p2p.overlay.clear("third")
+        assert(p2p.overlay.set("fifth", {text="now allowed"}))
+    )lua", "viewer", "main.lua", true, R"("overlay", "config")");
+    fixture.Plugin("channel-overlay", R"lua(
+        p2p.channel.on_message(function(kind, text)
+            if kind == "status" then p2p.overlay.set_text(text) end
+        end)
+    )lua", "viewer", "main.lua", true, R"("overlay", "channel")");
+    const auto store = std::make_shared<PluginOverlays>();
+    PluginHost overlay(false, {}, fixture.root, {}, fixture.root, true, store);
+    PluginHost channel(false, {}, fixture.root, {}, fixture.root, false, store);
+    overlay.SetConnected(true);
+    channel.SetConnected(true);
+    Deliver(channel, {"channel-overlay", "status", "peer data"});
+    overlay.UpdateMetrics({IcePath::host, 12.5, 0.01, 1'000'000, 250'000, 2.5, "udp", 1920, 1080, 5.0, 300});
+
+    PluginOverlaySnapshot snapshot;
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    do {
+        store->Read(snapshot);
+        if (snapshot.items.size() == 7) {
+            const auto text = overlay.OverlayText();
+            Check(text.find(L"1920×1080") != std::wstring::npos && text.find(L"60 fps") != std::wstring::npos
+                && text.find(L"RTT 12.5 ms") != std::wstring::npos, "Local overlay metrics are incorrect");
+            const auto find = [&](std::wstring_view id) {
+                return std::ranges::find(snapshot.items, id, &PluginOverlayItem::id);
+            };
+            const auto clock = find(L"session-stopwatch:clock");
+            const auto debug = find(L"overlay-test:debug");
+            const auto remote = find(L"channel-overlay:default");
+            Check(clock != snapshot.items.end() && clock->monospace && !clock->default_visible
+                && clock->anchor == OverlayAnchor::top_right, "Stopwatch defaults were lost");
+            Check(debug != snapshot.items.end() && debug->anchor == OverlayAnchor::top_center && debug->priority == 7
+                && debug->font_size == 15 && debug->opacity == 150 && debug->text_rgb == 0 && debug->monospace,
+                "Lua overlay values were lost");
+            Check(remote != snapshot.items.end() && remote->text == L"peer data", "Channel overlay was not published");
+            channel.Stop();
+            overlay.Stop();
+            store->Read(snapshot);
+            Check(snapshot.items.empty(), "Session shutdown retained overlay slots");
+
+            PluginOverlays bounded;
+            for (int i = 0; i < 17; ++i) {
+                PluginOverlayItem item;
+                item.plugin_id = std::to_wstring(i / 4);
+                item.id = std::to_wstring(i);
+                Check(bounded.Set(std::move(item)) == (i < 16), "Session overlay limit was not enforced");
+            }
+            return;
+        }
+        std::this_thread::sleep_for(20ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    Check(false, "Local overlay did not render without a peer plugin channel");
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -1004,6 +1071,10 @@ int wmain(int argc, wchar_t** argv) {
             return 0;
         }
         if (argc == 3 && std::wstring_view(argv[1]) == L"--file-clipboard") return TestFileClipboard(argv[2]);
+        if (argc == 3 && std::wstring_view(argv[1]) == L"--connection-status") {
+            TestConnectionStatus(argv[2]);
+            return 0;
+        }
         if (argc == 2) return TestClipboard(argv[1]);
         TestSandbox();
         TestWorkspace();
