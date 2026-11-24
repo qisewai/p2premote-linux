@@ -24,14 +24,16 @@ local function sample()
 end
 
 local menu
-menu = p2p.ui.add_menu("智能画质（自动档）", function()
-    enabled = not enabled
-    bad, good = 0, 0
-    local saved = p2p.config.set("enabled", enabled)
-    p2p.ui.set_checked(menu, enabled)
-    if not enabled then choose("automatic") end
-    if not saved then p2p.ui.notify("智能画质设置仅在本次连接生效")
-    else p2p.ui.notify(enabled and "已启用智能画质，仅在自动档生效" or "已关闭智能画质") end
-end, enabled)
+menu = p2p.ui.add_menu({menu = "display", section = "bitrate", order = 10,
+    label = "智能画质（自动档）", checked = enabled, on_click = function()
+        enabled = not enabled
+        bad, good = 0, 0
+        local saved = p2p.config.set("enabled", enabled)
+        p2p.ui.set_checked(menu, enabled)
+        if not enabled then choose("automatic") end
+        if not saved then p2p.ui.notify("智能画质设置仅在本次连接生效")
+        else p2p.ui.notify(enabled and "已启用智能画质，仅在自动档生效" or "已关闭智能画质") end
+    end
+})
 
 p2p.timer.every(1000, sample)

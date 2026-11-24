@@ -1,12 +1,13 @@
 #include "app_settings.h"
 
+#include <p2premote/core_api.h>
+
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
-#include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
 
@@ -15,10 +16,9 @@
 namespace {
 
 bool isValidPluginId(const QString& id) {
-    if (id.isEmpty() || id.size() > 64) return false;
+    if (id.isEmpty() || id.size() > 32) return false;
     for (const QChar ch : id) {
         const bool ok = (ch >= QLatin1Char('a') && ch <= QLatin1Char('z'))
-            || (ch >= QLatin1Char('A') && ch <= QLatin1Char('Z'))
             || (ch >= QLatin1Char('0') && ch <= QLatin1Char('9'))
             || ch == QLatin1Char('-') || ch == QLatin1Char('_');
         if (!ok) return false;
@@ -98,12 +98,6 @@ void AppSettings::save(const AppSettingsData& next) {
     }
 }
 
-void AppSettings::resetDefaults() {
-    AppSettingsData defaults;
-    defaults.default_server = data_.default_server;
-    save(defaults);
-}
-
 QString AppSettings::pluginsDirectory() {
     const auto app_dir = QCoreApplication::applicationDirPath();
     const auto beside_exe = QDir(app_dir).filePath(QStringLiteral("plugins"));
@@ -132,8 +126,8 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
         const auto obj = doc.object();
 
         PluginSettingSpec spec;
-        spec.id = obj.value(QStringLiteral("id")).toString(dir_name);
-        if (!isValidPluginId(spec.id)) continue;
+        spec.id = obj.value(QStringLiteral("id")).toString();
+        if (spec.id != dir_name) continue;
         spec.name = obj.value(QStringLiteral("name")).toString(spec.id);
         spec.version = obj.value(QStringLiteral("version")).toString(QStringLiteral("1.0.0"));
         spec.description = obj.value(QStringLiteral("description")).toString();
@@ -146,7 +140,29 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
             if (p.isString()) spec.permissions.append(p.toString());
         }
 
-        const auto settings = obj.value(QStringLiteral("settings")).toArray();
+        const auto ui = obj.value(QStringLiteral("settings_ui")).toObject();
+        const auto mode = ui.value(QStringLiteral("mode")).toString();
+        const auto page = ui.value(QStringLiteral("page")).toString();
+        const bool builtin_page = page == QStringLiteral("appearance") || page == QStringLiteral("general") ||
+            page == QStringLiteral("stream-audio");
+        const auto group = ui.value(QStringLiteral("nav_group")).toString(QStringLiteral("软件设置"));
+        const auto title = ui.value(QStringLiteral("page_title")).toString().trimmed();
+        if (mode == QStringLiteral("embed") && builtin_page) {
+            spec.placement = PluginSettingSpec::Placement::embed;
+        } else if (mode == QStringLiteral("page") && isValidPluginId(page) && !builtin_page &&
+            !title.isEmpty() && title.size() <= 64 &&
+            (group == QStringLiteral("软件设置") || group == QStringLiteral("插件与扩展"))) {
+            spec.placement = PluginSettingSpec::Placement::page;
+        }
+        spec.page = page;
+        spec.page_title = title;
+        spec.section = ui.value(QStringLiteral("section")).toString(spec.name).trimmed();
+        if (spec.section.isEmpty()) spec.section = spec.name;
+        spec.order = std::clamp(ui.value(QStringLiteral("order")).toInt(50), -10000, 10000);
+        spec.extension_page = group == QStringLiteral("插件与扩展");
+
+        const auto settings = spec.placement == PluginSettingSpec::Placement::none || !spec.roles.contains(QStringLiteral("viewer"))
+            ? QJsonArray{} : obj.value(QStringLiteral("settings")).toArray();
         for (const auto& item : settings) {
             if (!item.isObject()) continue;
             const auto f = item.toObject();
@@ -154,7 +170,7 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
             field.key = f.value(QStringLiteral("key")).toString();
             field.type = f.value(QStringLiteral("type")).toString(QStringLiteral("string"));
             field.label = f.value(QStringLiteral("label")).toString(field.key);
-            if (field.key.isEmpty()) continue;
+            if (!isValidPluginId(field.key)) continue;
             field.description = f.value(QStringLiteral("description")).toString();
             field.placeholder = f.value(QStringLiteral("placeholder")).toString();
             field.suffix = f.value(QStringLiteral("suffix")).toString();
@@ -185,26 +201,15 @@ QJsonObject AppSettings::loadPluginConfig(const QString& plugin_id) {
     if (!isValidPluginId(plugin_id)) return {};
     const auto dir = pluginConfigDirectory();
     if (dir.isEmpty()) return {};
-    QFile file(QDir(dir).filePath(plugin_id + QStringLiteral(".json")));
+    QFile file(QDir(dir).filePath(plugin_id + QStringLiteral(".viewer.json")));
     if (!file.open(QIODevice::ReadOnly)) return {};
     const auto doc = QJsonDocument::fromJson(file.read(16 * 1024));
     return doc.isObject() ? doc.object() : QJsonObject{};
 }
 
-bool AppSettings::savePluginConfig(const QString& plugin_id, const QJsonObject& config) {
-    if (!isValidPluginId(plugin_id)) return false;
-    const auto dir_path = pluginConfigDirectory();
-    if (dir_path.isEmpty()) return false;
-    QDir().mkpath(dir_path);
-    const auto data = QJsonDocument(config).toJson(QJsonDocument::Compact);
-    if (data.size() > 16 * 1024) return false;
-    QSaveFile file(QDir(dir_path).filePath(plugin_id + QStringLiteral(".json")));
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
-    if (file.write(data) != data.size()) {
-        file.cancelWriting();
-        return false;
-    }
-    if (!file.commit()) return false;
+bool AppSettings::savePluginConfig(const QString& plugin_id, const QJsonObject& updates) {
+    const auto data = QJsonDocument(updates).toJson(QJsonDocument::Compact);
+    if (p2p_plugin_update_viewer_config(plugin_id.toUtf8().constData(), data.constData()) != P2P_OK) return false;
     emit instance().pluginConfigChanged(plugin_id);
     return true;
 }

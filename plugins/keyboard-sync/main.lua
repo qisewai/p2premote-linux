@@ -36,16 +36,18 @@ local function sync()
 end
 
 local menu
-menu = p2p.ui.add_menu("同步键盘状态到远端", function()
-    enabled = not enabled
-    ready, last = false, nil
-    if not enabled then input.use_lock_sync(false) end
-    local saved = p2p.config.set("enabled", enabled)
-    p2p.ui.set_checked(menu, enabled)
-    if not saved then p2p.ui.notify("键盘同步设置仅在本次连接生效")
-    else p2p.ui.notify(enabled and "正在等待远端键盘插件" or "已关闭键盘状态同步") end
-    sync()
-end, enabled)
+menu = p2p.ui.add_menu({menu = "input", section = "sync", order = 10,
+    label = "同步键盘状态到远端", checked = enabled, on_click = function()
+        enabled = not enabled
+        ready, last = false, nil
+        if not enabled then input.use_lock_sync(false) end
+        local saved = p2p.config.set("enabled", enabled)
+        p2p.ui.set_checked(menu, enabled)
+        if not saved then p2p.ui.notify("键盘同步设置仅在本次连接生效")
+        else p2p.ui.notify(enabled and "正在等待远端键盘插件" or "已关闭键盘状态同步") end
+        sync()
+    end
+})
 
 channel.on_message(function(kind, value)
     if enabled and not ready and kind == "ready" and value == "" then

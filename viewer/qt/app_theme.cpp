@@ -192,6 +192,9 @@ QFrame#accountCard, QFrame#card, QFrame#settingsCard {
     border: 1px solid %BORDER%;
     border-radius: 10px;
 }
+QFrame#settingsCard[settingFocus="true"] {
+    border-color: %ACCENT%;
+}
 QFrame#divider {
     background: %BORDER%;
     max-height: 1px;

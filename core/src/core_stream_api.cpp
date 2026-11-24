@@ -1,10 +1,15 @@
 #include "core_api_internal.h"
+#include "plugin_settings.h"
 #include "viewer_input.h"
 #include "qpc.h"
 
 #include <commctrl.h>
+#include <objbase.h>
 #include <deque>
 #include <memory>
+#include <winrt/Windows.Foundation.Collections.h>
+
+#include <p2premote/plugin_protocol.h>
 
 using namespace p2premote;
 using namespace p2premote::abi;
@@ -404,7 +409,10 @@ size_t p2p_stream_read_menu(p2p_stream* stream) {
 int32_t p2p_stream_menu_item(const p2p_stream* stream, size_t index, p2p_menu_item* item) {
     return Guard([&] {
         const auto& entry = Required(stream).menu.at(index);
-        Required(item) = {entry.label.c_str(), entry.id, entry.checked ? static_cast<int32_t>(*entry.checked) : -1};
+        Required(item) = {entry.label.c_str(), entry.plugin_id.c_str(), entry.menu.c_str(),
+            entry.menu_title.c_str(), entry.path.c_str(), entry.section.c_str(), entry.id,
+            entry.checked ? static_cast<int32_t>(*entry.checked) : -1, entry.menu_order, entry.order,
+            entry.toolbar_button};
     });
 }
 
@@ -413,6 +421,37 @@ int32_t p2p_stream_invoke_menu(p2p_stream* stream, uint32_t id) {
         auto& session = Required(stream).session;
         ViewerInput::UpdatePluginLocks(session);
         session.InvokePluginMenu(id);
+    });
+}
+
+int32_t p2p_plugin_update_viewer_config(const char* plugin_id, const char* updates_json) {
+    return Guard([&] {
+        if (!plugin_id || !IsPluginIdentifier(plugin_id) || !updates_json ||
+            strnlen_s(updates_json, 16 * 1024 + 1) > 16 * 1024) {
+            throw std::invalid_argument("无效的插件配置");
+        }
+        std::optional<Apartment> apartment;
+        APTTYPE type{};
+        APTTYPEQUALIFIER qualifier{};
+        if (CoGetApartmentType(&type, &qualifier) == CO_E_NOTINITIALIZED) {
+            apartment.emplace(winrt::apartment_type::multi_threaded);
+        }
+        using namespace winrt::Windows::Data::Json;
+        JsonObject updates{nullptr};
+        if (!JsonObject::TryParse(winrt::to_hstring(updates_json), updates)) {
+            throw std::invalid_argument("无效的插件配置 JSON");
+        }
+        for (const auto& update : updates) {
+            const auto value = update.Value().ValueType();
+            if (!IsPluginIdentifier(winrt::to_string(update.Key())) ||
+                (value != JsonValueType::String && value != JsonValueType::Number && value != JsonValueType::Boolean)) {
+                throw std::invalid_argument("无效的插件配置项");
+            }
+        }
+        const auto directory = DefaultPluginSettingsDirectory();
+        if (directory.empty() || !PluginSettings(directory / (std::string(plugin_id) + ".viewer.json")).Merge(updates)) {
+            throw std::runtime_error("无法保存插件配置");
+        }
     });
 }
 

@@ -64,6 +64,19 @@ bool PluginSettings::Set(std::wstring_view key, const IJsonValue& value) const {
     if (!json) return false;
     if (value) json.SetNamedValue(key, value);
     else if (json.HasKey(key)) json.Remove(key);
+    return Write(json);
+}
+
+bool PluginSettings::Merge(const JsonObject& updates) const {
+    const std::lock_guard lock(settings_mutex);
+    if (file_.empty() || !parser_ || !factory_) return false;
+    const auto json = Read(true);
+    if (!json) return false;
+    for (const auto& update : updates) json.SetNamedValue(update.Key(), update.Value());
+    return Write(json);
+}
+
+bool PluginSettings::Write(const JsonObject& json) const {
     const auto data = winrt::to_string(json.Stringify());
     if (data.size() > settings_limit) return false;
 

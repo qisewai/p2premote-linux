@@ -1104,7 +1104,7 @@ local function open_transfer_dialog()
 end
 
 p2p.session.on("connected", function()
-    p2p.ui.add_menu("文件传输…", open_transfer_dialog)
+    p2p.ui.add_menu({menu = "tools", label = "文件传输…", order = 10, on_click = open_transfer_dialog})
     p2p.channel.send("hello", "1")
 end)
 

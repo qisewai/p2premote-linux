@@ -493,10 +493,7 @@ void AccountWindow::makeTray() {
 
 void AccountWindow::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
-    if (!dwm_applied_) {
-        dwm_applied_ = true;
-        applyWin32FramelessChrome(this);
-    }
+    applyWin32FramelessChrome(this);
     if (title_bar_) title_bar_->syncMaximizeState();
 }
 
@@ -519,7 +516,7 @@ void AccountWindow::closeEvent(QCloseEvent* event) {
 }
 
 bool AccountWindow::nativeEvent(const QByteArray& type, void* message, qintptr* result) {
-    if (handleFramelessResizeHitTest(this, message, result)) return true;
+    if (handleWin32FramelessChrome(this, message, result)) return true;
     const auto* msg = static_cast<MSG*>(message);
     if (msg->message == WM_HOTKEY && msg->wParam == stop_hotkey && host_) {
         stopReceiving();

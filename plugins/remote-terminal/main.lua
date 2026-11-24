@@ -302,4 +302,4 @@ channel.on_message(function(kind, payload)
     end
 end)
 
-p2p.ui.add_menu("远程终端…", open_dialog)
+p2p.ui.add_menu({menu = "tools", label = "远程终端…", order = 20, on_click = open_dialog})

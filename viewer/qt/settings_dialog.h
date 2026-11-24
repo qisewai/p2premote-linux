@@ -4,6 +4,7 @@
 #include "frameless_chrome.h"
 
 #include <QHash>
+#include <QJsonValue>
 #include <QVector>
 
 class QCheckBox;
@@ -11,6 +12,7 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QScrollArea;
 class QStackedWidget;
 
 class SettingsDialog final : public FramelessDialog {
@@ -23,22 +25,27 @@ private:
     struct PluginFieldBinding {
         PluginSettingField field;
         QWidget* widget{};
+        QJsonValue initial;
     };
 
-    struct PluginPageBinding {
-        PluginSettingSpec spec;
+    struct PluginCardBinding {
+        QString id;
+        QWidget* card{};
+        int nav_row{};
         QVector<PluginFieldBinding> fields;
     };
 
-    QWidget* buildAppearancePage();
-    QWidget* buildGeneralPage();
-    QWidget* buildStreamAudioPage();
-    QWidget* buildPluginsOverviewPage(const QVector<PluginSettingSpec>& plugins);
-    QWidget* buildPluginSettingsPage(const PluginSettingSpec& spec);
-    void loadFromSettings();
+    QScrollArea* buildAppearancePage();
+    QScrollArea* buildGeneralPage();
+    QScrollArea* buildStreamAudioPage();
+    QScrollArea* buildPluginsOverviewPage(const QVector<PluginSettingSpec>& plugins);
+    void addPluginCard(const PluginSettingSpec& spec, int nav_row);
+    void showPluginConfig(const QString& id);
+    static QJsonValue fieldValue(const PluginFieldBinding& binding);
+    void loadAppControls(const AppSettingsData& data);
     AppSettingsData collectAppSettings() const;
     void previewAppearance();
-    void saveAll();
+    bool saveAll();
     void resetAll();
 
     QListWidget* nav_{};
@@ -63,7 +70,8 @@ private:
     QComboBox* volume_combo_{};
     QCheckBox* mic_fallback_{};
 
-    QVector<PluginPageBinding> plugin_pages_;
+    QVector<PluginCardBinding> plugin_cards_;
     QHash<int, int> nav_to_page_;
     bool loading_{};
+    bool plugin_reset_{};
 };

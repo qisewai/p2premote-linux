@@ -7,6 +7,7 @@
   "roles": ["viewer", "host"],
   "enabled": true,
   "permissions": ["ui", "input", "channel", "config"],
+  "settings_ui": { "mode": "page", "page": "input", "page_title": "输入与控制", "nav_group": "软件设置", "order": 30 },
   "settings": [
     {
       "key": "enabled",

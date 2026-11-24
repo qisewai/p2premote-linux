@@ -10,6 +10,7 @@
 #include <QCursor>
 #include <QEvent>
 #include <QFileDialog>
+#include <QFontMetrics>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -386,7 +387,13 @@ RemoteWindow::RemoteWindow(QWidget* parent)
     };
     display_menu_ = addMenuBtn(QStringLiteral("画面 ▾"));
     audio_menu_ = addMenuBtn(QStringLiteral("音频 ▾"));
-    plugins_menu_ = addMenuBtn(QStringLiteral("插件 ▾"));
+    input_menu_ = addMenuBtn(QStringLiteral("输入 ▾"));
+    tools_menu_ = addMenuBtn(QStringLiteral("工具 ▾"));
+    input_menu_->hide();
+    tools_menu_->hide();
+    plugin_toolbar_ = new QHBoxLayout;
+    plugin_toolbar_->setSpacing(top->spacing());
+    top->addLayout(plugin_toolbar_);
     actions_menu_ = addMenuBtn(QStringLiteral("菜单 ▾"));
     fullscreen_ = addMenuBtn(QStringLiteral("全屏"));
     fullscreen_->setToolTip(QStringLiteral("F11"));
@@ -440,14 +447,17 @@ RemoteWindow::RemoteWindow(QWidget* parent)
     });
     connect(display_menu_, &QPushButton::clicked, this, &RemoteWindow::showDisplayMenu);
     connect(audio_menu_, &QPushButton::clicked, this, &RemoteWindow::showAudioMenu);
-    connect(plugins_menu_, &QPushButton::clicked, this, &RemoteWindow::showPluginsMenu);
+    connect(input_menu_, &QPushButton::clicked, this, [this] {
+        showPluginMenu(input_menu_, QStringLiteral("input"));
+    });
+    connect(tools_menu_, &QPushButton::clicked, this, [this] {
+        showPluginMenu(tools_menu_, QStringLiteral("tools"));
+    });
     connect(actions_menu_, &QPushButton::clicked, this, &RemoteWindow::showActionsMenu);
     connect(fullscreen_, &QPushButton::clicked, this, &RemoteWindow::toggleFullscreen);
-    connect(win_min_, &QPushButton::clicked, this, &QWidget::showMinimized);
+    connect(win_min_, &QPushButton::clicked, this, [this] { minimizeFramelessWindow(this); });
     connect(win_max_, &QPushButton::clicked, this, [this] {
-        if (isMaximized()) showNormal();
-        else showMaximized();
-        syncWindowControls();
+        toggleFramelessMaximize(this);
     });
     connect(win_close_, &QPushButton::clicked, this, &QWidget::close);
 
@@ -492,10 +502,7 @@ void RemoteWindow::openSession(p2p_account* account, const QString& device, cons
 
 void RemoteWindow::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
-    if (!dwm_applied_) {
-        dwm_applied_ = true;
-        applyWin32FramelessChrome(this);
-    }
+    applyWin32FramelessChrome(this);
     syncWindowControls();
 }
 
@@ -517,9 +524,7 @@ bool RemoteWindow::eventFilter(QObject* watched, QEvent* event) {
         } else if (event->type() == QEvent::MouseButtonDblClick) {
             const auto* me = static_cast<QMouseEvent*>(event);
             if (me->button() == Qt::LeftButton && !topbar_->childAt(me->position().toPoint())) {
-                if (isMaximized()) showNormal();
-                else showMaximized();
-                syncWindowControls();
+                toggleFramelessMaximize(this);
                 return true;
             }
         }
@@ -528,7 +533,7 @@ bool RemoteWindow::eventFilter(QObject* watched, QEvent* event) {
 }
 
 bool RemoteWindow::nativeEvent(const QByteArray& type, void* message, qintptr* result) {
-    if (handleFramelessResizeHitTest(this, message, result)) return true;
+    if (handleWin32FramelessChrome(this, message, result)) return true;
     return QWidget::nativeEvent(type, message, result);
 }
 
@@ -619,11 +624,11 @@ void RemoteWindow::refreshChrome() {
     }
 
     auto* current = currentSession();
+    refreshPluginMenus(current);
     if (!current) {
         setWindowTitle(QStringLiteral("P2P Remote"));
         display_menu_->setEnabled(false);
         audio_menu_->setEnabled(false);
-        plugins_menu_->setEnabled(false);
         actions_menu_->setEnabled(false);
         statusbar_->hide();
         return;
@@ -633,7 +638,6 @@ void RemoteWindow::refreshChrome() {
     const bool has_handle = current->handle() != nullptr;
     display_menu_->setEnabled(has_handle);
     audio_menu_->setEnabled(has_handle);
-    plugins_menu_->setEnabled(has_handle && current->hasPluginMenu());
     actions_menu_->setEnabled(has_handle);
 
     const bool mic_live = has_handle && current->playing() && current->micEnabled();
@@ -655,6 +659,49 @@ void RemoteWindow::refreshChrome() {
     const bool need_statusbar = !fullscreen_mode_
         && (!current->playing() || !current->noticeText().isEmpty());
     statusbar_->setVisible(need_statusbar);
+}
+
+void RemoteWindow::refreshPluginMenus(RemoteSessionTab* session) {
+    plugin_menu_.read(session && session->hasPluginMenu() ? session->handle() : nullptr);
+    input_menu_->setVisible(plugin_menu_.hasItems(QStringLiteral("input")));
+    tools_menu_->setVisible(plugin_menu_.hasItems(QStringLiteral("tools")));
+
+    auto buttons = plugin_menu_.toolbar();
+    if (buttons == plugin_buttons_) return;
+    plugin_buttons_ = std::move(buttons);
+    while (auto* item = plugin_toolbar_->takeAt(0)) {
+        item->widget()->hide();
+        item->widget()->deleteLater();
+        delete item;
+    }
+    for (const auto& spec : plugin_buttons_) {
+        auto* button = new QPushButton(topbar_);
+        button->setObjectName(QStringLiteral("barMenuBtn"));
+        button->setToolTip(spec.label);
+        const auto label = button->fontMetrics().elidedText(spec.label, Qt::ElideRight, 112);
+        button->setText(spec.command ? label : label + QStringLiteral(" ▾"));
+        plugin_toolbar_->addWidget(button);
+        if (spec.command) {
+            button->setCheckable(spec.checked >= 0);
+            button->setChecked(spec.checked > 0);
+            connect(button, &QPushButton::clicked, this, [this, button, checked = spec.checked, id = spec.command] {
+                button->setChecked(checked > 0);
+                pluginMenuInvoker(currentSession())(id);
+            });
+        } else {
+            connect(button, &QPushButton::clicked, this, [this, button, slot = spec.menu] {
+                showPluginMenu(button, slot);
+            });
+        }
+    }
+}
+
+PluginMenuLayout::Invoke RemoteWindow::pluginMenuInvoker(RemoteSessionTab* session) {
+    return [this, target = QPointer<RemoteSessionTab>(session)](uint32_t id) {
+        if (target && currentSession() == target && target->handle()) {
+            target->driver()->update(p2p_stream_invoke_menu(target->handle(), id));
+        }
+    };
 }
 
 void RemoteWindow::toggleFullscreen() {
@@ -716,9 +763,11 @@ void RemoteWindow::positionFullscreenToolbar() {
 void RemoteWindow::showDisplayMenu() {
     auto* session = currentSession();
     if (!session || !session->handle()) return;
+    plugin_menu_.read(session->handle());
 
     auto* menu = new QMenu(display_menu_);
     menu->setAttribute(Qt::WA_DeleteOnClose);
+    const auto invoke = pluginMenuInvoker(session);
 
     auto* res_header = menu->addAction(QStringLiteral("分辨率"));
     res_header->setEnabled(false);
@@ -735,6 +784,7 @@ void RemoteWindow::showDisplayMenu() {
         });
     }
 
+    plugin_menu_.append(*menu, QStringLiteral("display"), invoke, QStringLiteral("resolution"));
     menu->addSeparator();
     auto* br_header = menu->addAction(session->playing() && session->confirmedBitrate()
         ? QStringLiteral("画质码率 · 被控端上限 %1 Mbps").arg(session->confirmedBitrate() / 1'000'000.0, 0, 'g', 4)
@@ -757,6 +807,7 @@ void RemoteWindow::showDisplayMenu() {
         });
     }
 
+    plugin_menu_.append(*menu, QStringLiteral("display"), invoke, QStringLiteral("bitrate"));
     menu->addSeparator();
     auto* overlays = menu->addMenu(QStringLiteral("画面浮层"));
     auto* hide = overlays->addAction(QStringLiteral("隐藏全部浮层"));
@@ -781,6 +832,8 @@ void RemoteWindow::showDisplayMenu() {
             AppSettings::setOverlayVisibility(id, checked);
         });
     }
+    plugin_menu_.append(*overlays, QStringLiteral("display"), invoke, QStringLiteral("overlays"));
+    plugin_menu_.append(*menu, QStringLiteral("display"), invoke);
 
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
     menu->popup(display_menu_->mapToGlobal(QPoint(0, display_menu_->height())));
@@ -789,6 +842,7 @@ void RemoteWindow::showDisplayMenu() {
 void RemoteWindow::showAudioMenu() {
     auto* session = currentSession();
     if (!session || !session->handle()) return;
+    plugin_menu_.read(session->handle());
 
     auto* menu = new QMenu(audio_menu_);
     menu->setAttribute(Qt::WA_DeleteOnClose);
@@ -841,42 +895,33 @@ void RemoteWindow::showAudioMenu() {
     connect(fallback, &QAction::toggled, this, [this, session](bool checked) {
         if (currentSession() == session) session->setMicFallback(checked);
     });
+    plugin_menu_.append(*menu, QStringLiteral("audio"), pluginMenuInvoker(session));
 
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
     menu->popup(audio_menu_->mapToGlobal(QPoint(0, audio_menu_->height())));
 }
 
-void RemoteWindow::showPluginsMenu() {
+void RemoteWindow::showPluginMenu(QPushButton* button, const QString& slot) {
     auto* session = currentSession();
     if (!session || !session->handle()) return;
+    plugin_menu_.read(session->handle());
 
-    auto* menu = new QMenu(plugins_menu_);
+    auto* menu = new QMenu(button);
     menu->setAttribute(Qt::WA_DeleteOnClose);
 
-    const auto count = p2p_stream_read_menu(session->handle());
-    for (size_t i = 0; i < count; ++i) {
-        p2p_menu_item entry{};
-        if (p2p_stream_menu_item(session->handle(), i, &entry) != P2P_OK) continue;
-        auto* action = menu->addAction(QString::fromWCharArray(entry.label));
-        action->setCheckable(entry.checked >= 0);
-        action->setChecked(entry.checked > 0);
-        connect(action, &QAction::triggered, this, [this, session, id = entry.id] {
-            if (currentSession() == session && session->driver() && session->handle()) {
-                session->driver()->update(p2p_stream_invoke_menu(session->handle(), id));
-            }
-        });
-    }
+    plugin_menu_.append(*menu, slot, pluginMenuInvoker(session));
     if (menu->isEmpty()) {
-        auto* empty = menu->addAction(QStringLiteral("当前无可用插件"));
-        empty->setEnabled(false);
+        delete menu;
+        return;
     }
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
-    menu->popup(plugins_menu_->mapToGlobal(QPoint(0, plugins_menu_->height())));
+    menu->popup(button->mapToGlobal(QPoint(0, button->height())));
 }
 
 void RemoteWindow::showActionsMenu() {
     auto* session = currentSession();
     if (!session) return;
+    plugin_menu_.read(session->handle());
 
     auto* menu = new QMenu(actions_menu_);
     menu->setAttribute(Qt::WA_DeleteOnClose);
@@ -913,6 +958,7 @@ void RemoteWindow::showActionsMenu() {
     connect(close_tab, &QAction::triggered, this, [this] {
         closeTab(tabs_->currentIndex());
     });
+    plugin_menu_.append(*menu, QStringLiteral("actions"), pluginMenuInvoker(session));
 
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
     menu->popup(actions_menu_->mapToGlobal(QPoint(0, actions_menu_->height())));

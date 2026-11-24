@@ -8,6 +8,7 @@
   "permissions": ["overlay"],
   "overlay": { "anchor": "bottom-right", "priority": 20, "default_visible": true },
   "entry": "main.lua",
+  "settings_ui": { "mode": "page", "page": "overlays", "page_title": "画面浮层", "nav_group": "软件设置", "order": 10 },
   "settings": [
     {
       "key": "font_size",

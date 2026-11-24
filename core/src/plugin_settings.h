@@ -12,9 +12,11 @@ public:
     explicit PluginSettings(std::filesystem::path file);
     winrt::Windows::Data::Json::IJsonValue Get(std::wstring_view key) const;
     bool Set(std::wstring_view key, const winrt::Windows::Data::Json::IJsonValue& value) const;
+    bool Merge(const winrt::Windows::Data::Json::JsonObject& updates) const;
 
 private:
     winrt::Windows::Data::Json::JsonObject Read(bool reset_corrupt = false) const;
+    bool Write(const winrt::Windows::Data::Json::JsonObject& json) const;
 
     std::filesystem::path file_;
     winrt::Windows::Data::Json::IJsonObjectStatics parser_{nullptr};

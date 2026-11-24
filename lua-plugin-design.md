@@ -115,13 +115,51 @@ plugins/
 
 | 命名空间 | 权限 | 接口 |
 | --- | --- | --- |
-| `p2p.ui` | `"ui"` | `add_menu(label, fn [, checked])` 注册主控工具栏「插件」中的操作或开关，返回菜单 ID。`set_checked(id, value)` 更新本插件的开关。`notify(text)` 在连接状态区短暂显示提示。 |
+| `p2p.ui` | `"ui"` | `add_menu(spec)` 注册主控菜单操作或开关，返回菜单 ID。`set_checked(id, value)` 更新本插件的开关。`notify(text)` 在连接状态区短暂显示提示。 |
 | `p2p.input` | `"input"` | 主控用 `send_keys({"Ctrl", "Shift", "Esc"})` 或 `send_text(text)` 向被控端提交输入（`Win+L` 由被控端调用 `LockWorkStation()` 执行）。`get_state()` 返回本机 `caps_lock`、`num_lock` 和可用时的 `ime_open`；`on_state_change(fn)` 在主控锁定键切换时立即触发。被控端用 `set_lock(key, value)` 和 `set_ime(open)` 调整本机状态。`use_lock_sync(enabled)` 让插件接管主控窗口中的锁定键同步。 |
 | `p2p.config` | `"config"` | `get(key [, default])` 读取设置，`set(key, value)` 保存布尔值、有限数值或字符串，传 `nil` 删除。键名沿用插件 ID 的字符和长度规则。 |
 | `p2p.session` | 默认开放 | `stats()` 返回 `route`（`lan` / `direct` / `relay` / `unknown`）、可用时的 `rtt_ms`、`loss`（0–1）和 `download_bps`。 |
 | `p2p.video` | `"video"` | `set_bitrate(preset)` 提交 `economy`、`automatic` 或 `detail`，在主控选中「自动」画质时生效。 |
 
-输入和菜单回调经有界队列跨线程传递。组合键最多 8 个键，文本最多 256 个 UTF-16 代码单元。两端在加密插件通道中确认批量输入能力，再通过可靠控制通道发送输入。Windows 前台应用和输入法决定实际可用的状态及注入行为。配置按插件 ID 和端角色保存到 `%LOCALAPPDATA%\P2PRemote\plugin-config\`，每份 JSON 上限 16 KiB。
+输入和菜单回调经有界队列跨线程传递。组合键最多 8 个键，文本最多 256 个 UTF-16 代码单元。两端在加密插件通道中确认批量输入能力，再通过可靠控制通道发送输入。Windows 前台应用和输入法决定实际可用的状态及注入行为。
+
+#### Qt 菜单位置
+
+```lua
+local id = p2p.ui.add_menu({
+    menu = "input",
+    path = {"快捷键", "常用"},
+    section = "macros",
+    order = 20,
+    label = "打开任务管理器",
+    on_click = function() p2p.input.send_keys({"Ctrl", "Shift", "Esc"}) end
+})
+```
+
+- 必填字段为 `menu`、`label`、`on_click`。内置菜单 ID 为 `display`（画面）、`audio`（音频）、`input`（输入）、`tools`（工具）、`actions`（菜单）。自定义 ID 须提供 `menu_title`。相同 ID 合并，按 `menu_order`、插件 ID 和注册顺序选择标题及位置。
+- `path` 是最多三层的子菜单标题数组。`section` 将同级命令分组，`order` 控制显示顺序。`display` 的 `resolution`、`bitrate` 和 `overlays` 分别对应分辨率、码率和画面浮层。
+- `checked` 为布尔值时创建可勾选命令。默认用 `presentation = "item"`。声明 `presentation = "button"` 可作为顶栏直达按钮，此时省略 `path`。自定义菜单和直达按钮共占两个额外位置，剩余项目进入「更多」。
+- `menu`、`section` 使用插件 ID 的字符规则，`more`、`plugins` 为保留菜单 ID。顺序权重默认 50，有效范围为 -10000 到 10000。
+
+#### Qt 设置页位置
+
+插件在 `plugin.json` 中声明 `settings` 字段及对应的 `settings_ui`。
+
+```json
+"settings_ui": {
+  "mode": "page",
+  "page": "input",
+  "page_title": "输入与控制",
+  "nav_group": "软件设置",
+  "section": "快捷输入",
+  "order": 40
+}
+```
+
+- `mode: "embed"` 将卡片加入 `appearance`、`general` 或 `stream-audio`。
+- `mode: "page"` 创建功能页，需填写自定义 `page` ID 和 `page_title`。相同 ID 的卡片共用一页，按 `order` 排序。首张卡片确定页面的标题和导航分组。导航默认归入「软件设置」，也可指定「插件与扩展」。`section` 省略时使用插件名称。
+- 「插件总览」的「前往配置」可定位到对应卡片。字段支持 `bool`、`string`、`int`、`number` 和 `select`。
+- 设置页与 Lua 共用 `%LOCALAPPDATA%\P2PRemote\plugin-config\<id>.viewer.json`，被控端使用 `<id>.host.json`。每份 JSON 上限 16 KiB。
 
 ### Phase 3（后续增量扩展）
 

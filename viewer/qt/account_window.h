@@ -71,7 +71,6 @@ private:
     QPointer<RemoteWindow> viewer_;
     QPointer<SettingsDialog> settings_dialog_;
     TitleBar* title_bar_{};
-    bool dwm_applied_{};
     QWinEventNotifier account_event_;
     QTimer refresh_;
     Request request_{Request::none};

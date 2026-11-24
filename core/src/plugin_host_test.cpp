@@ -328,7 +328,12 @@ void TestWorkspace() {
     fixture.Plugin("office", R"lua(
         local api, id = p2p.ui, nil
         local saved = p2p.config.get("enabled", false)
-        id = api.add_menu("测试开关", function()
+        assert(not api.add_menu({label = "缺少归属", on_click = function() end}))
+        assert(not api.add_menu({menu = "tools", label = "路径过长",
+            path = {"1", "2", "3", "4"}, on_click = function() end}))
+        id = api.add_menu({menu = "office-tools", menu_title = "办公", menu_order = 20,
+            path = {"输入", "同步"}, section = "shortcuts", order = 10,
+            label = "测试开关", checked = saved, on_click = function()
             assert(api.set_checked(id, true))
             assert(not api.set_checked(id + 1, true))
             assert(p2p.config.set("enabled", true))
@@ -348,7 +353,7 @@ void TestWorkspace() {
             assert(p2p.video.set_bitrate("economy"))
             assert(api.notify("更新完成"))
             assert(p2p.channel.send("done", ""))
-        end, saved)
+        end})
         assert(id and p2p.channel.send("loaded", saved and "yes" or "no"))
     )lua", "viewer", "main.lua", true, R"("channel", "ui", "config", "video", "input")");
 
@@ -361,6 +366,10 @@ void TestWorkspace() {
     Check(log.Wait({"office", "loaded", "no"}), "Office plugin did not load");
     const auto initial = viewer.Menu();
     Check(initial.size() == 1 && initial[0].label == L"测试开关" && initial[0].checked == false, "Wrong menu state");
+    Check(initial[0].plugin_id == "office" && initial[0].menu == "office-tools" &&
+        initial[0].menu_title == L"办公" && initial[0].path == L"输入\x1f" L"同步" &&
+        initial[0].section == "shortcuts" && initial[0].menu_order == 20 && initial[0].order == 10 &&
+        !initial[0].toolbar_button, "Menu placement was not preserved");
     viewer.Invoke(initial[0].id + 1);
     viewer.Invoke(initial[0].id);
     Check(log.Wait({"office", "done", ""}), "Menu invokes the wrong handler or a workspace API failed");

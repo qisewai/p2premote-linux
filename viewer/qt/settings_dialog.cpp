@@ -17,6 +17,8 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStyle>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -88,25 +90,61 @@ SettingsDialog::SettingsDialog(QWidget* parent)
 
     contentLayout()->addWidget(body, 1);
 
-    auto addNavPage = [&](const QString& label, QWidget* page) {
+    auto addNavPage = [&](const QString& label, QScrollArea* page) {
         const int page_idx = pages_->addWidget(page);
         auto* item = new QListWidgetItem(label, nav_);
         const int nav_row = nav_->row(item);
         nav_to_page_.insert(nav_row, page_idx);
+        return nav_row;
     };
 
     addNavHeader(nav_, QStringLiteral("软件设置"));
-    addNavPage(QStringLiteral("外观与皮肤"), buildAppearancePage());
-    addNavPage(QStringLiteral("常规与使用"), buildGeneralPage());
-    addNavPage(QStringLiteral("画面与音频"), buildStreamAudioPage());
+    const QHash<QString, int> builtin{
+        {QStringLiteral("appearance"), addNavPage(QStringLiteral("外观与皮肤"), buildAppearancePage())},
+        {QStringLiteral("general"), addNavPage(QStringLiteral("常规与使用"), buildGeneralPage())},
+        {QStringLiteral("stream-audio"), addNavPage(QStringLiteral("画面与音频"), buildStreamAudioPage())}
+    };
 
-    const auto plugins = AppSettings::discoverPlugins();
-    addNavHeader(nav_, QStringLiteral("插件与扩展"));
-    addNavPage(QStringLiteral("插件总览"), buildPluginsOverviewPage(plugins));
+    auto plugins = AppSettings::discoverPlugins();
+    std::stable_sort(plugins.begin(), plugins.end(), [](const auto& a, const auto& b) {
+        return a.order < b.order;
+    });
+    struct Page {
+        QString id, title;
+        bool extension{};
+        QVector<const PluginSettingSpec*> specs;
+    };
+    QVector<Page> contributed;
     for (const auto& spec : plugins) {
         if (spec.fields.isEmpty()) continue;
-        addNavPage(spec.name, buildPluginSettingsPage(spec));
+        if (spec.placement == PluginSettingSpec::Placement::embed) {
+            addPluginCard(spec, builtin.value(spec.page));
+        } else {
+            const auto page = std::ranges::find(contributed, spec.page, &Page::id);
+            if (page == contributed.end()) {
+                contributed.append({spec.page, spec.page_title, spec.extension_page, {&spec}});
+            } else {
+                page->specs.append(&spec);
+            }
+        }
     }
+    const auto addContributedPages = [&](bool extension) {
+        for (const auto& page : contributed) {
+            if (page.extension != extension) continue;
+            auto* container = new QWidget(pages_);
+            auto* layout = new QVBoxLayout(container);
+            layout->setContentsMargins(22, 18, 22, 18);
+            layout->setSpacing(14);
+            layout->addWidget(makeSectionTitle(page.title, container));
+            layout->addStretch(1);
+            const int row = addNavPage(page.title, wrapScrollable(container, pages_));
+            for (const auto* spec : page.specs) addPluginCard(*spec, row);
+        }
+    };
+    addContributedPages(false);
+    addNavHeader(nav_, QStringLiteral("插件与扩展"));
+    addNavPage(QStringLiteral("插件总览"), buildPluginsOverviewPage(plugins));
+    addContributedPages(true);
 
     // Bottom footer bar
     auto* footer = new QFrame(contentWidget());
@@ -134,21 +172,19 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         }
     });
     connect(save_btn, &QPushButton::clicked, this, [this] {
-        saveAll();
-        accept();
+        if (saveAll()) accept();
     });
-    connect(close_btn, &QPushButton::clicked, this, [this] {
-        // Revert any live appearance preview if cancelled
+    connect(close_btn, &QPushButton::clicked, this, &QDialog::reject);
+    connect(this, &QDialog::rejected, this, [] {
         AppTheme::apply(AppSettings::instance().data());
-        reject();
     });
     connect(reset_btn, &QPushButton::clicked, this, &SettingsDialog::resetAll);
 
-    loadFromSettings();
+    loadAppControls(AppSettings::instance().data());
     nav_->setCurrentRow(1);
 }
 
-QWidget* SettingsDialog::buildAppearancePage() {
+QScrollArea* SettingsDialog::buildAppearancePage() {
     auto* container = new QWidget(pages_);
     auto* layout = new QVBoxLayout(container);
     layout->setContentsMargins(22, 18, 22, 18);
@@ -194,7 +230,7 @@ QWidget* SettingsDialog::buildAppearancePage() {
     return wrapScrollable(container, pages_);
 }
 
-QWidget* SettingsDialog::buildGeneralPage() {
+QScrollArea* SettingsDialog::buildGeneralPage() {
     auto* container = new QWidget(pages_);
     auto* layout = new QVBoxLayout(container);
     layout->setContentsMargins(22, 18, 22, 18);
@@ -229,7 +265,7 @@ QWidget* SettingsDialog::buildGeneralPage() {
     return wrapScrollable(container, pages_);
 }
 
-QWidget* SettingsDialog::buildStreamAudioPage() {
+QScrollArea* SettingsDialog::buildStreamAudioPage() {
     auto* container = new QWidget(pages_);
     auto* layout = new QVBoxLayout(container);
     layout->setContentsMargins(22, 18, 22, 18);
@@ -287,16 +323,13 @@ QWidget* SettingsDialog::buildStreamAudioPage() {
     return wrapScrollable(container, pages_);
 }
 
-QWidget* SettingsDialog::buildPluginsOverviewPage(const QVector<PluginSettingSpec>& plugins) {
+QScrollArea* SettingsDialog::buildPluginsOverviewPage(const QVector<PluginSettingSpec>& plugins) {
     auto* container = new QWidget(pages_);
     auto* layout = new QVBoxLayout(container);
     layout->setContentsMargins(22, 18, 22, 18);
     layout->setSpacing(12);
 
-    layout->addWidget(makeSectionTitle(QStringLiteral("插件总览与扩展说明"), container));
-    layout->addWidget(makeMuted(QStringLiteral(
-        "插件可在各自的 plugin.json 中声明 \"settings\" 字段（支持 bool / string / int / number / select），"
-        "声明后会自动出现在左侧「插件与扩展」列表中，并与 Lua 的 p2p.config.get / set 读写同一配置文件。"), container));
+    layout->addWidget(makeSectionTitle(QStringLiteral("插件总览"), container));
 
     if (plugins.isEmpty()) {
         QVBoxLayout* empty_layout{};
@@ -309,18 +342,19 @@ QWidget* SettingsDialog::buildPluginsOverviewPage(const QVector<PluginSettingSpe
             auto* card = makeCard(container, &card_layout);
             card_layout->setSpacing(4);
             auto* top = new QHBoxLayout;
-            auto* title = new QLabel(QStringLiteral("%1  (v%2)").arg(spec.name, spec.version), card);
-            title->setObjectName(QStringLiteral("titleLabel"));
+            auto* title = makeSectionTitle(QStringLiteral("%1  (v%2)").arg(spec.name, spec.version), card);
             top->addWidget(title);
             top->addStretch(1);
-            auto* badge = makeMuted(spec.fields.isEmpty()
-                ? QStringLiteral("无自定义配置项")
-                : QStringLiteral("%1 项可配置").arg(spec.fields.size()), card);
-            top->addWidget(badge);
+            if (!spec.fields.isEmpty()) {
+                auto* jump = new QPushButton(QStringLiteral("前往配置 →"), card);
+                connect(jump, &QPushButton::clicked, this, [this, id = spec.id] { showPluginConfig(id); });
+                top->addWidget(jump);
+            }
             card_layout->addLayout(top);
 
-            const auto meta = QStringLiteral("ID: %1  ·  角色: %2  ·  权限: %3")
-                .arg(spec.id, spec.roles.join(QStringLiteral("/")), spec.permissions.join(QStringLiteral(", ")));
+            const auto meta = QStringLiteral("%1  ·  %2  ·  角色 %3  ·  权限 %4")
+                .arg(spec.id, spec.enabled ? QStringLiteral("已启用") : QStringLiteral("已停用"),
+                    spec.roles.join(QStringLiteral("/")), spec.permissions.join(QStringLiteral(", ")));
             card_layout->addWidget(makeMuted(meta, card));
             if (!spec.description.isEmpty()) {
                 card_layout->addWidget(makeMuted(spec.description, card));
@@ -333,23 +367,16 @@ QWidget* SettingsDialog::buildPluginsOverviewPage(const QVector<PluginSettingSpe
     return wrapScrollable(container, pages_);
 }
 
-QWidget* SettingsDialog::buildPluginSettingsPage(const PluginSettingSpec& spec) {
-    auto* container = new QWidget(pages_);
-    auto* layout = new QVBoxLayout(container);
-    layout->setContentsMargins(22, 18, 22, 18);
-    layout->setSpacing(14);
-
-    layout->addWidget(makeSectionTitle(spec.name, container));
-    const auto subtitle = spec.description.isEmpty()
-        ? QStringLiteral("插件 ID：%1  ·  版本 v%2").arg(spec.id, spec.version)
-        : spec.description;
-    layout->addWidget(makeMuted(subtitle, container));
-
+void SettingsDialog::addPluginCard(const PluginSettingSpec& spec, int nav_row) {
+    auto* page = static_cast<QScrollArea*>(pages_->widget(nav_to_page_.value(nav_row)));
+    auto* container = page->widget();
+    auto* layout = static_cast<QVBoxLayout*>(container->layout());
     QVBoxLayout* card_layout{};
     auto* card = makeCard(container, &card_layout);
+    card_layout->addWidget(makeSectionTitle(spec.section, card));
+    if (!spec.description.isEmpty()) card_layout->addWidget(makeMuted(spec.description, card));
 
-    PluginPageBinding binding;
-    binding.spec = spec;
+    PluginCardBinding binding{spec.id, card, nav_row, {}};
     const auto saved = AppSettings::loadPluginConfig(spec.id);
 
     for (const auto& field : spec.fields) {
@@ -372,6 +399,7 @@ QWidget* SettingsDialog::buildPluginSettingsPage(const PluginSettingSpec& spec) 
             h->setContentsMargins(0, 0, 0, 0);
             h->setSpacing(12);
             auto* lbl = new QLabel(field.label, row_box);
+            lbl->setTextFormat(Qt::PlainText);
             lbl->setMinimumWidth(140);
             h->addWidget(lbl);
 
@@ -418,18 +446,34 @@ QWidget* SettingsDialog::buildPluginSettingsPage(const PluginSettingSpec& spec) 
         }
 
         card_layout->addWidget(row_box);
-        binding.fields.append({field, control});
+        PluginFieldBinding field_binding{field, control, {}};
+        field_binding.initial = fieldValue(field_binding);
+        binding.fields.append(std::move(field_binding));
     }
 
-    plugin_pages_.append(std::move(binding));
-    layout->addWidget(card);
-    layout->addStretch(1);
-    return wrapScrollable(container, pages_);
+    plugin_cards_.append(std::move(binding));
+    layout->insertWidget(layout->count() - 1, card);
 }
 
-void SettingsDialog::loadFromSettings() {
+void SettingsDialog::showPluginConfig(const QString& id) {
+    const auto binding = std::ranges::find(plugin_cards_, id, &PluginCardBinding::id);
+    if (binding == plugin_cards_.end()) return;
+    nav_->setCurrentRow(binding->nav_row);
+    auto* page = static_cast<QScrollArea*>(pages_->currentWidget());
+    auto* card = binding->card;
+    page->ensureWidgetVisible(card->layout()->itemAt(0)->widget());
+    const auto highlight = [card](bool selected) {
+        card->setProperty("settingFocus", selected);
+        card->style()->unpolish(card);
+        card->style()->polish(card);
+        card->update();
+    };
+    highlight(true);
+    QTimer::singleShot(1400, card, [highlight] { highlight(false); });
+}
+
+void SettingsDialog::loadAppControls(const AppSettingsData& d) {
     loading_ = true;
-    const auto& d = AppSettings::instance().data();
 
     auto setComboData = [](QComboBox* combo, const QVariant& value) {
         const QSignalBlocker b(combo);
@@ -476,39 +520,47 @@ void SettingsDialog::previewAppearance() {
     AppTheme::apply(collectAppSettings());
 }
 
-void SettingsDialog::saveAll() {
+QJsonValue SettingsDialog::fieldValue(const PluginFieldBinding& fb) {
+    if (fb.field.type == QStringLiteral("bool")) return static_cast<QCheckBox*>(fb.widget)->isChecked();
+    if (fb.field.type == QStringLiteral("int")) return static_cast<QSpinBox*>(fb.widget)->value();
+    if (fb.field.type == QStringLiteral("number")) return static_cast<QDoubleSpinBox*>(fb.widget)->value();
+    if (fb.field.type == QStringLiteral("select")) {
+        return static_cast<QComboBox*>(fb.widget)->currentData().toString();
+    }
+    return static_cast<QLineEdit*>(fb.widget)->text();
+}
+
+bool SettingsDialog::saveAll() {
+    for (auto& card : plugin_cards_) {
+        QJsonObject updates;
+        for (const auto& field : card.fields) {
+            const auto value = fieldValue(field);
+            if (plugin_reset_ || value != field.initial) updates.insert(field.field.key, value);
+        }
+        if (updates.isEmpty()) continue;
+        if (!AppSettings::savePluginConfig(card.id, updates)) {
+            save_hint_->setText(QStringLiteral("无法保存 %1 的设置。").arg(card.id));
+            showPluginConfig(card.id);
+            return false;
+        }
+        for (auto& field : card.fields) field.initial = fieldValue(field);
+    }
     const auto next = collectAppSettings();
     AppSettings::instance().save(next);
     AppTheme::apply(next);
-
-    for (const auto& page : plugin_pages_) {
-        QJsonObject cfg = AppSettings::loadPluginConfig(page.spec.id);
-        for (const auto& fb : page.fields) {
-            if (!fb.widget) continue;
-            if (fb.field.type == QStringLiteral("bool")) {
-                cfg.insert(fb.field.key, static_cast<QCheckBox*>(fb.widget)->isChecked());
-            } else if (fb.field.type == QStringLiteral("int")) {
-                cfg.insert(fb.field.key, static_cast<QSpinBox*>(fb.widget)->value());
-            } else if (fb.field.type == QStringLiteral("number")) {
-                cfg.insert(fb.field.key, static_cast<QDoubleSpinBox*>(fb.widget)->value());
-            } else if (fb.field.type == QStringLiteral("select")) {
-                cfg.insert(fb.field.key, static_cast<QComboBox*>(fb.widget)->currentData().toString());
-            } else {
-                cfg.insert(fb.field.key, static_cast<QLineEdit*>(fb.widget)->text());
-            }
-        }
-        AppSettings::savePluginConfig(page.spec.id, cfg);
-    }
+    return true;
 }
 
 void SettingsDialog::resetAll() {
-    AppSettings::instance().resetDefaults();
-    loadFromSettings();
-    AppTheme::apply(AppSettings::instance().data());
+    AppSettingsData defaults;
+    defaults.default_server = AppSettings::instance().data().default_server;
+    loadAppControls(defaults);
+    previewAppearance();
+    plugin_reset_ = true;
+    save_hint_->setText(QStringLiteral("已恢复默认值，保存后生效。"));
 
-    for (const auto& page : plugin_pages_) {
-        for (const auto& fb : page.fields) {
-            if (!fb.widget) continue;
+    for (const auto& card : plugin_cards_) {
+        for (const auto& fb : card.fields) {
             if (fb.field.type == QStringLiteral("bool")) {
                 static_cast<QCheckBox*>(fb.widget)->setChecked(fb.field.default_value.toBool());
             } else if (fb.field.type == QStringLiteral("int")) {

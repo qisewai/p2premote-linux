@@ -13,6 +13,14 @@ struct PluginMenuItem {
     unsigned id{};
     std::wstring label;
     std::optional<bool> checked;
+    std::string plugin_id;
+    std::string menu;
+    std::wstring menu_title;
+    std::wstring path;
+    std::string section;
+    int menu_order{50};
+    int order{50};
+    bool toolbar_button{};
 };
 
 struct PluginMetrics {

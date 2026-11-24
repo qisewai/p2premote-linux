@@ -48,6 +48,7 @@ struct PluginSettingField {
 };
 
 struct PluginSettingSpec {
+    enum class Placement { none, embed, page };
     QString id;
     QString name;
     QString version;
@@ -56,6 +57,12 @@ struct PluginSettingSpec {
     QStringList roles;
     QStringList permissions;
     QVector<PluginSettingField> fields;
+    Placement placement{Placement::none};
+    QString page;
+    QString page_title;
+    QString section;
+    int order{50};
+    bool extension_page{};
 };
 
 class AppSettings final : public QObject {
@@ -67,7 +74,6 @@ public:
     const AppSettingsData& data() const noexcept { return data_; }
     void reload();
     void save(const AppSettingsData& next);
-    void resetDefaults();
 
     static QString pluginsDirectory();
     static QString pluginConfigDirectory();

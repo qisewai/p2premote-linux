@@ -7,6 +7,7 @@
   "roles": ["viewer"],
   "enabled": true,
   "permissions": ["ui", "video", "config"],
+  "settings_ui": { "mode": "embed", "page": "stream-audio", "order": 10 },
   "settings": [
     {
       "key": "enabled",

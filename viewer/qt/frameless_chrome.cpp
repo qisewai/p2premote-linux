@@ -22,22 +22,48 @@ constexpr DWORD kDwmwcpRound = 2;
 
 } // namespace
 
-void applyWin32FramelessChrome(QWidget* window) {
-    if (!window) return;
+void applyWin32FramelessChrome(QWidget* window, bool allow_maximize) {
+    if (window->isFullScreen()) return;
     const auto hwnd = reinterpret_cast<HWND>(window->winId());
-    if (!hwnd) return;
+
+    // Qt keeps its frameless geometry while Windows handles window transitions.
+    const auto previous_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const auto style = (previous_style & ~static_cast<LONG_PTR>(WS_MAXIMIZEBOX)) |
+        WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX |
+        (allow_maximize ? WS_MAXIMIZEBOX : 0);
+    if (style == previous_style) return;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+
+    const MARGINS frame{0, 0, 1, 0};
+    DwmExtendFrameIntoClientArea(hwnd, &frame);
     const DWORD pref = kDwmwcpRound;
     DwmSetWindowAttribute(hwnd, kDwmwaWindowCornerPreference, &pref, sizeof(pref));
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-bool handleFramelessResizeHitTest(QWidget* window, void* native_msg, qintptr* result, int border_px) {
-    if (!window || !native_msg || !result) return false;
-    if (window->isMaximized() || window->isFullScreen()) return false;
+bool handleWin32FramelessChrome(QWidget* window, void* native_msg, qintptr* result) {
     const auto* msg = static_cast<const MSG*>(native_msg);
-    if (msg->message != WM_NCHITTEST) return false;
+    if (msg->message == WM_NCCALCSIZE && msg->wParam) {
+        // Use the whole window as client area. Maximized windows have an
+        // invisible resize border that extends beyond the monitor work area.
+        if (IsZoomed(msg->hwnd) && (GetWindowLongPtrW(msg->hwnd, GWL_STYLE) & WS_THICKFRAME)) {
+            auto& client = reinterpret_cast<NCCALCSIZE_PARAMS*>(msg->lParam)->rgrc[0];
+            const auto monitor = MonitorFromRect(&client, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            RECT visible{};
+            if (GetMonitorInfoW(monitor, &info) && IntersectRect(&visible, &client, &info.rcWork)) {
+                client = visible;
+            }
+        }
+        *result = 0;
+        return true;
+    }
+    if (msg->message != WM_NCHITTEST || window->isMaximized() || window->isFullScreen()) return false;
 
     const auto dpr = window->devicePixelRatioF();
-    const int margin = std::max(4, static_cast<int>(border_px * dpr));
+    const int margin = std::max(4, static_cast<int>(6 * dpr));
     RECT rect{};
     if (!GetWindowRect(msg->hwnd, &rect)) return false;
 
@@ -57,6 +83,15 @@ bool handleFramelessResizeHitTest(QWidget* window, void* native_msg, qintptr* re
     if (top) { *result = HTTOP; return true; }
     if (bottom) { *result = HTBOTTOM; return true; }
     return false;
+}
+
+void minimizeFramelessWindow(QWidget* window) {
+    SendMessageW(reinterpret_cast<HWND>(window->winId()), WM_SYSCOMMAND, SC_MINIMIZE, 0);
+}
+
+void toggleFramelessMaximize(QWidget* window) {
+    const auto hwnd = reinterpret_cast<HWND>(window->winId());
+    SendMessageW(hwnd, WM_SYSCOMMAND, IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE, 0);
 }
 
 TitleBar::TitleBar(QWidget* host_window, const QString& title, bool show_maximize,
@@ -92,7 +127,7 @@ TitleBar::TitleBar(QWidget* host_window, const QString& title, bool show_maximiz
     min_btn_->setFocusPolicy(Qt::NoFocus);
     layout_->addWidget(min_btn_);
     connect(min_btn_, &QPushButton::clicked, this, [this] {
-        if (host_) host_->showMinimized();
+        if (host_) minimizeFramelessWindow(host_);
     });
 
     if (allow_maximize_) {
@@ -102,10 +137,7 @@ TitleBar::TitleBar(QWidget* host_window, const QString& title, bool show_maximiz
         max_btn_->setFocusPolicy(Qt::NoFocus);
         layout_->addWidget(max_btn_);
         connect(max_btn_, &QPushButton::clicked, this, [this] {
-            if (!host_) return;
-            if (host_->isMaximized()) host_->showNormal();
-            else host_->showMaximized();
-            syncMaximizeState();
+            if (host_) toggleFramelessMaximize(host_);
         });
     }
 
@@ -146,9 +178,7 @@ void TitleBar::mousePressEvent(QMouseEvent* event) {
 
 void TitleBar::mouseDoubleClickEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton && allow_maximize_ && host_) {
-        if (host_->isMaximized()) host_->showNormal();
-        else host_->showMaximized();
-        syncMaximizeState();
+        toggleFramelessMaximize(host_);
         event->accept();
         return;
     }
@@ -156,7 +186,7 @@ void TitleBar::mouseDoubleClickEvent(QMouseEvent* event) {
 }
 
 FramelessDialog::FramelessDialog(const QString& title, bool allow_maximize, QWidget* parent)
-    : QDialog(parent, Qt::Dialog | Qt::FramelessWindowHint) {
+    : QDialog(parent, Qt::Dialog | Qt::FramelessWindowHint), allow_maximize_(allow_maximize) {
     setWindowTitle(title);
 
     auto* outer = new QVBoxLayout(this);
@@ -188,10 +218,7 @@ void FramelessDialog::setDialogTitle(const QString& title) {
 
 void FramelessDialog::showEvent(QShowEvent* event) {
     QDialog::showEvent(event);
-    if (!dwm_applied_) {
-        dwm_applied_ = true;
-        applyWin32FramelessChrome(this);
-    }
+    applyWin32FramelessChrome(this, allow_maximize_);
     if (title_bar_) title_bar_->syncMaximizeState();
 }
 
@@ -203,6 +230,6 @@ void FramelessDialog::changeEvent(QEvent* event) {
 }
 
 bool FramelessDialog::nativeEvent(const QByteArray& type, void* message, qintptr* result) {
-    if (handleFramelessResizeHitTest(this, message, result)) return true;
+    if (handleWin32FramelessChrome(this, message, result)) return true;
     return QDialog::nativeEvent(type, message, result);
 }

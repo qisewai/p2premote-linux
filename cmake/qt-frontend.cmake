@@ -24,6 +24,8 @@ add_executable(p2premote_qt WIN32
     viewer/qt/frameless_chrome.h
     viewer/qt/plugin_dialog.cpp
     viewer/qt/plugin_dialog.h
+    viewer/qt/plugin_menu.cpp
+    viewer/qt/plugin_menu.h
     viewer/qt/remote_window.cpp
     viewer/qt/remote_window.h
     viewer/connection_overlay.cpp

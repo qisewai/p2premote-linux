@@ -1316,30 +1316,132 @@ private:
 
     static int AddMenu(lua_State* state) {
         auto& self = Self(state);
-        const auto text = CheckString(state, 1);
-        luaL_checktype(state, 2, LUA_TFUNCTION);
-        if (!lua_isnoneornil(state, 3)) luaL_checktype(state, 3, LUA_TBOOLEAN);
+        luaL_checktype(state, 1, LUA_TTABLE);
+        luaL_argcheck(state, lua_gettop(state) == 1, 1, "expected one menu declaration");
+        MenuField(state, "on_click");
+        luaL_checktype(state, -1, LUA_TFUNCTION);
         const auto slot = std::ranges::find(self.menu_, 0u, &MenuCallback::id);
         unsigned id{};
         if (!self.runtime_.host && self.runtime_.Connected() && slot != self.menu_.end()) {
-            Subscribe(state, 2, slot->ref);
             try {
-                auto label = UiText(text, 64);
-                if (label && label->find_first_of(L"\r\n\t") == std::wstring::npos) {
-                    std::optional<bool> checked;
-                    if (lua_isboolean(state, 3)) checked = lua_toboolean(state, 3) != 0;
-                    id = self.runtime_.workspace.AddMenu({0, std::move(*label), checked});
+                if (auto item = ReadMenu(state)) {
+                    item->plugin_id = self.manifest_.id;
+                    Subscribe(state, 2, slot->ref);
+                    id = self.runtime_.workspace.AddMenu(std::move(*item));
                     slot->id = id;
                 }
             } catch (...) {}
-            if (!id) {
+            if (!id && slot->ref != LUA_NOREF) {
                 luaL_unref(state, LUA_REGISTRYINDEX, slot->ref);
                 *slot = {};
             }
         }
+        lua_settop(state, 1);
         if (id) lua_pushinteger(state, id);
         else lua_pushnil(state);
         return 1;
+    }
+
+    static void MenuField(lua_State* state, const char* name) {
+        lua_pushstring(state, name);
+        lua_rawget(state, 1);
+    }
+
+    static std::optional<PluginMenuItem> ReadMenu(lua_State* state) {
+        const auto string_field = [state](const char* key) -> std::optional<std::string_view> {
+            MenuField(state, key);
+            std::optional<std::string_view> result;
+            if (lua_type(state, -1) == LUA_TSTRING) {
+                size_t size{};
+                const auto* text = lua_tolstring(state, -1, &size);
+                result = std::string_view(text, size);
+            } else if (lua_isnil(state, -1)) {
+                result = std::string_view{};
+            }
+            lua_pop(state, 1);
+            return result;
+        };
+        const auto order_field = [state](const char* key) -> std::optional<int> {
+            MenuField(state, key);
+            std::optional<int> result;
+            if (lua_isnil(state, -1)) result = 50;
+            if (lua_isinteger(state, -1)) {
+                const auto value = lua_tointeger(state, -1);
+                if (value >= -10000 && value <= 10000) result = static_cast<int>(value);
+            }
+            lua_pop(state, 1);
+            return result;
+        };
+        const auto display_text = [](std::string_view text) -> std::optional<std::wstring> {
+            auto value = UiText(text, 64);
+            if (!value || std::ranges::any_of(*value, [](wchar_t ch) { return ch < 32 || ch == 127; })) {
+                return std::nullopt;
+            }
+            return value;
+        };
+        const auto label = string_field("label");
+        const auto menu = string_field("menu");
+        const auto title = string_field("menu_title");
+        const auto section = string_field("section");
+        const auto presentation = string_field("presentation");
+        const auto menu_order = order_field("menu_order");
+        const auto order = order_field("order");
+        if (!label || !menu || !title || !section || !presentation || !menu_order || !order ||
+            !IsPluginIdentifier(*menu) || (!section->empty() && !IsPluginIdentifier(*section)) ||
+            *menu == "plugins" || *menu == "more") return std::nullopt;
+
+        auto label_text = display_text(*label);
+        const bool builtin = *menu == "display" || *menu == "audio" || *menu == "input" ||
+            *menu == "tools" || *menu == "actions";
+        auto title_text = builtin ? std::optional<std::wstring>(std::in_place) : display_text(*title);
+        if (!label_text || !title_text) return std::nullopt;
+        const bool button = *presentation == "button";
+        if (!button && !presentation->empty() && *presentation != "item") return std::nullopt;
+
+        PluginMenuItem result;
+        result.label = std::move(*label_text);
+        result.menu.assign(*menu);
+        result.menu_title = std::move(*title_text);
+        result.section.assign(*section);
+        result.menu_order = *menu_order;
+        result.order = *order;
+        result.toolbar_button = button;
+
+        MenuField(state, "checked");
+        const bool checked_valid = lua_isnil(state, -1) || lua_isboolean(state, -1);
+        if (lua_isboolean(state, -1)) result.checked = lua_toboolean(state, -1) != 0;
+        lua_pop(state, 1);
+        if (!checked_valid) return std::nullopt;
+
+        MenuField(state, "path");
+        if (lua_isnil(state, -1)) {
+            lua_pop(state, 1);
+            return result;
+        }
+        if (!lua_istable(state, -1) || button || lua_rawlen(state, -1) > 3) return std::nullopt;
+        const auto count = lua_rawlen(state, -1);
+        size_t fields{};
+        lua_pushnil(state);
+        while (lua_next(state, -2) != 0) {
+            if (!lua_isinteger(state, -2) || lua_tointeger(state, -2) < 1 ||
+                static_cast<size_t>(lua_tointeger(state, -2)) > count) return std::nullopt;
+            ++fields;
+            lua_pop(state, 1);
+        }
+        if (fields != count) return std::nullopt;
+        for (size_t i = 1; i <= count; ++i) {
+            lua_rawgeti(state, -1, static_cast<lua_Integer>(i));
+            if (lua_type(state, -1) != LUA_TSTRING) return std::nullopt;
+            size_t size{};
+            const auto* text = lua_tolstring(state, -1, &size);
+            auto segment = display_text(std::string_view(text, size));
+            lua_pop(state, 1);
+            if (!segment) return std::nullopt;
+            if (i > 1) result.path += L'\x1f';
+            result.path += *segment;
+        }
+        lua_pop(state, 1);
+        return result;
     }
 
     static int CheckMenu(lua_State* state) {
@@ -2121,7 +2223,7 @@ private:
         if (!settings_) {
             auto path = runtime_.config_root;
             if (!path.empty()) {
-                const auto* extension = runtime_.host ? ".host.json" : (manifest_.overlay ? ".json" : ".viewer.json");
+                const auto* extension = runtime_.host ? ".host.json" : ".viewer.json";
                 path /= manifest_.id + extension;
             }
             settings_.emplace(std::move(path));

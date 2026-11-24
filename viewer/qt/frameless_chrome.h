@@ -8,8 +8,10 @@ class QLabel;
 class QPushButton;
 class QVBoxLayout;
 
-void applyWin32FramelessChrome(QWidget* window);
-bool handleFramelessResizeHitTest(QWidget* window, void* native_msg, qintptr* result, int border_px = 6);
+void applyWin32FramelessChrome(QWidget* window, bool allow_maximize = true);
+bool handleWin32FramelessChrome(QWidget* window, void* native_msg, qintptr* result);
+void minimizeFramelessWindow(QWidget* window);
+void toggleFramelessMaximize(QWidget* window);
 
 class TitleBar final : public QFrame {
     Q_OBJECT
@@ -58,5 +60,5 @@ private:
     TitleBar* title_bar_{};
     QWidget* content_{};
     QVBoxLayout* content_layout_{};
-    bool dwm_applied_{};
+    bool allow_maximize_{true};
 };

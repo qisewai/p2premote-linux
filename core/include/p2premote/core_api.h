@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define P2P_CORE_ABI_VERSION 2u
+#define P2P_CORE_ABI_VERSION 3u
 /* The viewer posts this message to video_parent for a local F11 fullscreen toggle. */
 #define P2P_VIDEO_FULLSCREEN_MESSAGE 0x8042u
 
@@ -68,9 +68,15 @@ typedef struct p2p_stream_snapshot_v1 {
 
 typedef struct p2p_menu_item {
     const wchar_t* label;
+    const char* plugin_id;
+    const char* menu;
+    const wchar_t* menu_title;
+    /* Submenu labels, separated by U+001F. */
+    const wchar_t* path;
+    const char* section;
     uint32_t id;
     /* -1 means a plain command, 0 and 1 indicate a toggle. */
-    int32_t checked;
+    int32_t checked, menu_order, order, toolbar_button;
 } p2p_menu_item;
 
 typedef struct p2p_ui_command {
@@ -174,6 +180,7 @@ P2P_CORE_API size_t p2p_stream_read_menu(p2p_stream* stream);
 /* Menu text views expire at the next read_menu call or destruction. */
 P2P_CORE_API int32_t p2p_stream_menu_item(const p2p_stream* stream, size_t index, p2p_menu_item* item);
 P2P_CORE_API int32_t p2p_stream_invoke_menu(p2p_stream* stream, uint32_t id);
+P2P_CORE_API int32_t p2p_plugin_update_viewer_config(const char* plugin_id, const char* updates_json);
 /*
  * Declarative plugin UI commands and events (UTF-8 JSON, frontend-agnostic).
  * poll_ui_command returns P2P_OK when a command is dequeued, P2P_PENDING when empty.
