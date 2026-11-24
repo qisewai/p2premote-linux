@@ -234,10 +234,13 @@ public:
         if (software_) return software_->SetTargetBitrate(bitrate);
         if (bitrate == config_.init_bitrate) return 0;
         if (!SetNumber(api_.get(), CODECAPI_AVEncCommonMeanBitRate, bitrate)) return -1;
-        // If bitrate jumped significantly upward (e.g. startup ramp-up), request a clean keyframe
-        // so low-bitrate blur does not persist across a long P-frame chain.
+        SetDesktopBufferSize(api_.get(), bitrate);
+        // A static desktop can benefit from a fresh high-quality reference.
+        // During motion, let the regular GOP handle it instead of adding an IDR
+        // just as the bandwidth estimate starts growing.
         if (config_.init_bitrate > 0 && bitrate >= 2LL * config_.init_bitrate) {
-            force_idr_ = true;
+            if (config_.video_content_type == VideoContentType::ScreenContent) refresh_static_ = true;
+            else force_idr_ = true;
         }
         config_.init_bitrate = bitrate;
         return 0;
@@ -261,6 +264,14 @@ public:
     }
 
 private:
+    void SetDesktopBufferSize(ICodecAPI* api, int bitrate) const {
+        if (config_.video_content_type != VideoContentType::ScreenContent || bitrate <= 0) return;
+        // H.264 HRD capacity is in bytes. A 125 ms buffer retains text detail
+        // across scroll frames while bounding the credit accumulated at idle.
+        constexpr int buffers_per_second = 8;
+        SetNumber(api, CODECAPI_AVEncCommonBufferSize, std::max(1, bitrate / 8 / buffers_per_second));
+    }
+
     void CloseHardware() {
         if (waiter_) waiter_->Cancel();
         generator_ = nullptr;
@@ -309,6 +320,10 @@ private:
         SetNumber(api.get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         const auto fps = static_cast<UINT>(std::clamp(config_.max_frame_rate, 1, 60));
         SetNumber(api.get(), CODECAPI_AVEncMPVGOPSize, fps * 2);
+        if (config_.video_content_type == VideoContentType::ScreenContent && config_.init_bitrate > 0) {
+            SetDesktopBufferSize(api.get(), config_.init_bitrate);
+            SetNumber(api.get(), CODECAPI_AVEncCommonMeanBitRate, config_.init_bitrate);
+        }
         const auto h264 = VideoType(MFVideoFormat_H264, width, height, fps);
         check_hresult(h264->SetUINT32(MF_MT_AVG_BITRATE, config_.init_bitrate));
         check_hresult(h264->SetUINT32(MF_MT_MPEG2_PROFILE, profile));
@@ -324,6 +339,11 @@ private:
 
     void EncodeHardware(const RawFrame& raw, const std::function<int(const EncodedFrame&)>& output) {
         if (raw.Width() != width_ || raw.Height() != height_) Open(raw.Width(), raw.Height());
+        const auto captured = raw.CapturedTimestamp();
+        const bool sparse = last_capture_us_ > 0 && captured - last_capture_us_ >= 250'000;
+        if (refresh_static_ && sparse && previous_sparse_) force_idr_ = true;
+        last_capture_us_ = captured;
+        previous_sparse_ = sparse;
         if (std::exchange(force_idr_, false) && !SetNumber(api_.get(), CODECAPI_AVEncVideoForceKeyFrame, 1)) Open(width_, height_);
         const auto* native = raw.NativeFrame();
         com_ptr<ID3D11Texture2D> uploaded;
@@ -364,6 +384,7 @@ private:
         const auto nal = AnnexBUnits(payload.data, payload.size);
         if (!nal) winrt::throw_hresult(MF_E_INVALID_STREAM_DATA);
         constexpr unsigned idr = 1u << 5;
+        if (nal & idr) refresh_static_ = false;
         constexpr unsigned parameter_sets = (1u << 7) | (1u << 8);
         std::vector<uint8_t> with_headers;
         if ((nal & idr) && (nal & parameter_sets) != parameter_sets) {
@@ -401,7 +422,8 @@ private:
     std::unique_ptr<OpenH264Encoder> software_;
     std::atomic<uint64_t> resolution_{};
     UINT width_{}, height_{}, input_requests_{};
-    bool force_idr_{}, reported_{};
+    int64_t last_capture_us_{};
+    bool force_idr_{}, refresh_static_{}, previous_sparse_{}, reported_{};
 };
 
 class WindowsDecoder final : public MediaCodec {

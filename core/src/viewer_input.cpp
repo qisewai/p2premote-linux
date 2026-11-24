@@ -9,6 +9,7 @@
 namespace p2premote {
 namespace {
 constexpr std::int64_t mouse_move_min_interval_ms = 4;
+constexpr std::int64_t drag_tail_delay_ms = 24;
 }
 
 void ViewerInput::Reset() {
@@ -28,6 +29,7 @@ bool ViewerInput::RefreshReady() {
 }
 
 void ViewerInput::Heartbeat() {
+    drag_tail_pending_ = false;
     if ((buttons_.any() || keys_.any()) && !session_.SubmitInput({InputKind::heartbeat})) ReleaseViewerInput();
 }
 
@@ -44,7 +46,11 @@ void ViewerInput::QueueMouseMove(const InputPacket& input) {
 }
 
 void ViewerInput::FlushPendingMove(bool force) {
-    if (!pending_move_ || !input_ready_) return;
+    if (!pending_move_) {
+        if (drag_tail_pending_ && PendingMoveTimeoutMs() == 0) Heartbeat();
+        return;
+    }
+    if (!input_ready_) return;
     const auto now = QpcNow();
     const auto min_interval = QpcFrequency() * mouse_move_min_interval_ms / 1000;
     if (!force && last_move_qpc_ && now - last_move_qpc_ < min_interval) return;
@@ -53,16 +59,18 @@ void ViewerInput::FlushPendingMove(bool force) {
     if (session_.SubmitInput(move)) {
         last_move_sent_ = {move.x, move.y};
         last_move_qpc_ = now;
+        drag_tail_pending_ = buttons_.any();
     }
 }
 
 DWORD ViewerInput::PendingMoveTimeoutMs() const noexcept {
-    if (!pending_move_ || !input_ready_) return INFINITE;
-    const auto min_interval = QpcFrequency() * mouse_move_min_interval_ms / 1000;
+    if ((!pending_move_ && !drag_tail_pending_) || !input_ready_) return INFINITE;
+    const auto delay = pending_move_ ? mouse_move_min_interval_ms : drag_tail_delay_ms;
+    const auto min_interval = QpcFrequency() * delay / 1000;
     const auto elapsed = last_move_qpc_ ? (QpcNow() - last_move_qpc_) : min_interval;
     if (elapsed >= min_interval) return 0;
     const auto remaining_ms = ((min_interval - elapsed) * 1000 + QpcFrequency() - 1) / QpcFrequency();
-    return static_cast<DWORD>(std::clamp<std::int64_t>(remaining_ms, 1, mouse_move_min_interval_ms));
+    return static_cast<DWORD>(remaining_ms);
 }
 
 void ViewerInput::RefreshLocalCursor() {
@@ -189,6 +197,7 @@ void ViewerInput::SetButton(InputButton button, bool down, POINT point) {
         SetCursor(cursor);
     }
     if (!SendControl(*input)) return;
+    drag_tail_pending_ = false;
     last_move_sent_ = {input->x, input->y};
     buttons_.set(code, down);
     if (down) SetCapture(surface_);
@@ -213,6 +222,7 @@ bool ViewerInput::SendControl(const InputPacket& input) {
 }
 
 void ViewerInput::ReleaseViewerInput() {
+    drag_tail_pending_ = false;
     if (!surface_) return;
     pending_move_.reset();
     last_move_sent_.reset();

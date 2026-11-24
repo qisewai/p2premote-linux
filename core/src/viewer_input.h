@@ -34,6 +34,7 @@ private:
     std::optional<InputPacket> pending_move_;
     std::optional<std::pair<std::uint16_t, std::uint16_t>> last_move_sent_;
     std::int64_t last_move_qpc_{};
+    bool drag_tail_pending_{};
     bool last_local_cursor_active_{};
     HCURSOR last_local_cursor_{};
     std::bitset<4> buttons_;

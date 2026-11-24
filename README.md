@@ -217,6 +217,19 @@ Host 可以用 `--capture-dxgi` 对照 DXGI Desktop Duplication。局域网 View
 
 编译工作区中的 `codec_probe.exe` 可以单机验证 H.264 编解码、GPU 纹理和 720p 至 1080p 的尺寸切换。探针报告的是媒体转换耗时。键鼠到画面回显的延迟需要用串流连接测试。
 
+### 自动验证静止后滚动首帧
+
+在带 D3D11 GPU 的 Windows 机器上，从仓库根目录运行以下命令。探针加载可执行文件同目录的 MiniRTC DLL，在本机建立 Host 和 Viewer，无需登录或操作桌面。
+
+```powershell
+cmake --build --preset windows-x64-qt-release --target idle_scroll_test
+ctest --test-dir out/build/windows-x64-qt -R '^idle_scroll_test$' -V
+```
+
+测试在 1080p、60 fps 下先确认接收端看到静止图，再等待一秒、补发旧帧，随后只提交一次带新标记的画面。补帧后 2 ms 和 250 ms 两组各跑 5 次。输出记录实际提交间隔和从提交到解码的毫秒数。500 ms 内未解码出新标记会输出 `MISS` 并返回非零退出码。把 `idle_scroll_test.exe` 复制到另一份解压的 Windows 发布包中运行，即可检验那一份 DLL。
+
+持续滚动的回归测试可运行 `out\build\windows-x64-qt\idle_scroll_test.exe --continuous`。它以 1080p、60 fps 和 8 Mbps 上限在本机传输滚动的文字与图像，预热后记录 8 秒。输出中的 `max_submit_gap_ms` 是发送端最长提交间隔，`max_update_gap_ms` 是主控端取得的相邻解码画面之间的最长间隔。该测试要求至少取得 440 帧且最长更新间隔小于 100 ms。若发送机自身未能按时提交，会单独报告计时无效。
+
 ## 公网连接测试
 
 在被控机启动仅监听回环地址的认证信令，再通过 HTTPS 隧道把 `/signal` 提供给两端。公网客户端使用相同的 `wss://域名/signal` 地址和各自的角色密钥。Host 仍需确认每次控制请求。
@@ -332,14 +345,28 @@ Qt Widgets 客户端使用 `p2premote_core.dll` 的 [C ABI](core/include/p2premo
 
 在 x64 Visual Studio 开发终端中设置 `VCPKG_ROOT`，指向已完成 `bootstrap-vcpkg.bat` 的 vcpkg 仓库。以下预设通过 vcpkg 的 `qt-ui` 特性安装 Qt 6，再构建和安装两个客户端。当前验证使用 Qt 6.11.3 和 vcpkg 提交 `277978ad2eddc3b05ecf288dcd33071968cd2f79`。
 
+Qt 远程终端需要 [libghostty-vt 1.0.1 Windows x64 预编译包](https://release.files.ghostty.org/libghostty-vt/1.0.1/ghostty-vt-1.0.1-x86_64-windows-gnu.zip)。按 [Ghostty 官方说明](https://lib.ghostty.org/vt/installing.html#windows) 验证后解压到 `out/ghostty-vt`，让 `out/ghostty-vt/ghostty-vt-1.0.1-x86_64-windows-gnu` 直接包含 `bin/`、`include/` 和 `lib/`。如果解压到其他位置，在首次配置时加上 `-DP2PREMOTE_GHOSTTY_VT_DIR="C:/path/to/ghostty-vt-1.0.1-x86_64-windows-gnu"`。
+
+Windows 发布产物统一放在仓库根目录的 `dist/` 下。
+
+- `dist/app/` 存放最新 Release 程序、运行库和插件。直接运行其中的 `p2premote_qt.exe`。
+- `dist/packages/` 存放带时间戳的便携 ZIP。把 ZIP 拷到目标电脑，完整解压后运行 `p2premote_qt.exe`。
+
+准备好构建依赖后，双击仓库根目录的 [Package-Windows.cmd](Package-Windows.cmd) 即可更新程序并生成 ZIP。依赖放在自定义目录时，可用 `.\Package-Windows.cmd -VcpkgRoot <路径> -MiniRtcDir <路径> -GhosttyVtDir <路径>`，也可加 `-OutputDirectory <路径>` 指定 ZIP 输出位置。
+
+也可以手动配置、编译和部署：
+
 ```powershell
 cmake --preset windows-x64-qt
 cmake --build --preset windows-x64-qt-release --parallel
 ctest --preset windows-x64-qt-release
-cmake --install out/build/windows-x64-qt --prefix out/portable/p2premote-qt-win64
 ```
 
 在安装目录运行 `p2premote_qt.exe`。选择「记住密码」后，成功登录的凭据按服务地址写入 Windows 凭据管理器。主窗口关闭可收起到系统托盘，托盘菜单可停止接收或退出程序。远控时 F11 切换全屏，鼠标移到窗口顶边可打开工具栏。点击画面接管键鼠后，按 F12 释放。
+
+启用系统服务时，安装程序会把被控端组件和加密的账号配置部署到 `Program Files\P2PRemoteHost`。旧版系统服务需要先卸载，再从新版客户端启用并重新绑定。文件传输、文件剪贴板和远程终端适用于登录用户进程中的普通接收模式。
+
+远控画面右下角默认显示连接信息。↓ 和 ↑ 是连接实际的下行和上行速率，fps 是主控端呈现帧率，「帧等待」是解码完成到开始绘制的平均等待时间。点击顶部性能按钮或「画面 → 显示右下角连接信息」可切换显示。拖动时文字模糊，可在「画面 → 画质码率」中切换「清晰 · 16 Mbps」，观察实际下行速率和画面变化。
 
 便携目录的 `licenses/` 包含 vcpkg 提供的 Qt 与其依赖许可。Qt Base 的对应源码归档可在 [Qt 下载站](https://download.qt.io/archive/qt/6.11/6.11.3/submodules/) 获取，构建补丁来自 [vcpkg qtbase port](https://github.com/microsoft/vcpkg/tree/277978ad2eddc3b05ecf288dcd33071968cd2f79/ports/qtbase)。
 

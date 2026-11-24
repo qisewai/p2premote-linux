@@ -29,7 +29,7 @@ private:
 class D3d11FrameDifference {
 public:
     explicit D3d11FrameDifference(ID3D11Device* device);
-    std::optional<UINT> ChangedTiles(ID3D11Texture2D* source, UINT width, UINT height);
+    std::optional<UINT> ChangedTiles(ID3D11Texture2D* source, UINT width, UINT height, bool active_drag = false);
     static UINT TileCount(UINT width, UINT height) noexcept;
 
 private:

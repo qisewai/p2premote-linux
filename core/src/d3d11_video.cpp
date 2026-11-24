@@ -154,7 +154,13 @@ UINT D3d11FrameDifference::TileCount(UINT width, UINT height) noexcept {
     return ((width + 31) / 32) * ((height + 31) / 32);
 }
 
-std::optional<UINT> D3d11FrameDifference::ChangedTiles(ID3D11Texture2D* source, UINT width, UINT height) {
+std::optional<UINT> D3d11FrameDifference::ChangedTiles(ID3D11Texture2D* source, UINT width, UINT height, bool active_drag) {
+    // During an active drag, avoid a GPU readback on the path to the encoder.
+    // The next comparison must start from the first frame after the drag.
+    if (active_drag) {
+        has_previous_ = false;
+        return TileCount(width, height);
+    }
     const auto deadline = QpcNow() + QpcFrequency() * 2 / 1000;
     if (width_ != width || height_ != height) Resize(width, height);
     const D3D11_BOX content{0, 0, 0, width, height, 1};

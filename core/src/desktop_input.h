@@ -4,12 +4,14 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <variant>
 
@@ -24,6 +26,7 @@ public:
 
     void Submit(const InputPacket& input);
     void Submit(InputCommand command);
+    bool DragRecentlyActive() const noexcept;
 
 private:
     struct ScreenMetrics {
@@ -37,6 +40,7 @@ private:
     };
 
     void Run(std::stop_token stop);
+    bool EnsureDesktop(bool force = false) noexcept;
     std::optional<INPUT> BuildMove(const InputPacket& input);
     void Apply(const InputPacket& input);
     void Apply(const InputCommand& command);
@@ -45,8 +49,13 @@ private:
     HMONITOR monitor_;
     LatencyTrace* trace_;
     ScreenMetrics metrics_;
+    HDESK attached_desktop_{};
+    std::wstring desktop_name_;
+    std::chrono::steady_clock::time_point last_desktop_check_{};
     std::bitset<512> keys_;
     std::bitset<4> buttons_;
+    std::optional<InputPacket> latest_move_;
+    std::atomic<ULONGLONG> last_drag_tick_{};
     std::mutex mutex_;
     std::condition_variable_any changed_;
     using PendingInput = std::variant<InputPacket, InputCommand>;

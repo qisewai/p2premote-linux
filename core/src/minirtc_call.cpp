@@ -389,7 +389,7 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
             if (label == controls_name && self.host_) {
                 self.events_->Push({StreamEventType::audio_settings, {}, {}, {}, *input});
             }
-        } else if (self.host_ && self.allow_input_ && ((input->kind == InputKind::move) == (label == motion_name))) {
+        } else if (self.host_ && self.allow_input_ && (label == controls_name || input->kind == InputKind::move)) {
             if (const auto& trace = self.events_->Trace()) trace->Pointer("input_received", *input);
             self.events_->PushInput(*input);
         }
@@ -517,8 +517,28 @@ bool MiniRtcCall::SendInput(const InputPacket& packet) {
     if (host_ || !InputReady()) return false;
     const auto bytes = EncodeInput(packet);
     const auto* data = reinterpret_cast<const char*>(bytes.data());
-    if (packet.kind == InputKind::move) return api_->send_data(peer_, data, bytes.size(), motion_name) == 0;
-    return api_->send_reliable(peer_, data, bytes.size(), controls_name) == 0;
+    if (packet.kind == InputKind::move) {
+        if (sent_buttons_.any()) drag_checkpoint_ = packet;
+        return api_->send_data(peer_, data, bytes.size(), motion_name) == 0;
+    }
+    if (packet.kind == InputKind::heartbeat && drag_checkpoint_) {
+        // Reuse the motion sequence so an already received or superseded
+        // position is ignored. Limit reliable copies to one per heartbeat.
+        const auto copy = EncodeInput(*drag_checkpoint_);
+        if (api_->send_reliable(peer_, reinterpret_cast<const char*>(copy.data()), copy.size(), controls_name) == 0)
+            drag_checkpoint_.reset();
+    }
+    if (api_->send_reliable(peer_, data, bytes.size(), controls_name) != 0) return false;
+    if (packet.kind == InputKind::reset) {
+        sent_buttons_.reset();
+        drag_checkpoint_.reset();
+    } else if (packet.kind == InputKind::button_down || packet.kind == InputKind::button_up) {
+        if (packet.code < sent_buttons_.size()) sent_buttons_.set(packet.code, packet.kind == InputKind::button_down);
+        drag_checkpoint_.reset();
+    } else if (packet.kind == InputKind::wheel) {
+        drag_checkpoint_.reset();
+    }
+    return true;
 }
 
 bool MiniRtcCall::SendInputCommand(const InputCommand& command) {

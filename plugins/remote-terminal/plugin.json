@@ -1,0 +1,9 @@
+{
+  "id": "remote-terminal",
+  "name": "Remote Terminal",
+  "version": "1.0.0",
+  "enabled": true,
+  "roles": ["host", "viewer"],
+  "permissions": ["channel", "ui", "pty", "log"],
+  "entry": "main.lua"
+}

@@ -1,7 +1,46 @@
 local role = p2p.session.role()
-local CHUNK_SIZE = 32768
-local WINDOW = 4
+local CHUNK_SIZE = 57344
+-- Every full window must include a cumulative ACK, including after backoff.
+local ACK_EVERY = 4
+local MIN_WINDOW = ACK_EVERY
+local MAX_WINDOW = 32
+local RETRY_MS = 10
 local MAX_LIST_JSON = 56000
+
+-- Automatic video-protection thresholds: keep video packet loss below 1.0%
+-- while dynamically maximizing file transfer throughput.
+local VIDEO_LOSS_THRESHOLD = 0.01
+local VIDEO_LOSS_SEVERE = 0.03
+local VIDEO_LOSS_CLEAR = 0.003
+local RTT_INFLATE_HOLD_MS = 35
+local RTT_INFLATE_CUT_MS = 60
+local MIN_PACE_BPS = 256 * 1024
+local UNLIMITED_PACE_BPS = 80 * 1024 * 1024
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+-- Token-bucket pacer: returns wait_ms (0 means allowed to send now).
+local function pacer_take(state, bytes)
+    local rate = state.pace_bps or 0
+    if rate <= 0 then return 0 end
+    local now = p2p.timer.now_ms()
+    local elapsed = now - (state.last_token_ms or now)
+    if elapsed < 0 then elapsed = 0 end
+    state.last_token_ms = now
+    local burst = math.max(CHUNK_SIZE * 2, math.floor(rate * 0.12))
+    local tokens = math.min(burst, (state.tokens or burst) + (rate * elapsed) / 1000.0)
+    if tokens >= bytes then
+        state.tokens = tokens - bytes
+        return 0
+    end
+    state.tokens = tokens
+    local deficit = bytes - tokens
+    return clamp(math.ceil((deficit * 1000.0) / rate), 5, 100)
+end
 
 local function trim(text)
     if type(text) ~= "string" then return "" end
@@ -99,10 +138,17 @@ if role == "host" then
             d.retry_timer = nil
         end
 
+        local win = clamp(d.win or MAX_WINDOW, MIN_WINDOW, MAX_WINDOW)
+
         if d.pending_chunk then
+            local wait_ms = pacer_take(d, #d.pending_chunk)
+            if wait_ms > 0 then
+                d.retry_timer = p2p.timer.after(wait_ms, function() pump_download(id) end)
+                return
+            end
             local frame = string.pack("<I4I4", id, d.pending_seq) .. d.pending_chunk
             if not p2p.channel.send("dn_data", frame) then
-                d.retry_timer = p2p.timer.after(30, function() pump_download(id) end)
+                d.retry_timer = p2p.timer.after(RETRY_MS, function() pump_download(id) end)
                 return
             end
             d.sent_bytes = d.sent_bytes + #d.pending_chunk
@@ -110,7 +156,12 @@ if role == "host" then
             d.pending_seq = nil
         end
 
-        while not d.eof and (d.next_seq - d.acked_seq) < WINDOW do
+        while not d.eof and (d.next_seq - d.acked_seq) < win do
+            local wait_ms = pacer_take(d, CHUNK_SIZE)
+            if wait_ms > 0 then
+                d.retry_timer = p2p.timer.after(wait_ms, function() pump_download(id) end)
+                return
+            end
             local chunk, err = p2p.fs.read(d.fh, CHUNK_SIZE)
             if not chunk then
                 send_json("dn_err", { id = id, err = err or "读取文件失败" })
@@ -127,15 +178,18 @@ if role == "host" then
             if not p2p.channel.send("dn_data", frame) then
                 d.pending_seq = seq
                 d.pending_chunk = chunk
-                d.retry_timer = p2p.timer.after(30, function() pump_download(id) end)
+                d.retry_timer = p2p.timer.after(RETRY_MS, function() pump_download(id) end)
                 return
             end
             d.sent_bytes = d.sent_bytes + #chunk
         end
 
         if d.eof and d.acked_seq >= d.next_seq then
-            if not send_json("dn_end", { id = id, bytes = d.sent_bytes }) then
-                d.retry_timer = p2p.timer.after(30, function() pump_download(id) end)
+            if not d.sha256 then
+                d.sha256 = p2p.fs.hash(d.fh) or ""
+            end
+            if not send_json("dn_end", { id = id, bytes = d.sent_bytes, sha256 = d.sha256 }) then
+                d.retry_timer = p2p.timer.after(RETRY_MS, function() pump_download(id) end)
                 return
             end
             close_download(id)
@@ -203,7 +257,9 @@ if role == "host" then
             end
             u.received = u.received + #data
             u.next_seq = u.next_seq + 1
-            send_json("up_ack", { id = id, seq = seq })
+            if (u.next_seq % ACK_EVERY) == 0 or #data < CHUNK_SIZE or u.received >= u.expected_size then
+                send_json("up_ack", { id = id, seq = seq })
+            end
             return
         end
 
@@ -267,6 +323,14 @@ if role == "host" then
                 close_upload(id)
                 return
             end
+            if type(msg.sha256) == "string" and #msg.sha256 == 64 then
+                local actual = p2p.fs.hash(u.fh)
+                if actual and actual ~= msg.sha256 then
+                    send_json("up_err", { id = id, err = "文件 SHA-256 校验不一致" })
+                    close_upload(id)
+                    return
+                end
+            end
             local ok, err = p2p.fs.commit(u.fh)
             u.fh = nil
             uploads[id] = nil
@@ -291,13 +355,19 @@ if role == "host" then
                 send_json("dn_err", { id = id, err = size_or_err or "无法读取文件" })
                 return
             end
+            local init_win = clamp(tonumber(msg.win) or MAX_WINDOW, MIN_WINDOW, MAX_WINDOW)
+            local init_pace = math.max(0, tonumber(msg.pace) or 0)
             downloads[id] = {
                 fh = fh,
                 total = size_or_err or 0,
                 sent_bytes = 0,
                 next_seq = 0,
                 acked_seq = 0,
-                eof = false
+                eof = false,
+                win = init_win,
+                pace_bps = init_pace,
+                last_token_ms = p2p.timer.now_ms(),
+                tokens = CHUNK_SIZE * 2
             }
             send_json("dn_meta", { id = id, size = size_or_err or 0 })
             pump_download(id)
@@ -307,6 +377,23 @@ if role == "host" then
             if not d then return end
             if type(msg.seq) == "number" and (msg.seq + 1) > d.acked_seq then
                 d.acked_seq = msg.seq + 1
+            end
+            if type(msg.win) == "number" then
+                d.win = clamp(math.floor(msg.win), MIN_WINDOW, MAX_WINDOW)
+            end
+            if type(msg.pace) == "number" then
+                d.pace_bps = math.max(0, math.floor(msg.pace))
+            end
+            pump_download(id)
+        elseif kind == "dn_pace" then
+            local id = msg.id
+            local d = downloads[id]
+            if not d then return end
+            if type(msg.win) == "number" then
+                d.win = clamp(math.floor(msg.win), MIN_WINDOW, MAX_WINDOW)
+            end
+            if type(msg.pace) == "number" then
+                d.pace_bps = math.max(0, math.floor(msg.pace))
             end
             pump_download(id)
         elseif kind == "dn_cancel" then
@@ -337,7 +424,17 @@ local remote_quick_items = {}
 local remote_list_req = 0
 
 local queue = {}
-local active = nil -- { id, dir="upload"|"download", name, local_path, remote_dir, fh, total, done, start_ms, last_ui_ms, next_seq, acked_seq, eof, pending_seq, pending_chunk, retry_timer, accepted }
+local active = nil -- { id, dir="upload"|"download", name, local_path, remote_dir, fh, total, done, start_ms, last_ui_ms, next_seq, acked_seq, eof, pending_seq, pending_chunk, retry_timer, accepted, sha256, pace_bps, last_token_ms, tokens }
+
+-- Automatic video-loss-aware AIMD controller (keeps video loss < VIDEO_LOSS_THRESHOLD).
+local dyn_win = MAX_WINDOW
+local dyn_pace_bps = 0 -- 0 = unlimited when video is clean
+local baseline_rtt = nil
+local clean_ticks = 0
+local sample_prev_done = 0
+local sample_prev_ms = 0
+local sample_job_id = 0
+local recent_bps = 0
 
 local function update_ui(patch)
     if dialog_id then
@@ -421,7 +518,8 @@ local function update_progress(force)
     local speed = format_speed(active.done / elapsed_s)
     local verb = active.dir == "upload" and "上传" or "下载"
     local rem = #queue > 0 and string.format("（剩余 %d 个）", #queue) or ""
-    local bar_text = string.format("%s %s · %d%% · %s", verb, active.name, pct, speed)
+    local pacing_tag = dyn_pace_bps > 0 and " · 自动保画质" or ""
+    local bar_text = string.format("%s %s · %d%% · %s%s", verb, active.name, pct, speed, pacing_tag)
     local detail = string.format("%s：%s / %s · %s %s",
         bar_text, format_size(active.done), format_size(active.total), speed, rem)
     update_ui({
@@ -475,10 +573,18 @@ local function pump_upload()
         job.retry_timer = nil
     end
 
+    job.pace_bps = dyn_pace_bps
+    local win = clamp(dyn_win, MIN_WINDOW, MAX_WINDOW)
+
     if job.pending_chunk then
+        local wait_ms = pacer_take(job, #job.pending_chunk)
+        if wait_ms > 0 then
+            job.retry_timer = p2p.timer.after(wait_ms, pump_upload)
+            return
+        end
         local frame = string.pack("<I4I4", job.id, job.pending_seq) .. job.pending_chunk
         if not p2p.channel.send("up_data", frame) then
-            job.retry_timer = p2p.timer.after(30, pump_upload)
+            job.retry_timer = p2p.timer.after(RETRY_MS, pump_upload)
             return
         end
         job.done = job.done + #job.pending_chunk
@@ -487,7 +593,12 @@ local function pump_upload()
         update_progress(false)
     end
 
-    while not job.eof and (job.next_seq - job.acked_seq) < WINDOW do
+    while not job.eof and (job.next_seq - job.acked_seq) < win do
+        local wait_ms = pacer_take(job, CHUNK_SIZE)
+        if wait_ms > 0 then
+            job.retry_timer = p2p.timer.after(wait_ms, pump_upload)
+            return
+        end
         local chunk, err = p2p.fs.read(job.fh, CHUNK_SIZE)
         if not chunk then
             send_json("up_cancel", { id = job.id })
@@ -504,7 +615,7 @@ local function pump_upload()
         if not p2p.channel.send("up_data", frame) then
             job.pending_seq = seq
             job.pending_chunk = chunk
-            job.retry_timer = p2p.timer.after(30, pump_upload)
+            job.retry_timer = p2p.timer.after(RETRY_MS, pump_upload)
             return
         end
         job.done = job.done + #chunk
@@ -512,8 +623,11 @@ local function pump_upload()
     end
 
     if job.eof and job.acked_seq >= job.next_seq then
-        if not send_json("up_end", { id = job.id, bytes = job.done }) then
-            job.retry_timer = p2p.timer.after(30, pump_upload)
+        if not job.sha256 and job.fh then
+            job.sha256 = p2p.fs.hash(job.fh) or ""
+        end
+        if not send_json("up_end", { id = job.id, bytes = job.done, sha256 = job.sha256 or "" }) then
+            job.retry_timer = p2p.timer.after(RETRY_MS, pump_upload)
             return
         end
         if job.fh then
@@ -521,6 +635,95 @@ local function pump_upload()
             job.fh = nil
         end
         update_progress(true)
+    end
+end
+
+local function adapt_transfer_rate()
+    if not p2p.session.connected() then return end
+    local stats = p2p.session.stats()
+    if type(stats) ~= "table" then return end
+
+    local rtt = type(stats.rtt_ms) == "number" and stats.rtt_ms or nil
+    local loss = type(stats.loss) == "number" and stats.loss or nil
+
+    -- Track baseline RTT while idle or clean so we can detect bufferbloat early.
+    if rtt and rtt > 0 then
+        if not baseline_rtt or rtt < baseline_rtt then
+            baseline_rtt = rtt
+        elseif not active and (not loss or loss <= VIDEO_LOSS_CLEAR) then
+            baseline_rtt = baseline_rtt * 0.9 + rtt * 0.1
+        end
+    end
+
+    if not active then
+        sample_job_id = 0
+        recent_bps = 0
+        if not loss or loss <= VIDEO_LOSS_CLEAR then
+            dyn_win = MAX_WINDOW
+            dyn_pace_bps = 0
+            clean_ticks = 0
+        end
+        return
+    end
+
+    local now = p2p.timer.now_ms()
+    if sample_job_id ~= active.id then
+        sample_job_id = active.id
+        sample_prev_done = active.done
+        sample_prev_ms = now
+        recent_bps = 0
+    else
+        local dt = now - sample_prev_ms
+        if dt >= 100 then
+            local delta = active.done - sample_prev_done
+            local inst = (delta * 1000.0) / dt
+            recent_bps = recent_bps > 0 and (recent_bps * 0.5 + inst * 0.5) or inst
+            sample_prev_done = active.done
+            sample_prev_ms = now
+        end
+    end
+
+    local rtt_inflate = (rtt and baseline_rtt) and (rtt - baseline_rtt) or 0
+    local prev_win, prev_pace = dyn_win, dyn_pace_bps
+    local ref_bps = dyn_pace_bps > 0 and dyn_pace_bps or math.max(recent_bps, 2 * 1024 * 1024)
+
+    if loss and loss >= VIDEO_LOSS_SEVERE then
+        -- Severe video loss (>= 3%): immediate aggressive backoff.
+        clean_ticks = 0
+        dyn_win = clamp(math.floor(dyn_win * 0.5), MIN_WINDOW, MAX_WINDOW)
+        dyn_pace_bps = math.max(MIN_PACE_BPS, math.floor(ref_bps * 0.5))
+    elseif (loss and loss >= VIDEO_LOSS_THRESHOLD) or rtt_inflate >= RTT_INFLATE_CUT_MS then
+        -- Above video loss threshold (>= 1%) or severe queuing delay: cut rate to keep video smooth.
+        clean_ticks = 0
+        dyn_win = clamp(math.floor(dyn_win * 0.75), MIN_WINDOW, MAX_WINDOW)
+        dyn_pace_bps = math.max(MIN_PACE_BPS, math.floor(ref_bps * 0.72))
+    elseif (loss and loss >= VIDEO_LOSS_THRESHOLD * 0.5) or rtt_inflate >= RTT_INFLATE_HOLD_MS then
+        -- Approaching threshold: hold rate steady and gently trim window.
+        clean_ticks = 0
+        if dyn_win > 8 then dyn_win = dyn_win - 1 end
+    else
+        -- Video loss well below threshold: smoothly ramp throughput back up.
+        clean_ticks = clean_ticks + 1
+        if clean_ticks >= 2 then
+            dyn_win = clamp(dyn_win + 2, MIN_WINDOW, MAX_WINDOW)
+            if dyn_pace_bps > 0 then
+                local next_pace = math.floor(dyn_pace_bps * 1.25 + 512 * 1024)
+                if next_pace >= UNLIMITED_PACE_BPS and dyn_win >= MAX_WINDOW then
+                    dyn_pace_bps = 0
+                else
+                    dyn_pace_bps = next_pace
+                end
+            end
+        end
+    end
+
+    if active.dir == "download" and (dyn_win ~= prev_win or dyn_pace_bps ~= prev_pace) then
+        send_json("dn_pace", { id = active.id, win = dyn_win, pace = dyn_pace_bps })
+    elseif active.dir == "upload" then
+        active.pace_bps = dyn_pace_bps
+        if dyn_win > prev_win or (prev_pace > 0 and (dyn_pace_bps == 0 or dyn_pace_bps > prev_pace)) then
+            pump_upload()
+        end
     end
 end
 
@@ -551,7 +754,10 @@ start_next_transfer = function()
             next_seq = 0,
             acked_seq = 0,
             eof = false,
-            accepted = false
+            accepted = false,
+            pace_bps = dyn_pace_bps,
+            last_token_ms = now,
+            tokens = CHUNK_SIZE * 2
         }
         set_transfer_buttons(true)
         update_progress(true)
@@ -584,7 +790,7 @@ start_next_transfer = function()
         }
         set_transfer_buttons(true)
         update_progress(true)
-        if not send_json("dn_open", { id = tid, dir = item.remote_dir, name = item.name }) then
+        if not send_json("dn_open", { id = tid, dir = item.remote_dir, name = item.name, win = dyn_win, pace = dyn_pace_bps }) then
             finish_active(false, "发送下载请求失败")
         end
     end
@@ -902,6 +1108,8 @@ p2p.session.on("connected", function()
     p2p.channel.send("hello", "1")
 end)
 
+p2p.timer.every(500, adapt_transfer_rate)
+
 p2p.session.on("disconnected", function()
     peer_ready = false
     cancel_transfer("连接已断开")
@@ -935,7 +1143,9 @@ p2p.channel.on_message(function(kind, payload)
         end
         job.done = job.done + #data
         job.next_seq = job.next_seq + 1
-        send_json("dn_ack", { id = id, seq = seq })
+        if (job.next_seq % ACK_EVERY) == 0 or #data < CHUNK_SIZE or (job.total > 0 and job.done >= job.total) then
+            send_json("dn_ack", { id = id, seq = seq, win = dyn_win, pace = dyn_pace_bps })
+        end
         update_progress(false)
         return
     end
@@ -1009,6 +1219,13 @@ p2p.channel.on_message(function(kind, payload)
             if active.done ~= expected then
                 finish_active(false, "下载文件大小校验不一致")
                 return
+            end
+            if type(msg.sha256) == "string" and #msg.sha256 == 64 then
+                local actual = p2p.fs.hash(active.fh)
+                if actual and actual ~= msg.sha256 then
+                    finish_active(false, "下载文件 SHA-256 校验不一致")
+                    return
+                end
             end
             local ok, err = p2p.fs.commit(active.fh)
             active.fh = nil

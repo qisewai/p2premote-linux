@@ -3,6 +3,7 @@
 #include "clipboard_bridge.h"
 #include "file_clipboard.h"
 #include "plugin_settings.h"
+#include "pty_session.h"
 
 #include <p2premote/plugin_protocol.h>
 
@@ -39,12 +40,12 @@ using winrt::Windows::Data::Json::IJsonValueStatics;
 using winrt::Windows::Data::Json::JsonValue;
 using winrt::Windows::Data::Json::JsonValueType;
 constexpr std::size_t max_plugins = 16;
-constexpr std::size_t max_pending_frames = 128;
+constexpr std::size_t max_pending_frames = 512;
 constexpr std::size_t lua_memory_limit = 2 * 1024 * 1024;
 constexpr int lua_instruction_limit = 200'000;
 constexpr std::size_t max_json_bytes = 512 * 1024;
 constexpr int max_json_depth = 16;
-constexpr std::size_t max_fs_read_chunk = 48 * 1024;
+constexpr std::size_t max_fs_read_chunk = 60 * 1024;
 constexpr std::size_t max_fs_list_entries = 1500;
 
 struct Manifest {
@@ -58,6 +59,7 @@ struct Manifest {
     bool config{};
     bool video{};
     bool fs{};
+    bool pty{};
 };
 
 void Log(std::string_view id, std::string_view level, std::string_view message) noexcept {
@@ -122,6 +124,7 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
         else if (name == L"config") manifest.config = true;
         else if (name == L"video") manifest.video = true;
         else if (name == L"fs") manifest.fs = true;
+        else if (name == L"pty") manifest.pty = true;
         else throw std::runtime_error("Unknown plugin permission");
     }
     const auto filename = winrt::to_string(json.GetNamedString(L"entry"));
@@ -744,6 +747,63 @@ UINT NamedVirtualKey(std::string_view name) noexcept {
     return 0;
 }
 
+std::string Base64Encode(std::string_view input) {
+    static constexpr char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((input.size() + 2) / 3) * 4);
+    const auto* bytes = reinterpret_cast<const unsigned char*>(input.data());
+    std::size_t i = 0;
+    while (i + 3 <= input.size()) {
+        const std::uint32_t n = (static_cast<std::uint32_t>(bytes[i]) << 16) |
+            (static_cast<std::uint32_t>(bytes[i + 1]) << 8) | static_cast<std::uint32_t>(bytes[i + 2]);
+        out.push_back(table[(n >> 18) & 0x3f]);
+        out.push_back(table[(n >> 12) & 0x3f]);
+        out.push_back(table[(n >> 6) & 0x3f]);
+        out.push_back(table[n & 0x3f]);
+        i += 3;
+    }
+    if (i < input.size()) {
+        const std::uint32_t b0 = bytes[i];
+        const std::uint32_t b1 = (i + 1 < input.size()) ? bytes[i + 1] : 0;
+        const std::uint32_t n = (b0 << 16) | (b1 << 8);
+        out.push_back(table[(n >> 18) & 0x3f]);
+        out.push_back(table[(n >> 12) & 0x3f]);
+        out.push_back(i + 1 < input.size() ? table[(n >> 6) & 0x3f] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+std::optional<std::string> Base64Decode(std::string_view input) {
+    auto decode_char = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::string out;
+    out.reserve((input.size() * 3) / 4);
+    std::uint32_t val = 0;
+    int bits = -8;
+    for (unsigned char c : input) {
+        if (c == '=' || c == ' ' || c == '\r' || c == '\n' || c == '\t') {
+            if (c == '=') break;
+            continue;
+        }
+        const int d = decode_char(c);
+        if (d < 0) return std::nullopt;
+        val = (val << 6) | static_cast<std::uint32_t>(d);
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<char>((val >> bits) & 0xff));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
 class LuaPlugin;
 
 class PluginRuntime {
@@ -758,8 +818,8 @@ public:
         if (!Connected()) return false;
         const auto now = GetTickCount64();
         if (now >= send_period_end_) {
-            send_period_end_ = now + 1'000;
-            send_bytes_left_ = 8 * 1024 * 1024;
+            send_period_end_ = now + 100;
+            send_bytes_left_ = 16 * 1024 * 1024;
             send_frames_left_ = 512;
         }
         if (!send_frames_left_ || packet.payload.size() > send_bytes_left_) return false;
@@ -801,6 +861,7 @@ public:
         ClearMenu();
         ClearDialogs();
         ClearFiles();
+        ClearPtys();
         lua_close(state_);
     }
     LuaPlugin(const LuaPlugin&) = delete;
@@ -814,6 +875,7 @@ public:
         if (!connected) {
             ClearDialogs();
             ClearFiles();
+            ClearPtys();
         }
     }
 
@@ -947,6 +1009,13 @@ private:
         bool writable{};
         std::filesystem::path target_path;
         std::filesystem::path temp_path;
+        BCRYPT_HASH_HANDLE hash{};
+        std::string hash_hex;
+    };
+
+    struct PtySlot {
+        std::uint32_t id{};
+        std::unique_ptr<PtySession> session;
     };
 
     void ClearMenu() noexcept {
@@ -969,6 +1038,10 @@ private:
     }
 
     void CloseFileSlot(FileSlot& slot) noexcept {
+        if (slot.hash) {
+            BCryptDestroyHash(slot.hash);
+            slot.hash = nullptr;
+        }
         if (slot.handle != INVALID_HANDLE_VALUE) {
             CloseHandle(slot.handle);
             slot.handle = INVALID_HANDLE_VALUE;
@@ -982,6 +1055,15 @@ private:
     void ClearFiles() noexcept {
         for (auto& slot : files_) {
             if (slot.id) CloseFileSlot(slot);
+        }
+    }
+
+    void ClearPtys() noexcept {
+        for (auto& slot : ptys_) {
+            if (slot.session) {
+                try { slot.session->Close(); } catch (...) {}
+            }
+            slot = {};
         }
     }
 
@@ -1041,6 +1123,7 @@ private:
         ClearMenu();
         ClearDialogs();
         ClearFiles();
+        ClearPtys();
         return false;
     }
 
@@ -1579,6 +1662,10 @@ private:
         slot->writable = false;
         slot->target_path = *path;
         slot->temp_path.clear();
+        slot->hash_hex.clear();
+        if (BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &slot->hash, nullptr, 0, nullptr, 0, 0) < 0) {
+            slot->hash = nullptr;
+        }
         lua_pushinteger(state, slot->id);
         lua_pushinteger(state, static_cast<lua_Integer>(size.QuadPart));
         if (strict) {
@@ -1599,6 +1686,11 @@ private:
             return FsBoolError(state, "无效的读取句柄或偏移量");
         }
         if (!SetFilePointerEx(slot->handle, offset, nullptr, FILE_BEGIN)) return FsBoolError(state, Win32ErrorUtf8(GetLastError()));
+        if (slot->hash) {
+            BCryptDestroyHash(slot->hash);
+            slot->hash = nullptr;
+        }
+        slot->hash_hex.clear();
         lua_pushboolean(state, true);
         return 1;
     }
@@ -1618,6 +1710,12 @@ private:
         DWORD read{};
         if (!::ReadFile(slot->handle, buffer.data(), chunk, &read, nullptr)) {
             return FsError(state, Win32ErrorUtf8(GetLastError()));
+        }
+        if (read > 0 && slot->hash) {
+            if (BCryptHashData(slot->hash, reinterpret_cast<PUCHAR>(buffer.data()), read, 0) < 0) {
+                BCryptDestroyHash(slot->hash);
+                slot->hash = nullptr;
+            }
         }
         lua_pushlstring(state, buffer.data(), read);
         return 1;
@@ -1646,6 +1744,10 @@ private:
         slot->writable = true;
         slot->target_path = *path;
         slot->temp_path = temp_path;
+        slot->hash_hex.clear();
+        if (BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &slot->hash, nullptr, 0, nullptr, 0, 0) < 0) {
+            slot->hash = nullptr;
+        }
         lua_pushinteger(state, slot->id);
         return 1;
     }
@@ -1666,6 +1768,13 @@ private:
             if (!WriteFile(slot->handle, data.data() + written_total, to_write, &written, nullptr) || written == 0) {
                 return FsBoolError(state, Win32ErrorUtf8(GetLastError()));
             }
+            if (slot->hash) {
+                if (BCryptHashData(slot->hash,
+                        reinterpret_cast<PUCHAR>(const_cast<char*>(data.data() + written_total)), written, 0) < 0) {
+                    BCryptDestroyHash(slot->hash);
+                    slot->hash = nullptr;
+                }
+            }
             written_total += written;
         }
         lua_pushboolean(state, 1);
@@ -1679,6 +1788,10 @@ private:
         if (slot == self.files_.end() || slot->id == 0 || !slot->writable || slot->handle == INVALID_HANDLE_VALUE) {
             return FsBoolError(state, "无效的写入句柄");
         }
+        if (slot->hash) {
+            BCryptDestroyHash(slot->hash);
+            slot->hash = nullptr;
+        }
         CloseHandle(slot->handle);
         slot->handle = INVALID_HANDLE_VALUE;
         const auto temp = std::move(slot->temp_path);
@@ -1690,6 +1803,33 @@ private:
             return FsBoolError(state, Win32ErrorUtf8(err));
         }
         lua_pushboolean(state, 1);
+        return 1;
+    }
+
+    static int FsHash(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = luaL_checkinteger(state, 1);
+        const auto slot = std::ranges::find(self.files_, id, &FileSlot::id);
+        if (slot == self.files_.end() || slot->id == 0) {
+            lua_pushnil(state);
+            return 1;
+        }
+        if (slot->hash_hex.empty() && slot->hash) {
+            std::array<UCHAR, 32> digest{};
+            const auto status = BCryptFinishHash(slot->hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+            BCryptDestroyHash(slot->hash);
+            slot->hash = nullptr;
+            if (status >= 0) {
+                constexpr char hex[] = "0123456789abcdef";
+                slot->hash_hex.resize(64);
+                for (std::size_t i = 0; i < digest.size(); ++i) {
+                    slot->hash_hex[i * 2] = hex[digest[i] >> 4];
+                    slot->hash_hex[i * 2 + 1] = hex[digest[i] & 0xf];
+                }
+            }
+        }
+        if (slot->hash_hex.empty()) lua_pushnil(state);
+        else PushString(state, slot->hash_hex);
         return 1;
     }
 
@@ -1899,6 +2039,115 @@ private:
         return 1;
     }
 
+    static int Base64EncodeLua(lua_State* state) {
+        const auto input = CheckString(state, 1);
+        if (input.size() > plugin_frame_limit) return luaL_argerror(state, 1, "data exceeds 64 KiB");
+        const auto encoded = Base64Encode(input);
+        PushString(state, encoded);
+        return 1;
+    }
+
+    static int Base64DecodeLua(lua_State* state) {
+        const auto input = CheckString(state, 1);
+        const auto decoded = input.size() <= plugin_frame_limit * 2 ? Base64Decode(input) : std::nullopt;
+        if (!decoded) {
+            lua_pushnil(state);
+            lua_pushstring(state, "invalid base64");
+            return 2;
+        }
+        PushString(state, *decoded);
+        return 1;
+    }
+
+    static int PtyOpen(lua_State* state) {
+        auto& self = Self(state);
+        if (!self.runtime_.host || !self.runtime_.Connected()) {
+            lua_pushnil(state);
+            lua_pushstring(state, "pty is only available on connected host");
+            return 2;
+        }
+        const std::string_view shell = lua_isnoneornil(state, 1) ? std::string_view("powershell") : CheckString(state, 1);
+        const auto cols = std::clamp<lua_Integer>(luaL_optinteger(state, 2, 100), 20, 400);
+        const auto rows = std::clamp<lua_Integer>(luaL_optinteger(state, 3, 30), 5, 200);
+        const auto slot = std::ranges::find_if(self.ptys_, [](const auto& item) { return item.id == 0; });
+        if (slot == self.ptys_.end()) {
+            lua_pushnil(state);
+            lua_pushstring(state, "too many open pty sessions");
+            return 2;
+        }
+        const auto pty_id = ++self.next_pty_;
+        try {
+            auto session = std::make_unique<PtySession>(shell, static_cast<std::uint16_t>(cols),
+                static_cast<std::uint16_t>(rows));
+            if (!session->Valid()) {
+                lua_pushnil(state);
+                PushString(state, session->Error());
+                return 2;
+            }
+            *slot = {pty_id, std::move(session)};
+        } catch (...) {
+            lua_pushnil(state);
+            lua_pushliteral(state, "无法初始化终端输入输出");
+            return 2;
+        }
+        lua_pushinteger(state, static_cast<lua_Integer>(pty_id));
+        return 1;
+    }
+
+    static int PtyWrite(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = static_cast<std::uint32_t>(luaL_checkinteger(state, 1));
+        const auto data = CheckString(state, 2);
+        const auto slot = std::ranges::find_if(self.ptys_, [id](const auto& item) { return item.id == id && item.session; });
+        bool queued{};
+        try { queued = slot != self.ptys_.end() && slot->session->Write(data); } catch (...) {}
+        lua_pushboolean(state, queued);
+        return 1;
+    }
+
+    static int PtyRead(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = static_cast<std::uint32_t>(luaL_checkinteger(state, 1));
+        const auto slot = std::ranges::find_if(self.ptys_, [id](const auto& item) { return item.id == id && item.session; });
+        if (slot == self.ptys_.end()) return 0;
+        PtySession::Output output;
+        try { output = slot->session->Read(); }
+        catch (...) { output.exit_code = ERROR_NOT_ENOUGH_MEMORY; }
+        if (!output.bytes.empty()) {
+            PushString(state, output.bytes);
+            return 1;
+        }
+        if (!output.exit_code) return 0;
+        lua_pushnil(state);
+        lua_pushinteger(state, *output.exit_code);
+        return 2;
+    }
+
+    static int PtyResize(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = static_cast<std::uint32_t>(luaL_checkinteger(state, 1));
+        const auto cols = std::clamp<lua_Integer>(luaL_checkinteger(state, 2), 20, 400);
+        const auto rows = std::clamp<lua_Integer>(luaL_checkinteger(state, 3), 5, 200);
+        const auto slot = std::ranges::find_if(self.ptys_, [id](const auto& item) { return item.id == id && item.session; });
+        lua_pushboolean(state, slot != self.ptys_.end() &&
+            slot->session->Resize(static_cast<std::uint16_t>(cols), static_cast<std::uint16_t>(rows)));
+        return 1;
+    }
+
+    static int PtyClose(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = static_cast<std::uint32_t>(luaL_checkinteger(state, 1));
+        const auto slot = std::ranges::find_if(self.ptys_, [id](const auto& item) { return item.id == id; });
+        if (slot == self.ptys_.end()) {
+            lua_pushboolean(state, false);
+            return 1;
+        }
+        if (slot->session) slot->session->Close();
+        *slot = {};
+        lua_pushboolean(state, true);
+        return 1;
+    }
+
     static int AddTimer(lua_State* state, bool repeating) {
         auto& self = Self(state);
         const auto ms = luaL_checkinteger(state, 1);
@@ -1988,6 +2237,13 @@ private:
         static const luaL_Reg json[] = {
             {"encode", JsonEncode}, {"decode", JsonDecode}, {nullptr, nullptr}
         };
+        static const luaL_Reg base64[] = {
+            {"encode", Base64EncodeLua}, {"decode", Base64DecodeLua}, {nullptr, nullptr}
+        };
+        static const luaL_Reg pty[] = {
+            {"open", PtyOpen}, {"read", PtyRead}, {"write", PtyWrite}, {"resize", PtyResize}, {"close", PtyClose},
+            {nullptr, nullptr}
+        };
         static const luaL_Reg log[] = {
             {"info", [](lua_State* l) { Log(Self(l).manifest_.id, "info", CheckString(l, 1)); return 0; }},
             {"warn", [](lua_State* l) { Log(Self(l).manifest_.id, "warn", CheckString(l, 1)); return 0; }},
@@ -2008,7 +2264,7 @@ private:
             {"roots", FsRoots}, {"home", FsHome}, {"list", FsList}, {"stat", FsStat},
             {"mkdir", FsMkdir}, {"join", FsJoin},
             {"open_read", FsOpenRead}, {"read", FsRead}, {"seek", FsSeek},
-            {"open_write", FsOpenWrite}, {"write", FsWrite}, {"commit", FsCommit}, {"close", FsClose},
+            {"open_write", FsOpenWrite}, {"write", FsWrite}, {"commit", FsCommit}, {"hash", FsHash}, {"close", FsClose},
             {nullptr, nullptr}
         };
         lua_newtable(state);
@@ -2016,6 +2272,7 @@ private:
         Namespace(state, "crypto", crypto);
         Namespace(state, "timer", timer);
         Namespace(state, "json", json);
+        Namespace(state, "base64", base64);
         if (manifest_.channel) Namespace(state, "channel", channel);
         if (manifest_.clipboard) Namespace(state, "clipboard", clipboard);
         if (manifest_.file_clipboard) Namespace(state, "file_clipboard", file_clipboard);
@@ -2025,6 +2282,7 @@ private:
         if (manifest_.config) Namespace(state, "config", config);
         if (manifest_.video) Namespace(state, "video", video);
         if (manifest_.fs) Namespace(state, "fs", fs);
+        if (manifest_.pty) Namespace(state, "pty", pty);
         ReadOnly(state);
         lua_setglobal(state, "p2p");
     }
@@ -2085,15 +2343,26 @@ private:
     std::array<MenuCallback, 8> menu_{};
     std::array<DialogCallback, 4> dialogs_{};
     std::array<FileSlot, 4> files_{};
+    std::array<PtySlot, 2> ptys_{};
     std::optional<PluginSettings> settings_;
     std::string config_result_;
     lua_Integer next_timer_{};
     lua_Integer next_file_{};
+    std::uint32_t next_pty_{};
 };
 
 void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
     std::vector<std::unique_ptr<LuaPlugin>>& plugins) {
     if (!IsPlainPath(root, true)) return;
+    const bool restricted_host = runtime.host && [] {
+        HANDLE opened{};
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &opened)) return true;
+        const winrt::handle token{opened};
+        alignas(TOKEN_USER) BYTE storage[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
+        DWORD size{};
+        return !GetTokenInformation(token.get(), TokenUser, storage, sizeof(storage), &size)
+            || IsWellKnownSid(reinterpret_cast<const TOKEN_USER*>(storage)->User.Sid, WinLocalSystemSid);
+    }();
     // Keep the activation factory scoped to this worker's COM apartment.
     const auto json_factory = winrt::try_get_activation_factory<JsonObject, IJsonObjectStatics>();
     if (!json_factory) throw std::runtime_error("Could not activate plugin manifest parser");
@@ -2104,6 +2373,7 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
             std::filesystem::path entry;
             auto manifest = ReadManifest(json_factory, directory.path(), runtime.host, entry);
             if (!manifest) continue;
+            if (restricted_host && (manifest->pty || manifest->fs || manifest->file_clipboard)) continue;
             const auto script = ReadFile(entry, 128 * 1024);
             if (manifest->clipboard || manifest->file_clipboard) {
                 if (!runtime.clipboard) runtime.clipboard.emplace();
@@ -2328,7 +2598,15 @@ void PluginHost::SendUiEvent(PluginUiEvent event) {
     {
         auto& workspace = impl_->workspace;
         const std::lock_guard lock(workspace.mutex);
-        if (!impl_->connected.load() || workspace.ui_events.size() >= 64) return;
+        if (!impl_->connected.load()) return;
+        if (workspace.ui_events.size() >= 64) {
+            if (event.event != "close" || !event.control.empty()) return;
+            const auto replaceable = std::ranges::find_if(workspace.ui_events, [](const auto& queued) {
+                return queued.event != "close" || !queued.control.empty();
+            });
+            if (replaceable == workspace.ui_events.end()) return;
+            workspace.ui_events.erase(replaceable);
+        }
         workspace.ui_events.push_back(std::move(event));
     }
     SetEvent(impl_->wake.get());

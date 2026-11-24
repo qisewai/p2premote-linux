@@ -56,3 +56,28 @@ index 78e8a21..f30b9bf 100644
    }
 +  retire_recovered_nack();
  }
+@@ -1050,5 +1065,7 @@ bool RtpVideoReceiver::Process() {
+       bool newer_complete_keyframe_available = false;
+-      if ((awaiting_keyframe_ || it->second.recovery_escalated) &&
+-          !(it->second.is_complete && it->second.is_keyframe)) {
++      const bool complete_keyframe =
++          it->second.is_complete && it->second.is_keyframe;
++      const bool blocked = !it->second.is_complete || has_blocking_nacks;
++      if (!complete_keyframe && (awaiting_keyframe_ || blocked)) {
+         for (auto keyframe_it = std::next(it);
+              keyframe_it != pending_frames_.end(); ++keyframe_it) {
+@@ -1068,10 +1085,11 @@ bool RtpVideoReceiver::Process() {
+       } else if (newer_complete_keyframe_available) {
+         // A complete synchronization point is already available. Do not let
+-        // an older incomplete delta frame hold it behind another timeout.
++        // an older blocked frame hold it behind another timeout.
+         awaiting_keyframe_ = true;
+         dropped_timestamp = it->first;
+         dropped_frame = true;
++        MarkFrameDiscardedLocked(dropped_timestamp);
+         pending_frames_.erase(it);
+-      } else if (it->second.is_complete && awaiting_keyframe_ &&
+-                 it->second.is_keyframe) {
++      } else if (complete_keyframe) {
++        // A complete keyframe can be decoded despite losses in older frames.
+         soft_fir_avoided = it->second.recovery_escalated &&

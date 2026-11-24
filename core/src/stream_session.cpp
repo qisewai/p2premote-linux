@@ -5,6 +5,7 @@
 #include "d3d11_preview.h"
 #include "d3d11_video.h"
 #include "desktop_input.h"
+#include "desktop_switch.h"
 #include "dxgi_capturer.h"
 #include "minirtc_call.h"
 #include "plugin_host.h"
@@ -266,6 +267,9 @@ struct ActiveStream {
     std::int64_t capture_interval{};
     bool dxgi_capture{};
     bool dxgi_attempted{};
+    bool dxgi_fallback_wgc{};
+    ULONGLONG capture_retry_due{};
+    ULONGLONG last_desktop_check{};
     bool redraw{};
     bool host_registered{};
     ULONGLONG transport_close_deadline{};
@@ -302,7 +306,7 @@ struct ActiveStream {
         const auto height = frame.metadata.height;
         std::optional<UINT> changed;
         try {
-            changed = frame_difference->ChangedTiles(frame.texture.get(), width, height);
+            changed = frame_difference->ChangedTiles(frame.texture.get(), width, height, desktop && desktop->DragRecentlyActive());
         } catch (const winrt::hresult_error& error) {
             frame_difference.reset();
             if (const auto& trace = events->Trace()) {
@@ -386,7 +390,60 @@ struct StreamSession::Impl {
         if (connection.signal_url.empty()) connection.signal_url = L"ws://127.0.0.1:8787/signal";
     }
 
+    ~Impl() {
+        if (attached_desktop) {
+            CloseDesktop(attached_desktop);
+            attached_desktop = nullptr;
+        }
+    }
+
+    bool PreferDxgi(const ActiveStream& stream) const noexcept {
+        return connection.desktop_duplication && !stream.dxgi_fallback_wgc;
+    }
+
+    bool TryStartDxgi(ActiveStream& stream, bool capture_cursor) noexcept {
+        stream.dxgi_attempted = true;
+        if (stream.dxgi_capture) {
+            // DXGI allows only one duplication per output in this process.
+            stream.capture.reset();
+            stream.dxgi_capture = false;
+        }
+        try {
+            stream.capture = StartDesktopDuplication(stream.monitor, stream.device.get(), capture_cursor);
+            stream.dxgi_capture = true;
+            stream.next_capture = 0;
+            stream.capture_retry_due = 0;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool StartBestCapture(ActiveStream& stream, bool capture_cursor, bool prefer_dxgi) noexcept {
+        SyncThreadToInputDesktop(attached_desktop, desktop_name);
+        const bool secure = IsSecureDesktopName(desktop_name);
+        if (prefer_dxgi || secure) {
+            if (TryStartDxgi(stream, capture_cursor)) return true;
+        }
+        if (!secure) {
+            try {
+                StartWgc(stream, capture_cursor);
+                stream.capture_retry_due = 0;
+                return true;
+            } catch (...) {
+                capture_item = nullptr;
+                capture_monitor = nullptr;
+            }
+        }
+        if (!prefer_dxgi && !secure && TryStartDxgi(stream, capture_cursor)) return true;
+        stream.capture.reset();
+        stream.dxgi_capture = false;
+        stream.capture_retry_due = GetTickCount64() + 200;
+        return false;
+    }
+
     void StartWgc(ActiveStream& stream, bool capture_cursor) {
+        if (!stream.frame_difference) stream.StartFrameComparison();
         if (!capture_item || capture_monitor != stream.monitor) {
             capture_item = CreateMonitorCaptureItem(stream.monitor);
             capture_monitor = stream.monitor;
@@ -403,7 +460,7 @@ struct StreamSession::Impl {
         }
         if (stream.quality != resolution) {
             stream.quality = resolution;
-            if (!stream.dxgi_capture) stream.quality_refresh_due = QpcNow() + QpcFrequency();
+            stream.quality_refresh_due = QpcNow() + QpcFrequency();
         }
         detail = stream.SharingStatus();
         return true;
@@ -416,6 +473,8 @@ struct StreamSession::Impl {
     std::wstring detail;
     HMONITOR capture_monitor{};
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item{nullptr};
+    HDESK attached_desktop{};
+    std::wstring desktop_name;
     std::unique_ptr<ActiveStream> active;
     std::optional<Reconnect> reconnect;
     StreamStatistics stats;
@@ -732,12 +791,8 @@ void StreamSession::ProcessEvents() {
                     if (!active.device) active.device = CreateD3d11Device(true);
                     active.pixels = std::make_unique<CapturePixels>(active.device.get());
                     impl_->ApplyVideoSettings(active, active.quality, VideoBitrateLimit(VideoBitratePreset::automatic));
-                    active.StartFrameComparison();
-                    try {
-                        impl_->StartWgc(active, true);
-                    } catch (...) {
+                    if (!impl_->StartBestCapture(active, true, impl_->PreferDxgi(active))) {
                         DisplayChanged();
-                        throw;
                     }
                 } else {
                     active.renderer = std::make_unique<D3d11Preview>(active.surface, active.device);
@@ -800,11 +855,10 @@ void StreamSession::ProcessEvents() {
             if (!active.input_ready) {
                 active.ResetInput();
                 if (impl_->host && active.cursor_separate && active.capture) {
-                    if (active.dxgi_capture) {
-                        impl_->StartWgc(active, true);
-                        impl_->detail = active.SharingStatus();
-                    } else {
-                        active.capture->SetCursorCapture(true);
+                    if (!active.capture->SetCursorCapture(true)) {
+                        if (impl_->StartBestCapture(active, true, impl_->PreferDxgi(active))) {
+                            impl_->detail = active.SharingStatus();
+                        }
                     }
                 }
                 active.cursor_requested = active.cursor_separate = active.cursor_sent = false;
@@ -995,20 +1049,14 @@ void StreamSession::PollCursor() {
         return;
     }
     if (!active.cursor_requested) return;
-    if (impl_->connection.desktop_duplication && !active.dxgi_attempted) {
-        active.dxgi_attempted = true;
-        try {
-            active.capture = StartDesktopDuplication(active.monitor, active.device.get());
-            active.dxgi_capture = true;
+    if (!active.dxgi_capture && impl_->PreferDxgi(active) && !active.dxgi_attempted) {
+        if (impl_->TryStartDxgi(active, false)) {
             active.cursor_separate = true;
-            active.next_capture = 0;
             impl_->detail = active.SharingStatus();
-        } catch (const winrt::hresult_error&) {
-            // Keep WGC for unsupported displays and D3D devices.
         }
     }
     if (!active.cursor_separate) {
-        active.cursor_separate = active.capture->SetCursorCapture(false);
+        active.cursor_separate = active.capture && active.capture->SetCursorCapture(false);
         if (!active.cursor_separate) {
             active.cursor_requested = false;
             return;
@@ -1045,15 +1093,21 @@ bool StreamSession::SubmitInput(InputPacket input) {
 
 void StreamSession::Capture() {
     auto& active = *impl_->active;
+    if (!active.capture) return;
     if (active.capture->IsSourceClosed()) {
-        if (active.dxgi_capture) {
-            impl_->StartWgc(active, !active.cursor_separate);
-            impl_->detail = active.SharingStatus();
-            return;
+        if (active.dxgi_capture && active.capture->PreferFallbackCapture()) {
+            active.dxgi_fallback_wgc = true;
         }
-        DisplayChanged();
-        Stop(L"Windows 已关闭采集源");
+        if (impl_->StartBestCapture(active, !active.cursor_separate, impl_->PreferDxgi(active))) {
+            impl_->detail = active.SharingStatus();
+        } else {
+            impl_->detail = L"正在切换桌面采集源…";
+        }
         return;
+    }
+    if (active.dxgi_capture && active.capture_interval && active.next_capture) {
+        const auto tolerance = active.capture_interval / 8;
+        if (QpcNow() + tolerance < active.next_capture) return;
     }
     impl_->stats.captured += active.capture->Poll().acquired;
     const auto frame = active.capture->TakeFrame();
@@ -1079,7 +1133,8 @@ void StreamSession::Capture() {
         }
         trace->Record("frame_captured", frame->metadata.frame_id, 0, 0, 0, frame->metadata.capture_qpc);
     }
-    const auto stamp = frame->metadata.source_qpc ? frame->metadata.source_qpc : frame->metadata.capture_qpc;
+    const auto stamp = (!active.dxgi_capture && frame->metadata.source_qpc)
+        ? frame->metadata.source_qpc : frame->metadata.capture_qpc;
     if (const auto interval = active.capture_interval) {
         const auto tolerance = interval / 8;
         if (stamp + tolerance < active.next_capture) return;
@@ -1200,11 +1255,30 @@ void StreamSession::Tick() {
             return;
         }
         const auto now = QpcNow();
+        if (impl_->host && now_ms - active.last_desktop_check >= 250) {
+            active.last_desktop_check = now_ms;
+            if (SyncThreadToInputDesktop(impl_->attached_desktop, impl_->desktop_name)) {
+                impl_->capture_item = nullptr;
+                impl_->capture_monitor = nullptr;
+                active.dxgi_fallback_wgc = false;
+                active.dxgi_attempted = false;
+                if (impl_->StartBestCapture(active, !active.cursor_separate, impl_->PreferDxgi(active))) {
+                    impl_->detail = active.SharingStatus();
+                } else {
+                    impl_->detail = L"正在切换桌面采集源…";
+                }
+            }
+        }
+        if (impl_->host && !active.capture && active.capture_retry_due && now_ms >= active.capture_retry_due) {
+            if (impl_->StartBestCapture(active, !active.cursor_separate, impl_->PreferDxgi(active))) {
+                impl_->detail = active.SharingStatus();
+            }
+        }
         if (active.quality_refresh_due && now >= active.quality_refresh_due) {
             active.quality_refresh_due = 0;
-            try {
-                impl_->StartWgc(active, !active.cursor_separate);
-            } catch (const winrt::hresult_error&) {}
+            if (impl_->StartBestCapture(active, !active.cursor_separate, impl_->PreferDxgi(active))) {
+                impl_->detail = active.SharingStatus();
+            }
         }
         if (active.last_video && active.last_video_quality == active.quality
             && now - active.last_submit_qpc >= QpcFrequency() * 9 / 10) {

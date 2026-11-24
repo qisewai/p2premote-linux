@@ -282,6 +282,10 @@ AccountWindow::AccountWindow(LaunchOptions options) : options_(std::move(options
     refresh_.setInterval(3000);
     connect(&refresh_, &QTimer::timeout, this, &AccountWindow::refresh);
     makeTray();
+    elevated_ = isProcessElevated();
+    refreshServiceStatus();
+    connect(&service_refresh_, &QTimer::timeout, this, &AccountWindow::refreshServiceStatus);
+    service_refresh_.start(1500);
     refreshScreens();
     loadCredentials();
     updateControls();
@@ -289,6 +293,8 @@ AccountWindow::AccountWindow(LaunchOptions options) : options_(std::move(options
 }
 
 AccountWindow::~AccountWindow() {
+    service_refresh_.stop();
+    if (service_status_thread_.joinable()) service_status_thread_.join();
     account_event_.setEnabled(false);
     closeSessions();
 }
@@ -390,6 +396,19 @@ QWidget* AccountWindow::makeDevicesPage() {
     host_status_->setObjectName(QStringLiteral("muted"));
     host_status_->setWordWrap(true);
     local->addWidget(host_status_);
+
+    auto* service_row = new QHBoxLayout;
+    service_row->setSpacing(8);
+    privilege_status_ = new QLabel(receiver);
+    privilege_status_->setTextFormat(Qt::PlainText);
+    privilege_status_->setObjectName(QStringLiteral("muted"));
+    privilege_status_->setWordWrap(true);
+    service_row->addWidget(privilege_status_, 1);
+    elevate_button_ = new QPushButton(QStringLiteral("以管理员重启"), receiver);
+    service_row->addWidget(elevate_button_);
+    service_button_ = new QPushButton(QStringLiteral("启用系统服务"), receiver);
+    service_row->addWidget(service_button_);
+    local->addLayout(service_row);
     layout->addWidget(receiver);
 
     devices_ = new QListWidget(page);
@@ -408,6 +427,8 @@ QWidget* AccountWindow::makeDevicesPage() {
 
     connect(logout_, &QPushButton::clicked, this, &AccountWindow::signOut);
     connect(receive_, &QPushButton::clicked, this, &AccountWindow::toggleReceiving);
+    connect(service_button_, &QPushButton::clicked, this, &AccountWindow::toggleHostService);
+    connect(elevate_button_, &QPushButton::clicked, this, &AccountWindow::relaunchAsAdmin);
     connect(refresh_button_, &QPushButton::clicked, this, &AccountWindow::refresh);
     connect(connect_, &QPushButton::clicked, this, &AccountWindow::connectDevice);
     connect(devices_, &QListWidget::itemDoubleClicked, this, &AccountWindow::connectDevice);
@@ -482,18 +503,42 @@ void AccountWindow::updateControls() {
     pages_->setCurrentWidget(signed_in ? devices_page_ : login_page_);
     login_page_->setEnabled(!busy);
     const auto* item = devices_->currentItem();
+    const auto selected_id = item ? item->data(Qt::UserRole).toString() : QString{};
+    const bool is_self_device = !selected_id.isEmpty() &&
+        (selected_id == winText(local) || (service_info_.running && selected_id == service_info_.device_id));
     connect_->setEnabled(signed_in && item && item->data(device_state_role).toString() == QStringLiteral("online")
-        && item->data(Qt::UserRole).toString() != winText(local));
+        && !is_self_device);
     refresh_button_->setEnabled(!busy);
-    screens_->setEnabled(!host_);
+    const bool service_active = service_info_.running;
+    screens_->setEnabled(!host_ && !service_active);
+    receive_->setVisible(!service_active);
     receive_->setEnabled(screens_->count() || host_);
     const auto label = host_ ? QStringLiteral("停止接收") : QStringLiteral("开始接收");
     receive_->setText(label);
     if (tray_receive_) {
-        tray_receive_->setText(label);
-        tray_receive_->setEnabled(signed_in && receive_->isEnabled());
+        tray_receive_->setText(service_active ? QStringLiteral("由系统服务托管中") : label);
+        tray_receive_->setEnabled(signed_in && !service_active && receive_->isEnabled());
     }
-    if (!host_) host_status_->setText(QStringLiteral("本机已暂停接收。"));
+    if (service_active) {
+        host_status_->setText(service_info_.status.isEmpty()
+            ? QStringLiteral("[系统服务] 后台已启动，正在等待接收状态。")
+            : service_info_.status);
+    } else if (!host_) {
+        host_status_->setText(QStringLiteral("本机已暂停接收。"));
+    }
+
+    const bool has_service_exe = serviceExecutableExists();
+    service_button_->setVisible(has_service_exe || service_info_.installed);
+    service_button_->setText(service_info_.installed ? QStringLiteral("卸载系统服务") : QStringLiteral("启用系统服务"));
+    service_button_->setEnabled(signed_in || service_info_.installed);
+    elevate_button_->setVisible(!elevated_ && !service_active);
+    if (service_active) {
+        privilege_status_->setText(QStringLiteral("SYSTEM 系统服务已托管 · 支持任务管理器 / UAC / 锁屏 / 开机自启"));
+    } else if (elevated_) {
+        privilege_status_->setText(QStringLiteral("当前为管理员权限 · 支持任务管理器（如需支持 UAC/锁屏请启用系统服务）"));
+    } else {
+        privilege_status_->setText(QStringLiteral("当前为普通权限 · 任务管理器/UAC 会拦截输入，建议启用系统服务"));
+    }
 }
 
 void AccountWindow::loadCredentials() {
@@ -525,6 +570,7 @@ void AccountWindow::signIn(bool create) {
 }
 
 void AccountWindow::refresh() {
+    refreshServiceStatus();
     if (request_ != Request::none || !p2p_account_device_id(account_.get())) return;
     if (p2p_account_refresh(account_.get()) != P2P_OK) {
         setStatus(winText(p2p_last_error()));
@@ -547,8 +593,10 @@ void AccountWindow::completeRequest() {
                 setStatus(QString{});
             }
             account_heading_->setText(QStringLiteral("我的设备 · %1").arg(pending_->user));
+            active_credentials_.emplace(pending_->server, pending_->user, pending_->password, pending_->remember);
             pending_.reset();
-            startReceiving();
+            refreshServiceStatus();
+            if (!service_info_.running) startReceiving();
             refresh_.start();
             refresh();
         } else if (request == Request::devices) {
@@ -573,6 +621,7 @@ void AccountWindow::signOut() {
     p2p_account_cancel(account_.get());
     request_ = Request::none;
     closeSessions();
+    active_credentials_.reset();
     if (p2p_account_logout(account_.get()) != P2P_OK) {
         setStatus(winText(p2p_last_error()));
     } else {
@@ -599,6 +648,7 @@ void AccountWindow::fillDevices() {
         const auto name = winText(device.name);
         auto subtitle = winText(device.platform);
         if (id == local) subtitle += QStringLiteral("  ·  本机");
+        else if (service_info_.running && id == service_info_.device_id) subtitle += QStringLiteral("  ·  本机(系统服务)");
         subtitle += state == QStringLiteral("online") ? QStringLiteral("  ·  可连接")
             : state == QStringLiteral("busy") ? QStringLiteral("  ·  控制中") : QStringLiteral("  ·  离线");
         const auto row = static_cast<int>(i);
@@ -640,7 +690,7 @@ void AccountWindow::toggleReceiving() {
 }
 
 void AccountWindow::startReceiving() {
-    if (!p2p_account_device_id(account_.get()) || host_ || !screens_->count()) return;
+    if (!p2p_account_device_id(account_.get()) || host_ || service_info_.running || !screens_->count()) return;
     const auto screen = reinterpret_cast<void*>(static_cast<quintptr>(screens_->currentData().toULongLong()));
     const auto generation = ++host_generation_;
     QString error;
@@ -678,6 +728,77 @@ void AccountWindow::stopReceiving() {
         hotkey_ = false;
     }
     updateControls();
+}
+
+void AccountWindow::refreshServiceStatus() {
+    auto status = queryHostServiceInfo();
+    if (status.running != service_info_.running || status.installed != service_info_.installed) {
+        ++service_status_generation_;
+        service_info_ = status;
+        updateControls();
+    }
+    if (service_info_.running && host_) {
+        stopReceiving();
+    }
+    if (!status.running || service_status_pending_) return;
+    service_status_pending_ = true;
+    const auto generation = service_status_generation_;
+    service_status_thread_ = std::jthread([this, generation, status = std::move(status)]() mutable {
+        auto info = queryHostWorkerStatus(std::move(status));
+        QMetaObject::invokeMethod(this, [this, generation, info = std::move(info)] {
+            service_status_pending_ = false;
+            if (generation != service_status_generation_) return;
+            service_info_ = info;
+            updateControls();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void AccountWindow::toggleHostService() {
+    QString error;
+    if (service_info_.installed) {
+        setStatus(QStringLiteral("正在停止并卸载系统服务…"));
+        if (!uninstallHostService(&error)) {
+            setStatus(error);
+            return;
+        }
+        refreshServiceStatus();
+        if (p2p_account_device_id(account_.get()) && !service_info_.running) {
+            startReceiving();
+        }
+        setStatus(QStringLiteral("已卸载系统服务，已恢复绿色便携接收模式。"));
+        updateControls();
+        return;
+    }
+
+    if (!active_credentials_) {
+        setStatus(QStringLiteral("请先登录账号后再启用系统服务。"));
+        return;
+    }
+    stopReceiving();
+    setStatus(QStringLiteral("正在安装并启动系统服务（请在弹出的 UAC 窗口确认）…"));
+    const int monitor_index = std::max(0, screens_->currentIndex());
+    if (!installHostService(active_credentials_->server, active_credentials_->user, active_credentials_->password,
+            monitor_index, options_.compatible_http, options_.relay_only, &error)) {
+        setStatus(error);
+        refreshServiceStatus();
+        if (!service_info_.running && p2p_account_device_id(account_.get())) startReceiving();
+        updateControls();
+        return;
+    }
+    refreshServiceStatus();
+    setStatus(QStringLiteral("系统服务已启动并启用开机自启，正在等待后台接收状态。"));
+    updateControls();
+    refresh();
+}
+
+void AccountWindow::relaunchAsAdmin() {
+    QString error;
+    if (!relaunchClientElevated(&error)) {
+        setStatus(error);
+        return;
+    }
+    quit();
 }
 
 void AccountWindow::connectDevice() {

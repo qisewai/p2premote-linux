@@ -39,6 +39,7 @@ public:
     virtual ~IVideoCapturer() = default;
     [[nodiscard]] virtual HANDLE ReadyEvent() const noexcept = 0;
     [[nodiscard]] virtual bool IsSourceClosed() const noexcept = 0;
+    [[nodiscard]] virtual bool PreferFallbackCapture() const noexcept { return false; }
     [[nodiscard]] virtual bool HasFrame() const noexcept = 0;
     virtual bool SetCursorCapture(bool enabled) noexcept = 0;
     virtual CaptureProgress Poll() = 0;

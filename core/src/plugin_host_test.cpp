@@ -1,4 +1,5 @@
 #include "plugin_host.h"
+#include "pty_session.h"
 
 #include <p2premote/plugin_protocol.h>
 
@@ -8,6 +9,7 @@
 #include <winrt/base.h>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -671,7 +673,23 @@ void TestFileTransfer(const std::filesystem::path& root) {
         return true;
     }, fixture.root, PluginHost::Notify{}, config);
     viewer = std::make_unique<PluginHost>(false, [&](std::string_view frame) {
-        if (host) host->Receive(frame);
+        if (host) {
+            // Keep the requested download window below the ACK batch size for the entire transfer.
+            if (const auto packet = DecodePluginPacket(frame); packet && packet->id == "file-transfer" &&
+                    (packet->type == "dn_open" || packet->type == "dn_pace" || packet->type == "dn_ack")) {
+                std::string payload(packet->payload);
+                if (const auto field = payload.find("\"win\":"); field != std::string::npos) {
+                    const auto start = field + 6;
+                    const auto end = payload.find_first_not_of("0123456789", start);
+                    payload.replace(start, end - start, "2");
+                    if (const auto replacement = EncodePluginPacket({packet->id, packet->type, payload})) {
+                        host->Receive(*replacement);
+                        return true;
+                    }
+                }
+            }
+            host->Receive(frame);
+        }
         return true;
     }, fixture.root, PluginHost::Notify{}, config);
 
@@ -750,7 +768,11 @@ void TestFileTransfer(const std::filesystem::path& root) {
     Check(ReadBinaryFile(remote_dir / "sample_up.bin") == up_bytes, "Uploaded binary content mismatch");
     Check(ReadBinaryFile(remote_dir / "empty.bin").empty(), "Uploaded empty file mismatch");
 
-    // 6. Download a 180 KiB binary file from Host -> Viewer.
+    // 6. Download a 180 KiB binary file from Host -> Viewer under simulated 4% video loss
+    //    to verify automatic video-loss-aware dynamic pacing + end-to-end SHA-256 verification.
+    viewer->UpdateMetrics({IcePath::nat, 25, 0.001, {}});
+    std::this_thread::sleep_for(550ms);
+    viewer->UpdateMetrics({IcePath::nat, 85, 0.04, {}});
     viewer->SendUiEvent({ft_dlg, "download_btn", "click",
         R"({"values":{"remote_table":["sample_down.bin"]}})"});
     Check(wait(8s, [&] {
@@ -774,6 +796,197 @@ void TestFileTransfer(const std::filesystem::path& root) {
     std::filesystem::remove_all(remote_dir, ignored);
 }
 
+std::string DecodeBase64Simple(std::string_view input) {
+    auto val_of = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::string out;
+    std::uint32_t val = 0;
+    int bits = -8;
+    for (unsigned char c : input) {
+        if (c == '=') break;
+        const int d = val_of(c);
+        if (d < 0) continue;
+        val = (val << 6) | static_cast<std::uint32_t>(d);
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<char>((val >> bits) & 0xff));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+void TestRemoteTerminal(const std::filesystem::path& source_plugins) {
+    Fixture fixture;
+    fixture.CopyPlugin(source_plugins / "remote-terminal");
+    const auto config = fixture.root / L"config";
+    std::atomic_bool hold_opened{}, drop_output{}, drop_input_ack{}, reject_input{};
+    std::atomic_uint open_replies{}, close_replies{}, input_packets{}, output_retries{};
+    std::unique_ptr<PluginHost> host;
+    std::unique_ptr<PluginHost> viewer;
+    host = std::make_unique<PluginHost>(true, [&](std::string_view frame) {
+        if (const auto packet = DecodePluginPacket(frame)) {
+            if (packet->type == "opened") {
+                ++open_replies;
+                if (hold_opened) return true;
+            }
+            if (packet->type == "closed") ++close_replies;
+            if (packet->type == "out" && drop_output.exchange(false)) {
+                ++output_retries;
+                return true;
+            }
+            if (packet->type == "in_ack" && drop_input_ack.exchange(false)) return true;
+        }
+        if (viewer) viewer->Receive(frame);
+        return true;
+    }, fixture.root, PluginHost::Notify{}, config);
+    viewer = std::make_unique<PluginHost>(false, [&](std::string_view frame) {
+        if (const auto packet = DecodePluginPacket(frame); packet && packet->type == "in") {
+            ++input_packets;
+            if (reject_input.exchange(false)) return false;
+        }
+        if (host) host->Receive(frame);
+        return true;
+    }, fixture.root, PluginHost::Notify{}, config);
+    struct StopOnExit {
+        PluginHost& viewer;
+        PluginHost& host;
+        ~StopOnExit() { viewer.Stop(); host.Stop(); }
+    } stop{*viewer, *host};
+
+    const auto wait = [](auto timeout, const auto& predicate) {
+        const auto until = std::chrono::steady_clock::now() + timeout;
+        do {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(25ms);
+        } while (std::chrono::steady_clock::now() < until);
+        return false;
+    };
+
+    host->SetConnected(true);
+    viewer->SetConnected(true);
+
+    std::vector<PluginMenuItem> menu;
+    Check(wait(3s, [&] { menu = viewer->Menu(); return !menu.empty(); }), "Remote-terminal menu did not register");
+    viewer->Invoke(menu[0].id);
+
+    std::uint32_t dlg{}, session{}, input_ack{};
+    bool clear{}, resized{}, exited{};
+    std::string terminal_output;
+    const auto read_number = [](std::string_view json, std::string_view key, std::uint32_t& value) {
+        const auto pos = json.find(key);
+        if (pos != json.npos) {
+            std::from_chars(json.data() + pos + key.size(), json.data() + json.size(), value);
+        }
+    };
+    const auto drain_ui = [&] {
+        for (const auto& cmd : viewer->TakeUiCommands()) {
+            if (cmd.kind == "open" && cmd.json.find("\"terminal\"") != std::string::npos) {
+                dlg = cmd.dialog_id;
+            } else if (cmd.kind == "update" && cmd.dialog_id == dlg) {
+                read_number(cmd.json, "\"input_session\":", session);
+                read_number(cmd.json, "\"input_ack\":", input_ack);
+                clear |= cmd.json.find("\"clear\":true") != std::string::npos;
+                resized |= cmd.json.find("120×36") != std::string::npos;
+                exited |= cmd.json.find("进程已退出（7）") != std::string::npos;
+                const std::string key = "\"write_b64\":\"";
+                const auto pos = cmd.json.find(key);
+                if (pos != std::string::npos) {
+                    const auto start = pos + key.size();
+                    const auto end = cmd.json.find('"', start);
+                    if (end != std::string::npos) {
+                        terminal_output += DecodeBase64Simple(std::string_view(cmd.json).substr(start, end - start));
+                    }
+                }
+            }
+        }
+    };
+
+    Check(wait(5s, [&] { drain_ui(); return dlg != 0 && session != 0; }), "PowerShell PTY failed to open");
+    const auto powershell = session;
+
+    viewer->SendUiEvent({dlg, "shell", "change", R"({"value":"cmd"})"});
+    Check(wait(5s, [&] { drain_ui(); return session != 0 && session != powershell; }), "Switching to CMD PTY failed");
+
+    terminal_output.clear();
+    viewer->SendUiEvent({dlg, "term", "resize", R"({"cols":120,"rows":36})"});
+    Check(wait(3s, [&] { drain_ui(); return resized; }), "Host did not confirm the terminal grid size");
+    viewer->SendUiEvent({dlg, "clear", "click", "{}"});
+    Check(wait(3s, [&] { drain_ui(); return clear; }) && input_packets == 0, "Clear display sent input to the shell");
+
+    const auto input = [&](unsigned seq, std::string_view b64) {
+        viewer->SendUiEvent({dlg, "term", "data", "{\"session\":" + std::to_string(session) +
+            ",\"seq\":" + std::to_string(seq) + ",\"data_b64\":\"" + std::string(b64) + "\"}"});
+    };
+    reject_input = true;
+    drop_input_ack = true;
+    drop_output = true;
+    // echo P2P_GHOSTTY_OK
+    input(1, "ZWNobyBQMlBfR0hPU1RUWV9PSw0=");
+    Check(wait(5s, [&] {
+        drain_ui();
+        return input_ack == 1 && terminal_output.find("P2P_GHOSTTY_OK\r") != std::string::npos;
+    }) && input_packets >= 3 && output_retries == 1, "Terminal stream did not recover from transport backpressure and loss");
+    const auto echoed = terminal_output.find("P2P_GHOSTTY_OK\r");
+    Check(terminal_output.find("P2P_GHOSTTY_OK\r", echoed + 1) == std::string::npos, "Input retry duplicated the command");
+
+    // Exercise more than one wire frame of continuous terminal output.
+    terminal_output.clear();
+    input(2, "Zm9yIC9MICVpIGluICgxLDEsMTUwMCkgZG8gQGVjaG8gUDJQX0JVTEtfJWlfYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU2Nzg5X0VORA0=");
+    Check(wait(5s, [&] {
+        drain_ui();
+        return input_ack == 2 && terminal_output.find("P2P_BULK_1500_") != std::string::npos;
+    }), "Could not stream the full terminal output");
+    std::size_t offset{};
+    for (int i = 1; i <= 1500; ++i) {
+        const auto record = "P2P_BULK_" + std::to_string(i) + "_";
+        offset = terminal_output.find(record, offset);
+        Check(offset != std::string::npos, "Terminal output lost a record or arrived out of order");
+        offset += record.size();
+    }
+
+    // exit /b 7
+    input(3, "ZXhpdCAvYiA3DQ==");
+    Check(wait(5s, [&] { drain_ui(); return exited && session == 0; }), "Terminal did not report the shell exit code");
+
+    viewer->SendUiEvent({dlg, "", "close", "{}"});
+    Check(wait(3s, [&] { return close_replies >= 1; }), "The real Qt close event did not close the remote terminal");
+    const auto previous_dialog = dlg;
+    const auto previous_opens = open_replies.load();
+    const auto previous_closes = close_replies.load();
+    hold_opened = true;
+    viewer->Invoke(menu[0].id);
+    Check(wait(5s, [&] { drain_ui(); return dlg != previous_dialog && open_replies > previous_opens; }),
+        "Could not reopen the dialog and begin a new terminal request");
+    viewer->SendUiEvent({dlg, "", "close", "{}"});
+    Check(wait(3s, [&] { return close_replies > previous_closes; }),
+        "Closing during startup left the remote terminal request active");
+
+    PtySession pressure("cmd", 100, 30);
+    Check(pressure.Valid(), "Could not start the ConPTY shutdown regression test");
+    Check(pressure.Write("for /L %i in (1,1,50000) do @echo P2P_PRESSURE_%i_abcdefghijklmnopqrstuvwxyz\r"),
+        "Could not queue the terminal output workload");
+    std::string pending_output;
+    Check(wait(3s, [&] {
+        pending_output += pressure.Read().bytes;
+        return pending_output.find("P2P_PRESSURE_1_") != std::string::npos;
+    }), "The terminal output workload did not start");
+
+    // Let both native pipes back up without draining terminal output.
+    const std::string queued_input(8192, ' ');
+    for (int i = 0; i < 40; ++i) pressure.Write(queued_input);
+    std::this_thread::sleep_for(200ms);
+    const auto closing = std::chrono::steady_clock::now();
+    pressure.Close();
+    Check(std::chrono::steady_clock::now() - closing < 3s, "ConPTY shutdown did not cancel blocked I/O");
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -784,6 +997,10 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (argc == 3 && std::wstring_view(argv[1]) == L"--file-transfer") {
             TestFileTransfer(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::wstring_view(argv[1]) == L"--remote-terminal") {
+            TestRemoteTerminal(argv[2]);
             return 0;
         }
         if (argc == 3 && std::wstring_view(argv[1]) == L"--file-clipboard") return TestFileClipboard(argv[2]);

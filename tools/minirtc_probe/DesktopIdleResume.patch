@@ -1,0 +1,65 @@
+diff --git a/src/transport/video_frame_cadence.h b/src/transport/video_frame_cadence.h
+--- a/src/transport/video_frame_cadence.h
++++ b/src/transport/video_frame_cadence.h
+@@ -16,10 +16,23 @@
+ // do not accumulate a burst of overdue frames after capture pauses.
+ class VideoFrameCadence {
+  public:
+-  bool Accept(int64_t now_us, int frame_rate) {
++  // A sparse desktop refresh may immediately precede the first scroll frame.
++  // Allow exactly one close pair, then anchor the normal cadence to motion.
++  bool CanResumeDesktop(int64_t now_us) const {
++    return resume_until_us_ != 0 && now_us <= resume_until_us_;
++  }
++
++  bool Accept(int64_t now_us, int frame_rate, bool resume_desktop = false) {
+     const int64_t interval_us = 1000000 / frame_rate;
+     const int64_t jitter_us = std::min<int64_t>(4000, interval_us / 4);
++    if (resume_desktop) {
++      resume_until_us_ = 0;
++      next_frame_us_ = now_us + interval_us;
++      return true;
++    }
+     if (now_us + jitter_us < next_frame_us_) return false;
++    const bool sparse = next_frame_us_ && now_us >= next_frame_us_ + 2 * interval_us;
++    resume_until_us_ = sparse ? now_us + interval_us + jitter_us : 0;
+     next_frame_us_ =
+         next_frame_us_ == 0
+             ? now_us + interval_us
+@@ -29,6 +42,7 @@
+ 
+  private:
+   int64_t next_frame_us_ = 0;
++  int64_t resume_until_us_ = 0;
+ };
+ 
+ }  // namespace minirtc
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -755,8 +755,12 @@
+   }
+ 
+   if (task_queue_encode_) {
+-    if (!video_frame_cadences_[channel_name].Accept(
+-            clock_->CurrentTimeUs(), media_config_.max_frame_rate))
++    auto& cadence = video_frame_cadences_[channel_name];
++    const int64_t now_us = clock_->CurrentTimeUs();
++    const bool resume_desktop =
++        media_config_.video_content_type == VideoContentType::ScreenContent &&
++        cadence.CanResumeDesktop(now_us);
++    if (!cadence.Accept(now_us, media_config_.max_frame_rate, resume_desktop))
+       return 0;
+     context->capture_input_frame_total.fetch_add(1,
+                                                  std::memory_order_relaxed);
+@@ -777,7 +781,9 @@
+     // Reject coalesced frames before copying the full desktop buffer. At 4K,
+     // copying frames that are known to be dropped can consume hundreds of MB/s
+     // and slow the capture callback itself below its configured frame rate.
+-    if (task_queue_encode_->PendingTasks() > 0) {
++    // At resume, the idle refresh may still be waiting for the encoder.
++    // Permit its successor while keeping the pacer and backlog limits.
++    if (task_queue_encode_->PendingTasks() > (resume_desktop ? 1 : 0)) {
+       context->encode_queue_dropped_frame_total.fetch_add(
+           1, std::memory_order_relaxed);
+       return 0;

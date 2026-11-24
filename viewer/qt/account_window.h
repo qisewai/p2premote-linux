@@ -2,9 +2,12 @@
 
 #include "credentials.h"
 #include "remote_window.h"
+#include "service_control.h"
 
 #include <QPointer>
 #include <QWidget>
+
+#include <thread>
 
 class QAction;
 class QCheckBox;
@@ -48,6 +51,9 @@ private:
     void toggleReceiving();
     void startReceiving();
     void stopReceiving();
+    void refreshServiceStatus();
+    void toggleHostService();
+    void relaunchAsAdmin();
     void connectDevice();
     void closeSessions();
 
@@ -60,6 +66,13 @@ private:
     QTimer refresh_;
     Request request_{Request::none};
     std::optional<Credentials> pending_;
+    std::optional<Credentials> active_credentials_;
+    HostServiceInfo service_info_;
+    QTimer service_refresh_;
+    std::jthread service_status_thread_;
+    std::uint64_t service_status_generation_{};
+    bool service_status_pending_{};
+    bool elevated_{};
     QString loaded_server_;
     bool hotkey_{};
     bool quitting_{};
@@ -67,10 +80,11 @@ private:
     QWidget *login_page_{}, *devices_page_{};
     QLineEdit *server_{}, *user_{}, *password_{};
     QCheckBox* remember_{};
-    QLabel *status_{}, *account_heading_{}, *host_status_{};
+    QLabel *status_{}, *account_heading_{}, *host_status_{}, *privilege_status_{};
     QListWidget* devices_{};
     QComboBox* screens_{};
     QPushButton *login_{}, *register_{}, *connect_{}, *receive_{}, *refresh_button_{}, *logout_{};
+    QPushButton *service_button_{}, *elevate_button_{};
     QSystemTrayIcon* tray_{};
     QAction* tray_receive_{};
 };

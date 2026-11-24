@@ -4,12 +4,14 @@ if not clipboard.available() then return end
 local viewer = p2p.session.role() == "viewer"
 local MAX_ENTRIES = 512
 local MAX_MANIFEST = 60 * 1024
-local CHUNK = 32 * 1024
-local WINDOW = 8 * CHUNK
+local CHUNK = 56 * 1024
+local LEGACY_CHUNK = 32 * 1024
+local WINDOW = 24 * CHUNK
 local ID = "<I4"
 local READ = "<I4I4I4i8I4"
 local DATA = "<I4I4"
 local ready, hello_timer = false, nil
+local peer_chunk = LEGACY_CHUNK
 local selection, offer_serial, advertised, advertise_timer = nil, 0, 0, nil
 local remote_offer = 0
 local incoming, outgoing, last_request = nil, nil, 0
@@ -131,7 +133,7 @@ local function pump()
             break
         end
         if not job.chunk then
-            local size = math.min(CHUNK, job.size - job.sent)
+            local size = math.min(job.chunk_limit, job.size - job.sent)
             local data = fs.read(job.file, size)
             if not data or #data ~= size then
                 job.failed = true
@@ -164,7 +166,8 @@ local function serve(payload)
     if id <= last_request or offset < 0 or size == 0 or size > WINDOW then return end
     stop_outgoing()
     last_request = id
-    local job = { id = id, size = size, sent = 0, failed = true, deadline = timer.now_ms() + 12000 }
+    local job = { id = id, size = size, sent = 0, chunk_limit = peer_chunk,
+        failed = true, deadline = timer.now_ms() + 12000 }
     local file = selection and selection.id == offer and selection.sources[index]
     if file and not file.dir and offset <= file.size and size <= file.size - offset then
         local fh, actual_size, stamp = fs.open_read(file.path, true)
@@ -181,7 +184,7 @@ local function receive_data(payload)
     local id, offset, start = string.unpack(DATA, payload)
     if id ~= job.id then return end
     local data = payload:sub(start)
-    if offset ~= job.received or #data ~= math.min(CHUNK, job.size - job.received) then
+    if offset ~= job.received or #data > job.size - job.received then
         clipboard.reply(id, nil)
         stop_incoming(true)
     elseif not clipboard.reply(id, data) then
@@ -195,10 +198,12 @@ end
 p2p.session.on("connected", function()
     if not viewer then return end
     local attempts = 1
+    channel.send("hello", "2")
     channel.send("hello", "1")
     hello_timer = timer.every(500, function()
         attempts = attempts + 1
         if attempts <= 12 then
+            channel.send("hello", "2")
             channel.send("hello", "1")
         else
             timer.cancel(hello_timer)
@@ -208,22 +213,27 @@ end)
 
 p2p.session.on("disconnected", function()
     ready = false
+    peer_chunk = LEGACY_CHUNK
     stop_incoming(false)
     stop_outgoing()
 end)
 
 channel.on_message(function(kind, payload)
-    if kind == "hello" and not viewer and payload == "1" then
-        if channel.send("ready", "1") and not ready then
+    if kind == "hello" and not viewer and (payload == "1" or payload == "2") then
+        if payload == "2" then peer_chunk = CHUNK end
+        if channel.send("ready", payload) and not ready then
             ready = true
             advertise()
         end
         return
     end
-    if kind == "ready" and viewer and payload == "1" and not ready then
-        ready = true
-        if hello_timer then timer.cancel(hello_timer) end
-        advertise()
+    if kind == "ready" and viewer and (payload == "1" or payload == "2") then
+        if payload == "2" then peer_chunk = CHUNK end
+        if not ready then
+            ready = true
+            if hello_timer then timer.cancel(hello_timer) end
+            advertise()
+        end
         return
     end
     if not ready then return end

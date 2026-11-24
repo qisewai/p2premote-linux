@@ -51,10 +51,9 @@ private:
     QStackedWidget* stack_{};
     QFrame* statusbar_{};
     QLabel* status_text_{};
-    QLabel* metrics_text_{};
     QTimer hover_;
     bool fullscreen_mode_{};
     bool was_maximized_{};
-    bool show_diagnostics_{false};
+    bool show_diagnostics_{true};
     std::vector<RemoteSessionTab*> sessions_;
 };

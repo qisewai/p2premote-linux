@@ -1,5 +1,6 @@
 #include "desktop_input.h"
 
+#include "desktop_switch.h"
 #include "latency_trace.h"
 
 #include <array>
@@ -106,6 +107,11 @@ DesktopInput::~DesktopInput() {
     worker_.join();
 }
 
+bool DesktopInput::DragRecentlyActive() const noexcept {
+    const auto last = last_drag_tick_.load(std::memory_order_relaxed);
+    return last && GetTickCount64() - last < 64;
+}
+
 void DesktopInput::Submit(const InputPacket& input) {
     {
         const std::lock_guard lock(mutex_);
@@ -131,8 +137,21 @@ void DesktopInput::Submit(InputCommand command) {
     changed_.notify_one();
 }
 
+bool DesktopInput::EnsureDesktop(bool force) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - last_desktop_check_ < std::chrono::milliseconds(250)) return false;
+    last_desktop_check_ = now;
+    if (SyncThreadToInputDesktop(attached_desktop_, desktop_name_)) {
+        metrics_.valid = false;
+        latest_move_.reset();
+        return true;
+    }
+    return false;
+}
+
 void DesktopInput::Run(std::stop_token stop) {
     using Clock = std::chrono::steady_clock;
+    EnsureDesktop(true);
     auto deadline = Clock::now();
     while (!stop.stop_requested()) {
         std::unique_lock lock(mutex_);
@@ -150,6 +169,7 @@ void DesktopInput::Run(std::stop_token stop) {
         }
         lock.unlock();
 
+        EnsureDesktop(false);
         const auto now = Clock::now();
         if ((keys_.any() || buttons_.any()) && now >= deadline) {
             Release();
@@ -166,6 +186,10 @@ void DesktopInput::Run(std::stop_token stop) {
         }
     }
     Release();
+    if (attached_desktop_) {
+        CloseDesktop(attached_desktop_);
+        attached_desktop_ = nullptr;
+    }
 }
 
 void DesktopInput::Apply(const InputCommand& command) {
@@ -178,6 +202,15 @@ void DesktopInput::Apply(const InputCommand& command) {
         if (command.units.size() == 2 && (command.units[0] == VK_LWIN || command.units[0] == VK_RWIN) && command.units[1] == 'L') {
             Release();
             LockWorkStation();
+            return;
+        }
+        // Windows blocks simulated Ctrl+Alt+Del via SendInput; invoke SendSAS when running as SYSTEM.
+        if (command.units.size() == 3 &&
+            (command.units[0] == VK_LCONTROL || command.units[0] == VK_RCONTROL || command.units[0] == VK_CONTROL) &&
+            (command.units[1] == VK_LMENU || command.units[1] == VK_RMENU || command.units[1] == VK_MENU) &&
+            command.units[2] == VK_DELETE) {
+            Release();
+            SendSecureAttentionSequence();
             return;
         }
         for (std::size_t i = 0; i < command.units.size(); ++i) {
@@ -225,19 +258,27 @@ void DesktopInput::Apply(const InputCommand& command) {
 }
 
 void DesktopInput::Apply(const InputPacket& input) {
+    auto inject_one = [this](INPUT event) {
+        if (Inject(event)) return true;
+        return EnsureDesktop(true) && Inject(event);
+    };
     switch (input.kind) {
     case InputKind::reset:
         Release();
         return;
     case InputKind::key_down:
-        if (Inject(Key(input.code, false))) keys_.set(input.code);
+        if (inject_one(Key(input.code, false))) keys_.set(input.code);
         return;
     case InputKind::key_up:
-        if (keys_.test(input.code) && Inject(Key(input.code, true))) keys_.reset(input.code);
+        if (keys_.test(input.code) && inject_one(Key(input.code, true))) keys_.reset(input.code);
         return;
     case InputKind::move: {
         const auto position = BuildMove(input);
-        const bool injected = position && Inject(*position);
+        const bool injected = position && inject_one(*position);
+        if (injected) {
+            latest_move_ = input;
+            if (buttons_.any()) last_drag_tick_.store(GetTickCount64(), std::memory_order_relaxed);
+        }
         if (trace_) trace_->Pointer(injected ? "input_injected" : "input_injection_failed", input);
         return;
     }
@@ -252,12 +293,23 @@ void DesktopInput::Apply(const InputPacket& input) {
         const auto action = Mouse(flags, 0, 0, delta);
         if (auto position = BuildMove(input)) {
             std::array events{*position, action};
-            const bool injected = SendInput(static_cast<UINT>(events.size()), events.data(), sizeof(INPUT)) == events.size();
+            bool injected = SendInput(static_cast<UINT>(events.size()), events.data(), sizeof(INPUT)) == events.size();
+            if (!injected && EnsureDesktop(true)) {
+                injected = SendInput(static_cast<UINT>(events.size()), events.data(), sizeof(INPUT)) == events.size();
+            }
             if (trace_) trace_->Pointer(injected ? "input_injected" : "input_injection_failed", input);
             if (injected && !wheel) {
                 buttons_.set(input.code, down);
+                if (down) last_drag_tick_.store(GetTickCount64(), std::memory_order_relaxed);
             }
-        } else if (input.kind == InputKind::button_up && Inject(action)) {
+            // Motion can overtake an ordered control on the other channel. Apply
+            // the edge at its original position, then catch up in the new button state.
+            if (injected && latest_move_ && latest_move_->sequence > input.sequence) {
+                if (auto latest = BuildMove(*latest_move_)) inject_one(*latest);
+            } else if (injected) {
+                latest_move_.reset();
+            }
+        } else if (input.kind == InputKind::button_up && inject_one(action)) {
             buttons_.reset(input.code);
         }
         return;
@@ -272,6 +324,8 @@ void DesktopInput::Apply(const InputPacket& input) {
 }
 
 void DesktopInput::Release() {
+    latest_move_.reset();
+    last_drag_tick_.store(0, std::memory_order_relaxed);
     for (std::uint16_t scan = 1; scan < keys_.size(); ++scan) {
         if (keys_.test(scan) && Inject(Key(scan, true))) keys_.reset(scan);
     }

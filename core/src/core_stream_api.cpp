@@ -1,5 +1,6 @@
 #include "core_api_internal.h"
 #include "viewer_input.h"
+#include "qpc.h"
 
 #include <commctrl.h>
 #include <deque>
@@ -67,11 +68,13 @@ struct p2p_stream {
             }
             return;
         }
-        if (move_timer_armed) return;
+        const auto deadline = QpcNow() + QpcFrequency() * delay / 1000;
+        if (move_timer_armed && move_timer_deadline <= deadline) return;
         LARGE_INTEGER due{};
         due.QuadPart = -static_cast<LONGLONG>(delay) * 10'000 - 1;
         winrt::check_bool(SetWaitableTimer(move_timer.get(), &due, 0, nullptr, nullptr, FALSE));
         move_timer_armed = true;
+        move_timer_deadline = deadline;
     }
 
     void PresentReadyFrame() {
@@ -120,8 +123,8 @@ struct p2p_stream {
             try {
                 if (const auto result = self.input.OnSurfaceMessage(window, message, wparam, lparam)) {
                     self.SyncMoveTimer();
-                    // Keep 60 fps frames presenting even while Qt drains a high-rate WM_MOUSEMOVE burst.
-                    if (message == WM_MOUSEMOVE) self.PresentReadyFrame();
+                    // Keep 60 fps frames presenting even while Qt drains high-rate move/wheel bursts.
+                    if (message == WM_MOUSEMOVE || message == WM_MOUSEWHEEL) self.PresentReadyFrame();
                     return *result;
                 }
             } catch (...) {
@@ -145,6 +148,7 @@ struct p2p_stream {
     StreamState surface_state{StreamState::idle};
     winrt::handle move_timer;
     bool move_timer_armed{};
+    std::int64_t move_timer_deadline{};
     bool pumping_video{};
     std::wstring status, notice;
     StreamStatistics stats;

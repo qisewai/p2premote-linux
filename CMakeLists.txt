@@ -32,7 +32,7 @@ target_compile_features(plugin_protocol PUBLIC cxx_std_20)
 target_compile_options(plugin_protocol PRIVATE /W4 /permissive- /utf-8)
 
 include(cmake/lua-target.cmake)
-add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp core/src/file_clipboard.cpp core/src/plugin_settings.cpp)
+add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp core/src/file_clipboard.cpp core/src/plugin_settings.cpp core/src/pty_session.cpp)
 target_include_directories(plugin_host PUBLIC core/include)
 target_compile_features(plugin_host PRIVATE cxx_std_20)
 target_compile_definitions(plugin_host PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -87,6 +87,15 @@ target_compile_options(p2premote PRIVATE /W4 /permissive- /utf-8)
 target_link_options(p2premote PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 set_property(TARGET p2premote APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 
+add_executable(p2premote_service WIN32 host/service_main.cpp)
+target_compile_features(p2premote_service PRIVATE cxx_std_20)
+target_compile_definitions(p2premote_service PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(p2premote_service PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(p2premote_service PRIVATE p2premote_core advapi32 crypt32 delayimp shell32 userenv wtsapi32 windowsapp)
+target_link_options(p2premote_service PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest"
+    "/DELAYLOAD:p2premote_core.dll")
+set_property(TARGET p2premote_service APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
+
 add_custom_target(p2premote_minirtc_runtime
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${P2PREMOTE_MINIRTC_DIR}/p2premote_minirtc.dll" "$<TARGET_FILE_DIR:p2premote>"
@@ -94,7 +103,7 @@ add_custom_target(p2premote_minirtc_runtime
 add_dependencies(p2premote p2premote_minirtc_runtime)
 
 set(plugin_assets)
-set(P2PREMOTE_BUILTIN_PLUGINS clipboard-sync file-clipboard shortcut-macros keyboard-sync adaptive-quality file-transfer)
+set(P2PREMOTE_BUILTIN_PLUGINS clipboard-sync file-clipboard shortcut-macros keyboard-sync adaptive-quality file-transfer remote-terminal)
 foreach(plugin IN LISTS P2PREMOTE_BUILTIN_PLUGINS)
     set(plugin_dir "${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}")
     set(plugin_output "$<TARGET_FILE_DIR:p2premote>/plugins/${plugin}")
@@ -120,6 +129,14 @@ target_link_libraries(core_api_test PRIVATE p2premote_core)
 target_compile_options(core_api_test PRIVATE /W4 /utf-8)
 add_test(NAME core_api_test COMMAND core_api_test)
 set_tests_properties(core_api_test PROPERTIES TIMEOUT 12)
+
+add_executable(idle_scroll_test tools/minirtc_probe/idle_scroll_test.cpp)
+target_include_directories(idle_scroll_test PRIVATE core/src tools/minirtc_probe "${P2PREMOTE_MINIRTC_DIR}")
+target_link_libraries(idle_scroll_test PRIVATE core windowsapp)
+target_compile_options(idle_scroll_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+add_dependencies(idle_scroll_test p2premote_minirtc_runtime)
+add_test(NAME idle_scroll_test COMMAND idle_scroll_test)
+set_tests_properties(idle_scroll_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 60 SKIP_RETURN_CODE 77)
 
 add_executable(input_protocol_test proto/input_protocol_test.cpp)
 target_link_libraries(input_protocol_test PRIVATE input_protocol)
@@ -148,5 +165,6 @@ add_test(NAME clipboard_plugin_test COMMAND plugin_host_test "${CMAKE_CURRENT_SO
 add_test(NAME file_clipboard_plugin_test COMMAND plugin_host_test --file-clipboard "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 add_test(NAME office_plugin_test COMMAND plugin_host_test --office "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 add_test(NAME file_transfer_plugin_test COMMAND plugin_host_test --file-transfer "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
-set_tests_properties(plugin_host_test clipboard_plugin_test file_clipboard_plugin_test office_plugin_test file_transfer_plugin_test PROPERTIES TIMEOUT 20)
+add_test(NAME remote_terminal_plugin_test COMMAND plugin_host_test --remote-terminal "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
+set_tests_properties(plugin_host_test clipboard_plugin_test file_clipboard_plugin_test office_plugin_test file_transfer_plugin_test remote_terminal_plugin_test PROPERTIES TIMEOUT 20)
 set_tests_properties(clipboard_plugin_test file_clipboard_plugin_test PROPERTIES SKIP_RETURN_CODE 77)

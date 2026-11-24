@@ -1,4 +1,5 @@
 #include "stream_window.h"
+#include "connection_overlay.h"
 #include "viewer_input.h"
 
 #include <p2premote/stream_session.h>
@@ -46,7 +47,6 @@ constexpr int stop_control_hotkey = 1;
 constexpr wchar_t stream_window_class[] = L"P2PRemote.Stream";
 constexpr wchar_t screen_class[] = L"P2PRemote.VideoSurface";
 constexpr wchar_t blank_class[] = L"P2PRemote.BlankSurface";
-constexpr wchar_t overlay_class[] = L"P2PRemote.Diagnostics";
 
 bool IsActive(StreamState state) { return state != StreamState::idle && state != StreamState::stopped; }
 
@@ -68,41 +68,6 @@ const wchar_t* NetworkPath(IcePath path) {
 
 std::wstring Milliseconds(std::optional<double> value) {
     return value ? std::format(L"{:.1f} ms", *value) : std::wstring(L"—");
-}
-
-LRESULT CALLBACK OverlayProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    switch (message) {
-    case WM_NCHITTEST: return HTTRANSPARENT;
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT paint{};
-        const auto dc = BeginPaint(window, &paint);
-        RECT bounds{};
-        GetClientRect(window, &bounds);
-        const auto dpi = GetDpiForWindow(window);
-        const auto px = [dpi](int value) { return MulDiv(value, dpi, 96); };
-        const auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
-        SetDCBrushColor(dc, RGB(20, 30, 43));
-        FillRect(dc, &bounds, brush);
-        const RECT accent{0, 0, bounds.right, px(2)};
-        SetDCBrushColor(dc, RGB(92, 211, 207));
-        FillRect(dc, &accent, brush);
-        const auto font = CreateFontW(-px(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        const auto original = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(242, 248, 252));
-        std::array<wchar_t, 512> text{};
-        GetWindowTextW(window, text.data(), static_cast<int>(text.size()));
-        InflateRect(&bounds, -px(11), -px(9));
-        DrawTextW(dc, text.data(), -1, &bounds, DT_LEFT | DT_TOP | DT_NOPREFIX);
-        SelectObject(dc, original);
-        if (font) DeleteObject(font);
-        EndPaint(window, &paint);
-        return 0;
-    }
-    }
-    return DefWindowProcW(window, message, wparam, lparam);
 }
 
 BOOL CALLBACK AddScreen(HMONITOR monitor, HDC, LPRECT, LPARAM context) noexcept {
@@ -142,10 +107,7 @@ public:
             cls.lpfnWndProc = DefWindowProcW;
             cls.lpszClassName = blank_class;
             winrt::check_bool(RegisterClassW(&cls));
-            cls.lpfnWndProc = OverlayProc;
-            cls.hbrBackground = nullptr;
-            cls.lpszClassName = overlay_class;
-            winrt::check_bool(RegisterClassW(&cls));
+
         });
 
         const auto dpi = GetDpiForSystem();
@@ -198,10 +160,8 @@ public:
             ShowWindow(surface_, SW_HIDE);
             overlay_toggle_ = Control(L"BUTTON", L"诊断", BS_AUTOCHECKBOX | WS_TABSTOP, overlay_toggle);
             SendMessageW(overlay_toggle_, BM_SETCHECK, BST_CHECKED, 0);
-            overlay_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT, overlay_class, L"",
-                WS_CHILD | WS_DISABLED, 0, 0, 0, 0, surface_, nullptr, instance_, nullptr);
+            overlay_ = p2premote::viewer::CreateConnectionOverlay(surface_);
             winrt::check_pointer(overlay_);
-            winrt::check_bool(SetLayeredWindowAttributes(overlay_, 0, 226, LWA_ALPHA));
         }
 
         Layout();
@@ -520,34 +480,21 @@ private:
 
     void UpdateOverlay(const StreamStatistics& stats) {
         if (!overlay_) return;
-        RECT area{};
-        GetClientRect(surface_, &area);
-        const auto dpi = GetDpiForWindow(window_);
-        const auto px = [dpi](int value) { return MulDiv(value, dpi, 96); };
-        const auto margin = px(8);
-        const auto width = px(224);
-        const auto height = px(116);
-        if (session_.State() != StreamState::streaming || !stats.width || !stats.height || IsIconic(window_)
-            || SendMessageW(overlay_toggle_, BM_GETCHECK, 0, 0) != BST_CHECKED
-            || area.right < width + 2 * margin || area.bottom < height + 2 * margin) {
+        if (session_.State() != StreamState::streaming || IsIconic(window_)
+            || SendMessageW(overlay_toggle_, BM_GETCHECK, 0, 0) != BST_CHECKED) {
             ShowWindow(overlay_, SW_HIDE);
             return;
         }
-        const auto viewport = p2premote::FitVideo(area.right, area.bottom, stats.width, stats.height);
-        const bool fits_video = viewport.width >= static_cast<unsigned>(width + 2 * margin)
-            && viewport.height >= static_cast<unsigned>(height + 2 * margin);
-        const auto right = fits_video ? static_cast<int>(viewport.left + viewport.width) : area.right;
-        const auto top = fits_video ? static_cast<int>(viewport.top) : 0;
-        SetWindowPos(overlay_, HWND_TOP, right - margin - width, top + margin, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        p2premote::viewer::PlaceConnectionOverlay(overlay_, stats.width, stats.height, 200, 174);
 
         const auto seconds = static_cast<std::uint64_t>(stats.seconds);
         const auto fps = presented_fps_ ? std::format(L"{:.1f}", *presented_fps_) : std::wstring(L"—");
         const auto loss = loss_rate_ ? std::format(L"{:.1f}%", *loss_rate_) : std::wstring(L"—");
-        auto text = std::format(L"{:02}:{:02}:{:02}\r\n{} · {}\r\n{} fps · {} × {}\r\n"
-                                L"↓ {}   ↑ {}\r\nRTT {} · 丢包 {}\r\n解码等待 {}",
-            seconds / 3600, seconds / 60 % 60, seconds % 60, NetworkPath(stats.ice_path), NetworkProtocol(stats.ice_protocol),
-            fps, stats.width, stats.height, down_rate_.empty() ? L"—" : down_rate_,
-            up_rate_.empty() ? L"—" : up_rate_, Milliseconds(stats.ice_rtt_ms), loss, Milliseconds(stats.decoded_frame_wait_ms));
+        auto text = std::format(L"{:02}:{:02}:{:02}\r\n{} {}\r\n{} fps\r\n↓ {}\r\n↑ {}\r\n"
+                                L"RTT {}\r\n帧等待 {}\r\n丢包 {}\r\n{} × {}",
+            seconds / 3600, seconds / 60 % 60, seconds % 60, NetworkProtocol(stats.ice_protocol), NetworkPath(stats.ice_path),
+            fps, down_rate_.empty() ? L"—" : down_rate_, up_rate_.empty() ? L"—" : up_rate_, Milliseconds(stats.ice_rtt_ms),
+            Milliseconds(stats.decoded_frame_wait_ms), loss, stats.width, stats.height);
         if (text != visible_overlay_) {
             SetWindowTextW(overlay_, text.c_str());
             visible_overlay_ = std::move(text);

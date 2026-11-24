@@ -1,4 +1,5 @@
 #include "plugin_dialog.h"
+#include "terminal_widget.h"
 
 #include <QAbstractItemView>
 #include <QApplication>
@@ -106,18 +107,31 @@ public:
         setAttribute(Qt::WA_DeleteOnClose);
         setWindowFlag(Qt::WindowContextHelpButtonHint, false);
         setObjectName(QStringLiteral("pluginDialog"));
-        setStyleSheet(QStringLiteral(
-            "QDialog#pluginDialog { background: #f1f5f9; }"
-            "QTreeWidget { background: #ffffff; border: 1px solid #cbd7e3; border-radius: 6px; outline: 0; }"
-            "QTreeWidget::item { padding: 3px 4px; min-height: 22px; }"
-            "QTreeWidget::item:selected { background: #dfedfc; color: #11253c; }"
-            "QHeaderView::section { background: #f8fafc; color: #364e66; border: 0; border-bottom: 1px solid #d4dfe9; "
-            "border-right: 1px solid #e4ecf3; padding: 5px 8px; font-weight: 600; }"
-            "QProgressBar { background: #ffffff; color: #11253c; border: 1px solid #cbd7e3; border-radius: 5px; text-align: center; min-height: 22px; font-weight: 500; }"
-            "QProgressBar::chunk { background: #b9d7f6; border-radius: 4px; }"
-            "QComboBox { background: #ffffff; border: 1px solid #bccbd9; border-radius: 5px; min-height: 26px; padding: 2px 8px; }"
-            "QSplitter::handle { background: #dce5ee; width: 4px; height: 4px; border-radius: 2px; }"
-        ));
+        const bool dark_theme = spec.value(QStringLiteral("theme")).toString() == QStringLiteral("dark");
+        if (dark_theme) {
+            setStyleSheet(QStringLiteral(
+                "QDialog#pluginDialog { background: #0d1117; color: #e6edf3; }"
+                "QLabel { color: #c9d1d9; }"
+                "QPushButton { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 4px 12px; min-height: 24px; }"
+                "QPushButton:hover { background: #30363d; border-color: #8b949e; }"
+                "QPushButton:pressed { background: #161b22; }"
+                "QComboBox { background: #161b22; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; min-height: 26px; padding: 2px 10px; }"
+                "QComboBox QAbstractItemView { background: #161b22; color: #e6edf3; selection-background-color: #1f6feb; border: 1px solid #30363d; }"
+            ));
+        } else {
+            setStyleSheet(QStringLiteral(
+                "QDialog#pluginDialog { background: #f1f5f9; }"
+                "QTreeWidget { background: #ffffff; border: 1px solid #cbd7e3; border-radius: 6px; outline: 0; }"
+                "QTreeWidget::item { padding: 3px 4px; min-height: 22px; }"
+                "QTreeWidget::item:selected { background: #dfedfc; color: #11253c; }"
+                "QHeaderView::section { background: #f8fafc; color: #364e66; border: 0; border-bottom: 1px solid #d4dfe9; "
+                "border-right: 1px solid #e4ecf3; padding: 5px 8px; font-weight: 600; }"
+                "QProgressBar { background: #ffffff; color: #11253c; border: 1px solid #cbd7e3; border-radius: 5px; text-align: center; min-height: 22px; font-weight: 500; }"
+                "QProgressBar::chunk { background: #b9d7f6; border-radius: 4px; }"
+                "QComboBox { background: #ffffff; border: 1px solid #bccbd9; border-radius: 5px; min-height: 26px; padding: 2px 8px; }"
+                "QSplitter::handle { background: #dce5ee; width: 4px; height: 4px; border-radius: 2px; }"
+            ));
+        }
 
         setWindowTitle(spec.value(QStringLiteral("title")).toString(QStringLiteral("插件窗口")));
         const int min_w = std::clamp(spec.value(QStringLiteral("min_width")).toInt(520), 280, 1600);
@@ -164,7 +178,7 @@ protected:
     }
 
 private:
-    enum class ControlKind { other, label, input, button, checkbox, combo, progress, table };
+    enum class ControlKind { other, label, input, button, checkbox, combo, progress, table, terminal };
 
     struct ControlRef {
         ControlKind kind{ControlKind::other};
@@ -396,6 +410,28 @@ private:
             return tree;
         }
 
+        if (type == QStringLiteral("terminal")) {
+            auto* term = new GhosttyTerminalWidget(parent);
+            registerControl(node, ControlKind::terminal, term);
+            if (!id.isEmpty()) {
+                connect(term, &GhosttyTerminalWidget::inputChunk, this,
+                    [this, id](quint32 session, quint32 sequence, const QByteArray& bytes) {
+                    QJsonObject payload;
+                    payload.insert(QStringLiteral("session"), static_cast<qint64>(session));
+                    payload.insert(QStringLiteral("seq"), static_cast<qint64>(sequence));
+                    payload.insert(QStringLiteral("data_b64"), QString::fromLatin1(bytes.toBase64()));
+                    emitControlEvent(id, QStringLiteral("data"), std::move(payload));
+                });
+                connect(term, &GhosttyTerminalWidget::resized, this, [this, id](int cols, int rows) {
+                    QJsonObject payload;
+                    payload.insert(QStringLiteral("cols"), cols);
+                    payload.insert(QStringLiteral("rows"), rows);
+                    emitControlEvent(id, QStringLiteral("resize"), std::move(payload));
+                });
+            }
+            return term;
+        }
+
         return nullptr;
     }
 
@@ -415,7 +451,7 @@ private:
     void addNodeToLayout(const QJsonObject& node, QBoxLayout* layout, QWidget* parent) {
         const auto type = node.value(QStringLiteral("type")).toString();
         const int stretch = std::max(0, node.value(QStringLiteral("stretch")).toInt(
-            (type == QStringLiteral("table") || type == QStringLiteral("split")) ? 1 : 0));
+            (type == QStringLiteral("table") || type == QStringLiteral("split") || type == QStringLiteral("terminal")) ? 1 : 0));
         if (type == QStringLiteral("spacer")) {
             layout->addStretch(stretch > 0 ? stretch : 1);
             return;
@@ -501,6 +537,26 @@ private:
                 populateTableRows(static_cast<QTreeWidget*>(ref.widget), patch.value(QStringLiteral("rows")), style());
             }
             break;
+        case ControlKind::terminal: {
+            auto* term = static_cast<GhosttyTerminalWidget*>(ref.widget);
+            if (const auto session = patch.value(QStringLiteral("input_session")); session.isDouble()) {
+                term->setInputSession(static_cast<quint32>(session.toInteger()));
+            }
+            if (patch.value(QStringLiteral("reset")).toBool()) term->resetTerminal();
+            if (patch.value(QStringLiteral("clear")).toBool()) term->clearDisplay();
+            if (const auto b64 = patch.value(QStringLiteral("write_b64")); b64.isString()) {
+                const auto bytes = QByteArray::fromBase64(b64.toString().toLatin1());
+                if (!bytes.isEmpty()) term->feed(bytes);
+            }
+            if (patch.value(QStringLiteral("focus")).toBool(false)) {
+                term->setFocus();
+            }
+            if (const auto sequence = patch.value(QStringLiteral("input_ack")); sequence.isDouble()) {
+                term->acknowledgeInput(static_cast<quint32>(sequence.toInteger()));
+            }
+            if (patch.value(QStringLiteral("interrupt")).toBool()) term->interrupt();
+            break;
+        }
         case ControlKind::other:
             break;
         }

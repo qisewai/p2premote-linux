@@ -1,5 +1,17 @@
 find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets)
 
+set(P2PREMOTE_GHOSTTY_VT_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/out/ghostty-vt/ghostty-vt-1.0.1-x86_64-windows-gnu"
+    CACHE PATH "Directory containing libghostty-vt release (bin/ghostty-vt.dll, include/, lib/cmake/ghostty-vt/)")
+set(ghostty-vt_DIR "${P2PREMOTE_GHOSTTY_VT_DIR}/lib/cmake/ghostty-vt")
+find_package(ghostty-vt 1.0.1 CONFIG QUIET NO_DEFAULT_PATH)
+if(NOT TARGET ghostty-vt::ghostty-vt)
+    message(FATAL_ERROR
+        "Qt requires the libghostty-vt 1.0.1 Windows x64 package. See README.md (Qt 6) "
+        "and set P2PREMOTE_GHOSTTY_VT_DIR to the extracted package root. "
+        "Current path: ${P2PREMOTE_GHOSTTY_VT_DIR}")
+endif()
+
 add_executable(p2premote_qt WIN32
     viewer/qt/main.cpp
     viewer/qt/account_window.cpp
@@ -8,15 +20,19 @@ add_executable(p2premote_qt WIN32
     viewer/qt/plugin_dialog.h
     viewer/qt/remote_window.cpp
     viewer/qt/remote_window.h
+    viewer/qt/service_control.cpp
+    viewer/qt/service_control.h
     viewer/qt/stream_driver.cpp
-    viewer/qt/stream_driver.h)
+    viewer/qt/stream_driver.h
+    viewer/qt/terminal_widget.cpp
+    viewer/qt/terminal_widget.h)
 set_target_properties(p2premote_qt PROPERTIES
     AUTOMOC ON
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 target_compile_features(p2premote_qt PRIVATE cxx_std_20)
 target_compile_definitions(p2premote_qt PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(p2premote_qt PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(p2premote_qt PRIVATE p2premote_core Qt6::Widgets advapi32 windowsapp)
+target_link_libraries(p2premote_qt PRIVATE p2premote_core Qt6::Widgets ghostty-vt::ghostty-vt advapi32 crypt32 shell32 windowsapp)
 target_link_options(p2premote_qt PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 set_property(TARGET p2premote_qt APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 
@@ -24,10 +40,28 @@ add_custom_command(TARGET p2premote_qt POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:p2premote_qt>/platforms"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "$<TARGET_FILE:Qt6::QWindowsIntegrationPlugin>" "$<TARGET_FILE_DIR:p2premote_qt>/platforms"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "$<TARGET_FILE:ghostty-vt::ghostty-vt>" "$<TARGET_FILE_DIR:p2premote_qt>"
     VERBATIM)
 
-install(TARGETS p2premote_qt p2premote p2premote_core RUNTIME DESTINATION .)
+add_executable(terminal_widget_test viewer/qt/terminal_widget_test.cpp
+    viewer/qt/terminal_widget.cpp viewer/qt/terminal_widget.h)
+set_target_properties(terminal_widget_test PROPERTIES
+    AUTOMOC ON
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+target_compile_features(terminal_widget_test PRIVATE cxx_std_20)
+target_compile_options(terminal_widget_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(terminal_widget_test PRIVATE Qt6::Widgets ghostty-vt::ghostty-vt)
+add_dependencies(terminal_widget_test p2premote_qt)
+add_test(NAME terminal_widget_test COMMAND terminal_widget_test)
+set_tests_properties(terminal_widget_test PROPERTIES TIMEOUT 10)
+
+install(TARGETS p2premote_qt p2premote p2premote_service p2premote_core RUNTIME DESTINATION .)
 install(FILES "${P2PREMOTE_MINIRTC_DIR}/p2premote_minirtc.dll" DESTINATION .)
+install(FILES "$<TARGET_FILE:ghostty-vt::ghostty-vt>" DESTINATION .)
+get_target_property(ghostty_vt_dll ghostty-vt::ghostty-vt IMPORTED_LOCATION)
+get_filename_component(ghostty_vt_bin_dir "${ghostty_vt_dll}" DIRECTORY)
+install(FILES "${ghostty_vt_bin_dir}/../LICENSE" DESTINATION licenses RENAME ghostty-vt.txt)
 install(FILES "${P2PREMOTE_LUA_NOTICE}" DESTINATION . RENAME lua-notice.html)
 foreach(plugin IN LISTS P2PREMOTE_BUILTIN_PLUGINS)
     install(FILES "plugins/${plugin}/plugin.json" "plugins/${plugin}/main.lua" DESTINATION "plugins/${plugin}")

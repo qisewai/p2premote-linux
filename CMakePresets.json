@@ -21,6 +21,7 @@
       "name": "windows-x64-qt",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/out/build/windows-x64-qt",
+      "installDir": "${sourceDir}/dist/app",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -44,6 +45,7 @@
     {
       "name": "windows-x64-qt-release",
       "configurePreset": "windows-x64-qt",
+      "targets": ["install"],
       "configuration": "Release"
     }
   ],

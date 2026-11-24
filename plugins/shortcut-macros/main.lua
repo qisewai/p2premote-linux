@@ -6,6 +6,7 @@ end
 
 shortcut("远端切换窗口 (Alt+Tab)", {"Alt", "Tab"})
 shortcut("远端任务管理器 (Ctrl+Shift+Esc)", {"Ctrl", "Shift", "Esc"})
+shortcut("远端安全选项 (Ctrl+Alt+Del)", {"Ctrl", "Alt", "Delete"})
 shortcut("锁定远端 (Win+L)", {"Win", "L"})
 
 p2p.ui.add_menu("输入文本模板", function()
