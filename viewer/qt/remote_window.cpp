@@ -1,5 +1,8 @@
 #include "remote_window.h"
+#include "app_settings.h"
+#include "frameless_chrome.h"
 #include "plugin_dialog.h"
+#include "settings_dialog.h"
 #include "../connection_overlay.h"
 
 #include <QActionGroup>
@@ -13,14 +16,17 @@
 #include <QLabel>
 #include <QMenu>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QPushButton>
 #include <QShortcut>
+#include <QShowEvent>
 #include <QStackedWidget>
 #include <QStyle>
 #include <QTabBar>
 #include <QVBoxLayout>
+#include <QWindow>
 
 #include <windows.h>
 
@@ -31,131 +37,6 @@
 #include <utility>
 
 namespace {
-
-constexpr auto remote_stylesheet = R"(
-QWidget#remoteWindow { background: #0f131a; color: #e2e8f0; }
-QFrame#remoteTopbar {
-    background: #151b26;
-    border-bottom: 1px solid #232d3f;
-}
-QTabBar#remoteTabs {
-    background: transparent;
-    border: 0;
-}
-QTabBar#remoteTabs::tab {
-    background: transparent;
-    color: #94a3b8;
-    border: 0;
-    border-top: 2px solid transparent;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    padding: 7px 14px;
-    margin-right: 3px;
-    min-width: 120px;
-    max-width: 240px;
-    font-size: 13px;
-}
-QTabBar#remoteTabs::tab:hover {
-    background: #1d2536;
-    color: #e2e8f0;
-}
-QTabBar#remoteTabs::tab:selected {
-    background: #212b3e;
-    color: #ffffff;
-    border-top: 2px solid #3b82f6;
-    font-weight: 600;
-}
-QPushButton#perfPill {
-    background: #1e2636;
-    color: #cbd5e1;
-    border: 1px solid #2b374d;
-    border-radius: 11px;
-    padding: 2px 10px;
-    min-height: 18px;
-    font-size: 12px;
-}
-QPushButton#perfPill:hover {
-    background: #273247;
-    color: #ffffff;
-}
-QPushButton#barAddBtn {
-    background: transparent;
-    color: #94a3b8;
-    border: 0;
-    border-radius: 5px;
-    padding: 3px 8px;
-    min-height: 20px;
-    font-size: 16px;
-    font-weight: 600;
-}
-QPushButton#barAddBtn:hover {
-    background: #1e2636;
-    color: #ffffff;
-}
-QPushButton#barMenuBtn {
-    background: #1e2636;
-    color: #e2e8f0;
-    border: 1px solid #2d3a52;
-    border-radius: 5px;
-    padding: 4px 10px;
-    min-height: 20px;
-    font-size: 13px;
-}
-QPushButton#barMenuBtn:hover, QPushButton#barMenuBtn:focus {
-    background: #28344b;
-    border-color: #4b658f;
-    color: #ffffff;
-}
-QPushButton#barMenuBtn:disabled {
-    background: #171d29;
-    color: #55647a;
-    border-color: #20293a;
-}
-QPushButton#barMenuBtn[micLive="true"] {
-    background: #3b1d26;
-    color: #fecdd3;
-    border-color: #e11d48;
-}
-QPushButton#barMenuBtn[micLive="true"]:hover {
-    background: #4c222f;
-    color: #ffffff;
-}
-QFrame#remoteStatusbar {
-    background: #151b26;
-    border-top: 1px solid #232d3f;
-}
-QLabel#remoteStatusText {
-    color: #94a3b8;
-    font-size: 12px;
-}
-QWidget#video { background: #000000; }
-)";
-
-constexpr auto dark_menu_stylesheet = R"(
-QMenu {
-    background: #1a2230;
-    color: #e2e8f0;
-    border: 1px solid #2f3d56;
-    border-radius: 6px;
-    padding: 5px 0;
-    font-size: 13px;
-}
-QMenu::item {
-    padding: 6px 22px 6px 26px;
-}
-QMenu::item:selected {
-    background: #283750;
-    color: #ffffff;
-}
-QMenu::item:disabled {
-    color: #5a6a82;
-}
-QMenu::separator {
-    height: 1px;
-    background: #29354a;
-    margin: 4px 10px;
-}
-)";
 
 class VideoContainer final : public QWidget {
 public:
@@ -237,6 +118,14 @@ public:
         overlay_ = p2premote::viewer::CreateConnectionOverlay(reinterpret_cast<HWND>(video_->winId()));
         if (!overlay_) qWarning("Unable to create connection overlay (error %lu)", GetLastError());
 
+        const auto& defaults = AppSettings::instance().data();
+        quality_index_ = defaults.default_quality;
+        bitrate_index_ = defaults.default_bitrate;
+        speaker_enabled_ = defaults.speaker_enabled;
+        speaker_volume_ = static_cast<float>(defaults.speaker_volume) / 100.0f;
+        mic_fallback_ = defaults.mic_fallback;
+        show_overlay_ = defaults.show_diagnostics;
+
         dialogs_ = new PluginDialogManager(dialog_parent, this);
         connect(driver_.get(), &StreamDriver::changed, this, [this](const p2p_stream_snapshot_v1& snap) {
             onSnapshot(snap);
@@ -296,6 +185,9 @@ public:
         if (driver_ && driver_->handle()) {
             syncVideo();
             driver_->update(p2p_stream_start(driver_->handle(), nullptr, 60));
+            setQuality(quality_index_);
+            setBitrate(bitrate_index_);
+            pushAudioOptions();
         }
     }
 
@@ -451,22 +343,30 @@ private:
     QString pill_text_;
 };
 
-RemoteWindow::RemoteWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
+RemoteWindow::RemoteWindow(QWidget* parent)
+    : QWidget(parent, Qt::Window | Qt::FramelessWindowHint) {
     setAttribute(Qt::WA_DeleteOnClose);
     setObjectName(QStringLiteral("remoteWindow"));
-    setStyleSheet(QString::fromUtf8(remote_stylesheet));
     setWindowTitle(QStringLiteral("P2P Remote"));
     setMinimumSize(820, 480);
     resize(1160, 720);
+    show_diagnostics_ = AppSettings::instance().data().show_diagnostics;
 
-    layout_ = new QVBoxLayout(this);
-    layout_->setContentsMargins(0, 0, 0, 0);
+    auto* outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setSpacing(0);
+
+    shell_ = new QFrame(this);
+    shell_->setObjectName(QStringLiteral("framelessShell"));
+    layout_ = new QVBoxLayout(shell_);
+    layout_->setContentsMargins(1, 1, 1, 1);
     layout_->setSpacing(0);
 
-    topbar_ = new QFrame(this);
+    topbar_ = new QFrame(shell_);
     topbar_->setObjectName(QStringLiteral("remoteTopbar"));
+    topbar_->installEventFilter(this);
     auto* top = new QHBoxLayout(topbar_);
-    top->setContentsMargins(10, 5, 10, 0);
+    top->setContentsMargins(10, 4, 6, 0);
     top->setSpacing(6);
 
     tabs_ = new QTabBar(topbar_);
@@ -503,12 +403,30 @@ RemoteWindow::RemoteWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
     fullscreen_ = addMenuBtn(QStringLiteral("全屏"));
     fullscreen_->setToolTip(QStringLiteral("F11"));
 
+    win_min_ = new QPushButton(QStringLiteral("—"), topbar_);
+    win_min_->setObjectName(QStringLiteral("titleBtn"));
+    win_min_->setToolTip(QStringLiteral("最小化"));
+    win_min_->setFocusPolicy(Qt::NoFocus);
+    top->addWidget(win_min_);
+
+    win_max_ = new QPushButton(QStringLiteral("□"), topbar_);
+    win_max_->setObjectName(QStringLiteral("titleBtn"));
+    win_max_->setToolTip(QStringLiteral("最大化"));
+    win_max_->setFocusPolicy(Qt::NoFocus);
+    top->addWidget(win_max_);
+
+    win_close_ = new QPushButton(QStringLiteral("✕"), topbar_);
+    win_close_->setObjectName(QStringLiteral("titleCloseBtn"));
+    win_close_->setToolTip(QStringLiteral("关闭窗口"));
+    win_close_->setFocusPolicy(Qt::NoFocus);
+    top->addWidget(win_close_);
+
     layout_->addWidget(topbar_);
 
-    stack_ = new QStackedWidget(this);
+    stack_ = new QStackedWidget(shell_);
     layout_->addWidget(stack_, 1);
 
-    statusbar_ = new QFrame(this);
+    statusbar_ = new QFrame(shell_);
     statusbar_->setObjectName(QStringLiteral("remoteStatusbar"));
     auto* bottom = new QHBoxLayout(statusbar_);
     bottom->setContentsMargins(12, 4, 12, 4);
@@ -518,6 +436,8 @@ RemoteWindow::RemoteWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
     status_text_->setTextFormat(Qt::PlainText);
     bottom->addWidget(status_text_, 1);
     layout_->addWidget(statusbar_);
+
+    outer->addWidget(shell_);
 
     connect(tabs_, &QTabBar::currentChanged, this, &RemoteWindow::onTabChanged);
     connect(tabs_, &QTabBar::tabCloseRequested, this, &RemoteWindow::closeTab);
@@ -539,6 +459,17 @@ RemoteWindow::RemoteWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
     connect(plugins_menu_, &QPushButton::clicked, this, &RemoteWindow::showPluginsMenu);
     connect(actions_menu_, &QPushButton::clicked, this, &RemoteWindow::showActionsMenu);
     connect(fullscreen_, &QPushButton::clicked, this, &RemoteWindow::toggleFullscreen);
+    connect(win_min_, &QPushButton::clicked, this, &QWidget::showMinimized);
+    connect(win_max_, &QPushButton::clicked, this, [this] {
+        if (isMaximized()) showNormal();
+        else showMaximized();
+        syncWindowControls();
+    });
+    connect(win_close_, &QPushButton::clicked, this, &QWidget::close);
+    connect(&AppSettings::instance(), &AppSettings::changed, this, [this](const AppSettingsData& next) {
+        show_diagnostics_ = next.show_diagnostics;
+        refreshChrome();
+    });
 
     auto* shortcut = new QShortcut(QKeySequence(Qt::Key_F11), this);
     shortcut->setAutoRepeat(false);
@@ -579,11 +510,68 @@ void RemoteWindow::openSession(p2p_account* account, const QString& device, cons
     session->start();
 }
 
+void RemoteWindow::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    if (!dwm_applied_) {
+        dwm_applied_ = true;
+        applyWin32FramelessChrome(this);
+    }
+    syncWindowControls();
+}
+
 void RemoteWindow::changeEvent(QEvent* event) {
     QWidget::changeEvent(event);
     if (event->type() == QEvent::WindowStateChange) {
+        syncWindowControls();
         if (auto* session = currentSession()) session->syncVideo();
     }
+}
+
+bool RemoteWindow::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == topbar_ && !fullscreen_mode_) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            const auto* me = static_cast<QMouseEvent*>(event);
+            if (me->button() == Qt::LeftButton && !topbar_->childAt(me->position().toPoint()) && windowHandle()) {
+                if (windowHandle()->startSystemMove()) return true;
+            }
+        } else if (event->type() == QEvent::MouseButtonDblClick) {
+            const auto* me = static_cast<QMouseEvent*>(event);
+            if (me->button() == Qt::LeftButton && !topbar_->childAt(me->position().toPoint())) {
+                if (isMaximized()) showNormal();
+                else showMaximized();
+                syncWindowControls();
+                return true;
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+bool RemoteWindow::nativeEvent(const QByteArray& type, void* message, qintptr* result) {
+    if (handleFramelessResizeHitTest(this, message, result)) return true;
+    return QWidget::nativeEvent(type, message, result);
+}
+
+void RemoteWindow::syncWindowControls() {
+    const bool show_controls = !fullscreen_mode_;
+    if (win_min_) win_min_->setVisible(show_controls);
+    if (win_max_) {
+        win_max_->setVisible(show_controls);
+        const bool maxed = isMaximized();
+        win_max_->setText(maxed ? QStringLiteral("❐") : QStringLiteral("□"));
+        win_max_->setToolTip(maxed ? QStringLiteral("还原") : QStringLiteral("最大化"));
+    }
+    if (win_close_) win_close_->setVisible(show_controls);
+}
+
+void RemoteWindow::openSettings() {
+    if (!settings_dialog_) {
+        settings_dialog_ = new SettingsDialog(this);
+        settings_dialog_->setAttribute(Qt::WA_DeleteOnClose);
+    }
+    settings_dialog_->show();
+    settings_dialog_->raise();
+    settings_dialog_->activateWindow();
 }
 
 RemoteSessionTab* RemoteWindow::currentSession() const {
@@ -708,6 +696,7 @@ void RemoteWindow::toggleFullscreen() {
         topbar_->setParent(this, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
         topbar_->setAttribute(Qt::WA_ShowWithoutActivating);
         fullscreen_->setText(QStringLiteral("退出全屏"));
+        syncWindowControls();
         statusbar_->hide();
         showFullScreen();
         hover_.start();
@@ -715,9 +704,10 @@ void RemoteWindow::toggleFullscreen() {
     } else {
         hover_.stop();
         topbar_->hide();
-        topbar_->setParent(this, Qt::Widget);
+        topbar_->setParent(shell_, Qt::Widget);
         layout_->insertWidget(0, topbar_);
         fullscreen_->setText(QStringLiteral("全屏"));
+        syncWindowControls();
         topbar_->show();
         if (was_maximized_) showMaximized();
         else showNormal();
@@ -760,7 +750,6 @@ void RemoteWindow::showDisplayMenu() {
 
     auto* menu = new QMenu(display_menu_);
     menu->setAttribute(Qt::WA_DeleteOnClose);
-    menu->setStyleSheet(QString::fromUtf8(dark_menu_stylesheet));
 
     auto* res_header = menu->addAction(QStringLiteral("分辨率"));
     res_header->setEnabled(false);
@@ -816,7 +805,6 @@ void RemoteWindow::showAudioMenu() {
 
     auto* menu = new QMenu(audio_menu_);
     menu->setAttribute(Qt::WA_DeleteOnClose);
-    menu->setStyleSheet(QString::fromUtf8(dark_menu_stylesheet));
 
     auto* speaker = menu->addAction(QStringLiteral("远端扬声器声音"));
     speaker->setCheckable(true);
@@ -877,7 +865,6 @@ void RemoteWindow::showPluginsMenu() {
 
     auto* menu = new QMenu(plugins_menu_);
     menu->setAttribute(Qt::WA_DeleteOnClose);
-    menu->setStyleSheet(QString::fromUtf8(dark_menu_stylesheet));
 
     const auto count = p2p_stream_read_menu(session->handle());
     for (size_t i = 0; i < count; ++i) {
@@ -906,7 +893,6 @@ void RemoteWindow::showActionsMenu() {
 
     auto* menu = new QMenu(actions_menu_);
     menu->setAttribute(Qt::WA_DeleteOnClose);
-    menu->setStyleSheet(QString::fromUtf8(dark_menu_stylesheet));
 
     auto* reconnect = menu->addAction(QStringLiteral("重新连接"));
     reconnect->setEnabled(session->handle() && !session->active());
@@ -933,6 +919,9 @@ void RemoteWindow::showActionsMenu() {
     });
 
     menu->addSeparator();
+    auto* open_settings = menu->addAction(QStringLiteral("设置…"));
+    connect(open_settings, &QAction::triggered, this, &RemoteWindow::openSettings);
+
     auto* close_tab = menu->addAction(QStringLiteral("关闭当前标签页"));
     connect(close_tab, &QAction::triggered, this, [this] {
         closeTab(tabs_->currentIndex());

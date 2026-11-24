@@ -1,9 +1,13 @@
 #include "account_window.h"
+#include "app_settings.h"
+#include "frameless_chrome.h"
+#include "settings_dialog.h"
 
 #include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QEvent>
 #include <QFormLayout>
 #include <QFrame>
 #include <QLabel>
@@ -12,6 +16,7 @@
 #include <QMenu>
 #include <QPushButton>
 #include <QSettings>
+#include <QShowEvent>
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
@@ -251,25 +256,50 @@ private:
     std::jthread thread_;
 };
 
-AccountWindow::AccountWindow(LaunchOptions options) : options_(std::move(options)) {
+AccountWindow::AccountWindow(LaunchOptions options)
+    : QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint), options_(std::move(options)) {
     account_.reset(p2p_account_create());
     setWindowTitle(QStringLiteral("P2P Remote"));
-    resize(700, 510);
-    setMinimumSize(630, 460);
-    auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(28, 22, 28, 18);
+    resize(740, 560);
+    setMinimumSize(640, 490);
+
+    auto* outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setSpacing(0);
+
+    auto* shell = new QFrame(this);
+    shell->setObjectName(QStringLiteral("framelessShell"));
+    auto* shell_layout = new QVBoxLayout(shell);
+    shell_layout->setContentsMargins(1, 1, 1, 1);
+    shell_layout->setSpacing(0);
+
+    title_bar_ = new TitleBar(this, QStringLiteral("P2P Remote"), true, true, shell);
+    auto* settings_btn = new QPushButton(QStringLiteral("⚙ 设置"), title_bar_);
+    settings_btn->setObjectName(QStringLiteral("titleToolBtn"));
+    settings_btn->setFocusPolicy(Qt::NoFocus);
+    settings_btn->setToolTip(QStringLiteral("打开软件与插件设置"));
+    title_bar_->addToolWidget(settings_btn);
+    connect(settings_btn, &QPushButton::clicked, this, &AccountWindow::openSettings);
+    shell_layout->addWidget(title_bar_);
+
+    auto* body = new QWidget(shell);
+    auto* root = new QVBoxLayout(body);
+    root->setContentsMargins(26, 18, 26, 16);
     root->setSpacing(12);
-    pages_ = new QStackedWidget(this);
+    pages_ = new QStackedWidget(body);
     login_page_ = makeLoginPage();
     devices_page_ = makeDevicesPage();
     pages_->addWidget(login_page_);
     pages_->addWidget(devices_page_);
     root->addWidget(pages_, 1);
-    status_ = new QLabel(this);
+    status_ = new QLabel(body);
     status_->setObjectName(QStringLiteral("status"));
     status_->setWordWrap(true);
     status_->setTextFormat(Qt::PlainText);
     root->addWidget(status_);
+    shell_layout->addWidget(body, 1);
+    outer->addWidget(shell);
+
     if (!account_) {
         setStatus(winText(p2p_last_error()));
         login_page_->setEnabled(false);
@@ -443,6 +473,7 @@ void AccountWindow::makeTray() {
     auto* menu = new QMenu(this);
     menu->addAction(QStringLiteral("打开 P2P Remote"), this, &AccountWindow::restore);
     tray_receive_ = menu->addAction(QString{}, this, &AccountWindow::toggleReceiving);
+    menu->addAction(QStringLiteral("设置…"), this, &AccountWindow::openSettings);
     menu->addSeparator();
     menu->addAction(QStringLiteral("退出程序"), this, &AccountWindow::quit);
     tray_->setContextMenu(menu);
@@ -453,17 +484,35 @@ void AccountWindow::makeTray() {
     tray_->show();
 }
 
+void AccountWindow::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    if (!dwm_applied_) {
+        dwm_applied_ = true;
+        applyWin32FramelessChrome(this);
+    }
+    if (title_bar_) title_bar_->syncMaximizeState();
+}
+
+void AccountWindow::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::WindowStateChange && title_bar_) {
+        title_bar_->syncMaximizeState();
+    }
+}
+
 void AccountWindow::closeEvent(QCloseEvent* event) {
-    if (tray_ && !quitting_) {
+    if (tray_ && !quitting_ && AppSettings::instance().data().close_to_tray) {
         event->ignore();
         hide();
     } else {
         closeSessions();
         event->accept();
+        if (!quitting_) QApplication::quit();
     }
 }
 
 bool AccountWindow::nativeEvent(const QByteArray& type, void* message, qintptr* result) {
+    if (handleFramelessResizeHitTest(this, message, result)) return true;
     const auto* msg = static_cast<MSG*>(message);
     if (msg->message == WM_HOTKEY && msg->wParam == stop_hotkey && host_) {
         stopReceiving();
@@ -478,6 +527,16 @@ bool AccountWindow::nativeEvent(const QByteArray& type, void* message, qintptr* 
         }, Qt::QueuedConnection);
     }
     return QWidget::nativeEvent(type, message, result);
+}
+
+void AccountWindow::openSettings() {
+    if (!settings_dialog_) {
+        settings_dialog_ = new SettingsDialog(this);
+        settings_dialog_->setAttribute(Qt::WA_DeleteOnClose);
+    }
+    settings_dialog_->show();
+    settings_dialog_->raise();
+    settings_dialog_->activateWindow();
 }
 
 void AccountWindow::restore() {
@@ -596,7 +655,7 @@ void AccountWindow::completeRequest() {
             active_credentials_.emplace(pending_->server, pending_->user, pending_->password, pending_->remember);
             pending_.reset();
             refreshServiceStatus();
-            if (!service_info_.running) startReceiving();
+            if (!service_info_.running && AppSettings::instance().data().auto_receive_on_login) startReceiving();
             refresh_.start();
             refresh();
         } else if (request == Request::devices) {

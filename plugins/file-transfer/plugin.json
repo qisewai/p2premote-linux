@@ -2,6 +2,7 @@
   "id": "file-transfer",
   "name": "文件传输",
   "version": "1.0.0",
+  "description": "双栏文件管理器，支持断点续传、SHA-256 校验与视频丢包自适应限速",
   "entry": "main.lua",
   "enabled": true,
   "roles": ["host", "viewer"],

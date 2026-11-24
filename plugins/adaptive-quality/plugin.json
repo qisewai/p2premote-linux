@@ -2,8 +2,18 @@
   "id": "adaptive-quality",
   "name": "智能画质",
   "version": "1.0.0",
+  "description": "根据网络丢包与延迟动态调整远控视频码率档位",
   "entry": "main.lua",
   "roles": ["viewer"],
   "enabled": true,
-  "permissions": ["ui", "video", "config"]
+  "permissions": ["ui", "video", "config"],
+  "settings": [
+    {
+      "key": "enabled",
+      "type": "bool",
+      "label": "默认启用智能画质自动调节",
+      "description": "连接建立后自动监测丢包率与 RTT，在省流/自动/清晰档位间平滑切换",
+      "default": false
+    }
+  ]
 }

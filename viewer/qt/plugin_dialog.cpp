@@ -1,4 +1,5 @@
 #include "plugin_dialog.h"
+#include "frameless_chrome.h"
 #include "terminal_widget.h"
 
 #include <QAbstractItemView>
@@ -7,7 +8,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
-#include <QDialog>
+#include <QFrame>
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QJsonArray>
@@ -19,6 +20,8 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
 #include <QSplitter>
 #include <QStyle>
 #include <QTreeWidget>
@@ -96,44 +99,18 @@ void populateComboItems(QComboBox* combo, const QJsonValue& items_value, const Q
 
 } // namespace
 
-class PluginDialog final : public QDialog {
+class PluginDialog final : public FramelessDialog {
 public:
     using EventCallback = std::function<void(uint32_t, const QString&, const QString&, const QByteArray&)>;
     using ClosedCallback = std::function<void(uint32_t, bool)>;
 
     PluginDialog(uint32_t id, const QJsonObject& spec, EventCallback on_event,
         ClosedCallback on_closed, QWidget* parent)
-        : QDialog(parent), id_(id), on_event_(std::move(on_event)), on_closed_(std::move(on_closed)) {
+        : FramelessDialog(spec.value(QStringLiteral("title")).toString(QStringLiteral("插件窗口")), true, parent),
+          id_(id), on_event_(std::move(on_event)), on_closed_(std::move(on_closed)) {
         setAttribute(Qt::WA_DeleteOnClose);
-        setWindowFlag(Qt::WindowContextHelpButtonHint, false);
         setObjectName(QStringLiteral("pluginDialog"));
-        const bool dark_theme = spec.value(QStringLiteral("theme")).toString() == QStringLiteral("dark");
-        if (dark_theme) {
-            setStyleSheet(QStringLiteral(
-                "QDialog#pluginDialog { background: #0d1117; color: #e6edf3; }"
-                "QLabel { color: #c9d1d9; }"
-                "QPushButton { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 4px 12px; min-height: 24px; }"
-                "QPushButton:hover { background: #30363d; border-color: #8b949e; }"
-                "QPushButton:pressed { background: #161b22; }"
-                "QComboBox { background: #161b22; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; min-height: 26px; padding: 2px 10px; }"
-                "QComboBox QAbstractItemView { background: #161b22; color: #e6edf3; selection-background-color: #1f6feb; border: 1px solid #30363d; }"
-            ));
-        } else {
-            setStyleSheet(QStringLiteral(
-                "QDialog#pluginDialog { background: #f1f5f9; }"
-                "QTreeWidget { background: #ffffff; border: 1px solid #cbd7e3; border-radius: 6px; outline: 0; }"
-                "QTreeWidget::item { padding: 3px 4px; min-height: 22px; }"
-                "QTreeWidget::item:selected { background: #dfedfc; color: #11253c; }"
-                "QHeaderView::section { background: #f8fafc; color: #364e66; border: 0; border-bottom: 1px solid #d4dfe9; "
-                "border-right: 1px solid #e4ecf3; padding: 5px 8px; font-weight: 600; }"
-                "QProgressBar { background: #ffffff; color: #11253c; border: 1px solid #cbd7e3; border-radius: 5px; text-align: center; min-height: 22px; font-weight: 500; }"
-                "QProgressBar::chunk { background: #b9d7f6; border-radius: 4px; }"
-                "QComboBox { background: #ffffff; border: 1px solid #bccbd9; border-radius: 5px; min-height: 26px; padding: 2px 8px; }"
-                "QSplitter::handle { background: #dce5ee; width: 4px; height: 4px; border-radius: 2px; }"
-            ));
-        }
 
-        setWindowTitle(spec.value(QStringLiteral("title")).toString(QStringLiteral("插件窗口")));
         const int min_w = std::clamp(spec.value(QStringLiteral("min_width")).toInt(520), 280, 1600);
         const int min_h = std::clamp(spec.value(QStringLiteral("min_height")).toInt(320), 180, 1000);
         setMinimumSize(min_w, min_h);
@@ -141,16 +118,15 @@ public:
         const int height = std::clamp(spec.value(QStringLiteral("height")).toInt(560), min_h, 1000);
         resize(width, height);
 
-        auto* root_layout = new QVBoxLayout(this);
-        root_layout->setContentsMargins(14, 12, 14, 12);
-        root_layout->setSpacing(10);
+        contentLayout()->setContentsMargins(14, 12, 14, 12);
+        contentLayout()->setSpacing(10);
         const auto body = spec.value(QStringLiteral("body")).toObject();
-        addNodeToLayout(body, root_layout, this);
+        addNodeToLayout(body, contentLayout(), contentWidget());
     }
 
     void applyPatch(const QJsonObject& patch) {
         if (const auto title = patch.value(QStringLiteral("title")); title.isString()) {
-            setWindowTitle(title.toString());
+            setDialogTitle(title.toString());
         }
         const auto controls = patch.value(QStringLiteral("controls")).isObject()
             ? patch.value(QStringLiteral("controls")).toObject()
@@ -174,11 +150,11 @@ protected:
             closed_notified_ = true;
             if (on_closed_) on_closed_(id_, programmatic_close_);
         }
-        QDialog::closeEvent(event);
+        FramelessDialog::closeEvent(event);
     }
 
 private:
-    enum class ControlKind { other, label, input, button, checkbox, combo, progress, table, terminal };
+    enum class ControlKind { other, label, input, button, checkbox, combo, progress, table, terminal, spin, slider };
 
     struct ControlRef {
         ControlKind kind{ControlKind::other};
@@ -203,6 +179,12 @@ private:
             }
             case ControlKind::table:
                 values.insert(id, selectedRowIds(static_cast<QTreeWidget*>(ref.widget)));
+                break;
+            case ControlKind::spin:
+                values.insert(id, static_cast<QSpinBox*>(ref.widget)->value());
+                break;
+            case ControlKind::slider:
+                values.insert(id, static_cast<QSlider*>(ref.widget)->value());
                 break;
             default:
                 break;
@@ -293,10 +275,70 @@ private:
             return edit;
         }
 
+        if (type == QStringLiteral("card")) {
+            auto* card = new QFrame(parent);
+            card->setObjectName(QStringLiteral("card"));
+            auto* layout = new QVBoxLayout(card);
+            layout->setContentsMargins(14, 12, 14, 12);
+            layout->setSpacing(node.value(QStringLiteral("spacing")).toInt(8));
+            if (const auto children = node.value(QStringLiteral("children")); children.isArray()) {
+                for (const auto& child : children.toArray()) {
+                    if (child.isObject()) addNodeToLayout(child.toObject(), layout, card);
+                }
+            }
+            registerControl(node, ControlKind::other, card);
+            return card;
+        }
+
+        if (type == QStringLiteral("divider")) {
+            auto* line = new QFrame(parent);
+            line->setObjectName(QStringLiteral("divider"));
+            registerControl(node, ControlKind::other, line);
+            return line;
+        }
+
+        if (type == QStringLiteral("spin")) {
+            auto* spin = new QSpinBox(parent);
+            spin->setRange(node.value(QStringLiteral("min")).toInt(0), node.value(QStringLiteral("max")).toInt(100));
+            spin->setSingleStep(std::max(1, node.value(QStringLiteral("step")).toInt(1)));
+            if (const auto suffix = node.value(QStringLiteral("suffix")).toString(); !suffix.isEmpty()) spin->setSuffix(suffix);
+            spin->setValue(node.value(QStringLiteral("value")).toInt(0));
+            registerControl(node, ControlKind::spin, spin);
+            if (!id.isEmpty()) {
+                connect(spin, &QSpinBox::valueChanged, this, [this, id](int value) {
+                    QJsonObject payload;
+                    payload.insert(QStringLiteral("value"), value);
+                    emitControlEvent(id, QStringLiteral("change"), std::move(payload));
+                });
+            }
+            return spin;
+        }
+
+        if (type == QStringLiteral("slider")) {
+            auto* slider = new QSlider(Qt::Horizontal, parent);
+            slider->setRange(node.value(QStringLiteral("min")).toInt(0), node.value(QStringLiteral("max")).toInt(100));
+            slider->setSingleStep(std::max(1, node.value(QStringLiteral("step")).toInt(1)));
+            slider->setValue(node.value(QStringLiteral("value")).toInt(0));
+            registerControl(node, ControlKind::slider, slider);
+            if (!id.isEmpty()) {
+                connect(slider, &QSlider::valueChanged, this, [this, id](int value) {
+                    QJsonObject payload;
+                    payload.insert(QStringLiteral("value"), value);
+                    emitControlEvent(id, QStringLiteral("change"), std::move(payload));
+                });
+            }
+            return slider;
+        }
+
         if (type == QStringLiteral("button")) {
             auto* button = new QPushButton(node.value(QStringLiteral("text")).toString(), parent);
             button->setAutoDefault(false);
-            if (node.value(QStringLiteral("primary")).toBool(false)) button->setObjectName(QStringLiteral("primary"));
+            const auto variant = node.value(QStringLiteral("style")).toString();
+            if (node.value(QStringLiteral("primary")).toBool(false) || variant == QStringLiteral("primary")) {
+                button->setObjectName(QStringLiteral("primary"));
+            } else if (!variant.isEmpty()) {
+                button->setProperty("variant", variant);
+            }
             registerControl(node, ControlKind::button, button);
             const auto prompt = node.value(QStringLiteral("prompt")).isObject()
                 ? node.value(QStringLiteral("prompt")).toObject()
@@ -519,6 +561,18 @@ private:
                 const int idx = combo->findData(selected.toString());
                 if (idx >= 0) combo->setCurrentIndex(idx);
             }
+            break;
+        }
+        case ControlKind::spin: {
+            auto* spin = static_cast<QSpinBox*>(ref.widget);
+            const QSignalBlocker blocker(spin);
+            if (patch.contains(QStringLiteral("value"))) spin->setValue(patch.value(QStringLiteral("value")).toInt(spin->value()));
+            break;
+        }
+        case ControlKind::slider: {
+            auto* slider = static_cast<QSlider*>(ref.widget);
+            const QSignalBlocker blocker(slider);
+            if (patch.contains(QStringLiteral("value"))) slider->setValue(patch.value(QStringLiteral("value")).toInt(slider->value()));
             break;
         }
         case ControlKind::progress: {

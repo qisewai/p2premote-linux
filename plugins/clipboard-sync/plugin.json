@@ -2,6 +2,7 @@
   "id": "clipboard-sync",
   "name": "剪贴板同步",
   "version": "1.0.0",
+  "description": "在主控端与被控端之间自动双向同步纯文本剪贴板",
   "entry": "main.lua",
   "roles": ["host", "viewer"],
   "enabled": true,

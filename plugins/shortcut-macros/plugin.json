@@ -2,8 +2,19 @@
   "id": "shortcut-macros",
   "name": "快捷输入",
   "version": "1.0.0",
+  "description": "提供 Ctrl+Alt+Del、任务管理器、锁屏与常用回复文本一键发送",
   "entry": "main.lua",
   "roles": ["viewer"],
   "enabled": true,
-  "permissions": ["ui", "input", "config"]
+  "permissions": ["ui", "input", "config"],
+  "settings": [
+    {
+      "key": "template",
+      "type": "string",
+      "label": "常用回复模板文本",
+      "description": "点击「发送常用回复」插件菜单时向远端输入的默认文本内容",
+      "placeholder": "您好，已收到。",
+      "default": "您好，已收到。"
+    }
+  ]
 }

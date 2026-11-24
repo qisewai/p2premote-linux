@@ -15,13 +15,21 @@ endif()
 add_executable(p2premote_qt WIN32
     viewer/qt/main.cpp
     viewer/qt/account_window.cpp
+    viewer/qt/app_settings.cpp
+    viewer/qt/app_settings.h
+    viewer/qt/app_theme.cpp
+    viewer/qt/app_theme.h
     viewer/qt/credentials.cpp
+    viewer/qt/frameless_chrome.cpp
+    viewer/qt/frameless_chrome.h
     viewer/qt/plugin_dialog.cpp
     viewer/qt/plugin_dialog.h
     viewer/qt/remote_window.cpp
     viewer/qt/remote_window.h
     viewer/qt/service_control.cpp
     viewer/qt/service_control.h
+    viewer/qt/settings_dialog.cpp
+    viewer/qt/settings_dialog.h
     viewer/qt/stream_driver.cpp
     viewer/qt/stream_driver.h
     viewer/qt/terminal_widget.cpp
@@ -32,7 +40,7 @@ set_target_properties(p2premote_qt PROPERTIES
 target_compile_features(p2premote_qt PRIVATE cxx_std_20)
 target_compile_definitions(p2premote_qt PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(p2premote_qt PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(p2premote_qt PRIVATE p2premote_core Qt6::Widgets ghostty-vt::ghostty-vt advapi32 crypt32 shell32 windowsapp)
+target_link_libraries(p2premote_qt PRIVATE p2premote_core Qt6::Widgets ghostty-vt::ghostty-vt advapi32 crypt32 dwmapi shell32 windowsapp)
 target_link_options(p2premote_qt PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 set_property(TARGET p2premote_qt APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 

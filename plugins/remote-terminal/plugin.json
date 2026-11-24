@@ -1,7 +1,8 @@
 {
   "id": "remote-terminal",
-  "name": "Remote Terminal",
+  "name": "远程终端",
   "version": "1.0.0",
+  "description": "基于 ConPTY 与 libghostty-vt 的低延迟远端 PowerShell / CMD 交互终端",
   "enabled": true,
   "roles": ["host", "viewer"],
   "permissions": ["channel", "ui", "pty", "log"],

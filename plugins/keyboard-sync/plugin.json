@@ -2,8 +2,18 @@
   "id": "keyboard-sync",
   "name": "键盘状态同步",
   "version": "1.0.0",
+  "description": "自动同步本机与远端的 CapsLock / NumLock 锁定键状态",
   "entry": "main.lua",
   "roles": ["viewer", "host"],
   "enabled": true,
-  "permissions": ["ui", "input", "channel", "config"]
+  "permissions": ["ui", "input", "channel", "config"],
+  "settings": [
+    {
+      "key": "enabled",
+      "type": "bool",
+      "label": "默认启用键盘锁定键状态同步",
+      "description": "保持本机与被控端 CapsLock / NumLock 指示灯与输入状态一致",
+      "default": false
+    }
+  ]
 }

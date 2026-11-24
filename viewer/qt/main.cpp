@@ -1,41 +1,11 @@
 #include "account_window.h"
+#include "app_settings.h"
+#include "app_theme.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QMessageBox>
 #include <QStyle>
-
-namespace {
-
-constexpr auto stylesheet = R"(
-QWidget { color: #172a3f; font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 14px; }
-QWidget#accountWindow, QStackedWidget { background: #f1f5f9; }
-QLabel#heading { color: #11253c; font-size: 26px; font-weight: 600; }
-QLabel#muted, QLabel#status { color: #475d74; }
-QFrame#accountCard { background: #ffffff; border: 1px solid #d4dfe9; border-radius: 9px; }
-QLineEdit {
-    background: #ffffff; border: 1px solid #bccbd9; border-radius: 5px; min-height: 28px; padding: 3px 8px;
-    selection-background-color: #205995;
-}
-QLineEdit:focus { border: 1px solid #205995; }
-QPushButton {
-    background: #ffffff; border: 1px solid #bdccda; border-radius: 5px; padding: 5px 12px; min-height: 19px;
-}
-QPushButton:hover, QPushButton:focus { background: #e8f1fb; border-color: #6b8fb3; }
-QPushButton#primary { background: #205995; color: #ffffff; border-color: #205995; font-weight: 600; }
-QPushButton#primary:hover, QPushButton#primary:focus { background: #194876; }
-QPushButton:disabled, QPushButton#primary:disabled { background: #e9eef3; color: #687b8d; border-color: #d3dee7; }
-QListWidget#deviceList { background: #f1f5f9; border: 0; outline: 0; }
-QListWidget#deviceList::item {
-    background: #ffffff; border: 1px solid #d4dfe9; border-radius: 7px; padding: 8px 12px; min-height: 35px;
-}
-QListWidget#deviceList::item:hover { background: #eef5fd; }
-QListWidget#deviceList::item:selected { background: #dfedfc; border-color: #8fb6dc; color: #11253c; }
-QFrame#streamToolbar { background: #f1f5f9; border-bottom: 1px solid #bfccd8; }
-QWidget#video { background: #000000; }
-)";
-
-} // namespace
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
@@ -44,7 +14,12 @@ int main(int argc, char* argv[]) {
     QApplication::setApplicationDisplayName(QStringLiteral("P2P Remote"));
     QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
     QApplication::setWindowIcon(app.style()->standardIcon(QStyle::SP_ComputerIcon));
-    app.setStyleSheet(QString::fromUtf8(stylesheet));
+
+    auto& settings = AppSettings::instance();
+    AppTheme::apply(settings.data());
+    QObject::connect(&settings, &AppSettings::changed, &app, [](const AppSettingsData& next) {
+        AppTheme::apply(next);
+    });
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("P2P Remote Qt 客户端"));

@@ -20,6 +20,8 @@ class QPushButton;
 class QStackedWidget;
 class QSystemTrayIcon;
 class HostSession;
+class SettingsDialog;
+class TitleBar;
 
 class AccountWindow final : public QWidget {
 public:
@@ -28,6 +30,8 @@ public:
     bool valid() const { return account_ != nullptr; }
 
 protected:
+    void showEvent(QShowEvent* event) override;
+    void changeEvent(QEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     bool nativeEvent(const QByteArray& type, void* message, qintptr* result) override;
 
@@ -39,6 +43,7 @@ private:
     void makeTray();
     void restore();
     void quit();
+    void openSettings();
     void setStatus(const QString& text);
     void updateControls();
     void loadCredentials();
@@ -62,6 +67,9 @@ private:
     std::unique_ptr<HostSession> host_;
     uint64_t host_generation_{};
     QPointer<RemoteWindow> viewer_;
+    QPointer<SettingsDialog> settings_dialog_;
+    TitleBar* title_bar_{};
+    bool dwm_applied_{};
     QWinEventNotifier account_event_;
     QTimer refresh_;
     Request request_{Request::none};

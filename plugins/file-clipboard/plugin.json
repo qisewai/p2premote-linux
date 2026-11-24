@@ -2,6 +2,7 @@
   "id": "file-clipboard",
   "name": "文件剪贴板",
   "version": "1.0.0",
+  "description": "支持跨设备 Ctrl+C / Ctrl+V 复制粘贴本地文件与文件夹",
   "entry": "main.lua",
   "roles": ["host", "viewer"],
   "enabled": true,
