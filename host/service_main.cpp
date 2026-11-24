@@ -31,6 +31,8 @@ struct HostConfig {
     std::wstring server;
     std::wstring user;
     std::wstring password;
+    std::wstring installation_id;
+    std::wstring device_id;
     int monitor_index{};
     bool compatible_http{};
     bool relay_only{};
@@ -64,10 +66,13 @@ std::optional<HostConfig> ParseHostConfig(const std::string& json_utf8) {
         cfg.server = obj.GetNamedString(L"server", L"").c_str();
         cfg.user = obj.GetNamedString(L"user", L"").c_str();
         cfg.password = obj.GetNamedString(L"password", L"").c_str();
+        cfg.installation_id = obj.GetNamedString(L"installation_id", L"").c_str();
+        cfg.device_id = obj.GetNamedString(L"device_id", L"").c_str();
         cfg.monitor_index = static_cast<int>(obj.GetNamedNumber(L"monitor_index", 0));
         cfg.compatible_http = obj.GetNamedBoolean(L"compatible_http", false);
         cfg.relay_only = obj.GetNamedBoolean(L"relay_only", false);
-        if (cfg.server.empty() || cfg.user.empty() || cfg.password.empty()) return std::nullopt;
+        if (cfg.server.empty() || cfg.user.empty() || cfg.password.empty() || cfg.installation_id.empty()
+            || cfg.device_id.empty()) return std::nullopt;
         return cfg;
     } catch (...) {
         return std::nullopt;
@@ -141,7 +146,7 @@ void SetWorkerStatus(WorkerSharedStatus& shared, int state, const std::wstring& 
     if (monitor_index) shared.monitor_index = *monitor_index;
 }
 
-bool WaitLoginComplete(p2p_account* account, HANDLE stop_event, std::wstring& error) {
+bool WaitAccountComplete(p2p_account* account, HANDLE stop_event, std::wstring& error) {
     HANDLE handles[]{stop_event, p2p_account_event(account)};
     for (;;) {
         const DWORD w = WaitForMultipleObjects(2, handles, FALSE, 200);
@@ -244,15 +249,16 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
             continue;
         }
 
-        if (p2p_account_login(account.get(), cfg->server.c_str(), cfg->user.c_str(), cfg->password.c_str(),
-                0, cfg->compatible_http ? 1 : 0, cfg->relay_only ? 1 : 0) != P2P_OK) {
+        if (p2p_account_service_login(account.get(), cfg->server.c_str(), cfg->user.c_str(), cfg->password.c_str(),
+                cfg->installation_id.c_str(), cfg->device_id.c_str(), cfg->compatible_http ? 1 : 0,
+                cfg->relay_only ? 1 : 0) != P2P_OK) {
             SetWorkerStatus(shared, P2P_STOPPED, p2p_last_error() ? p2p_last_error() : L"账号登录请求失败");
             sleep_interruptible(5000);
             continue;
         }
 
         std::wstring login_err;
-        if (!WaitLoginComplete(account.get(), stop_event, login_err)) {
+        if (!WaitAccountComplete(account.get(), stop_event, login_err)) {
             if (!login_err.empty()) {
                 SetWorkerStatus(shared, P2P_STOPPED, L"系统服务登录失败：" + login_err);
                 sleep_interruptible(5000);
@@ -352,6 +358,16 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
             }
 
             if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) break;
+            stream.reset();
+            std::wstring refresh_error;
+            if (p2p_account_refresh(account.get()) != P2P_OK
+                || !WaitAccountComplete(account.get(), stop_event, refresh_error)) break;
+            const auto* current = p2p_account_device_id(account.get());
+            if (!current || cfg->device_id != current) {
+                SetWorkerStatus(shared, P2P_STOPPED, L"服务绑定的设备已移除，请在客户端重新配置", false, L"");
+                WaitForSingleObject(stop_event, INFINITE);
+                break;
+            }
             // Stream ended (e.g. viewer disconnected or transient drop); re-listen shortly.
             sleep_interruptible(1500);
         }

@@ -104,7 +104,8 @@ HostServiceInfo queryHostWorkerStatus(HostServiceInfo info) {
 }
 
 bool installHostService(const QString& server, const QString& user, const std::wstring& password,
-    int monitor_index, bool compatible_http, bool relay_only, QString* error) {
+    const QString& installation_id, const QString& device_id, int monitor_index,
+    bool compatible_http, bool relay_only, QString* error) {
     const auto exe = serviceExePath();
     if (!QFileInfo::exists(QString::fromStdWString(exe))) {
         if (error) *error = QStringLiteral("未找到 p2premote_service.exe，请重新解压完整客户端。");
@@ -115,6 +116,8 @@ bool installHostService(const QString& server, const QString& user, const std::w
     obj.insert(QStringLiteral("server"), server);
     obj.insert(QStringLiteral("user"), user);
     obj.insert(QStringLiteral("password"), QString::fromStdWString(password));
+    obj.insert(QStringLiteral("installation_id"), installation_id);
+    obj.insert(QStringLiteral("device_id"), device_id);
     obj.insert(QStringLiteral("monitor_index"), monitor_index);
     obj.insert(QStringLiteral("compatible_http"), compatible_http);
     obj.insert(QStringLiteral("relay_only"), relay_only);

@@ -167,6 +167,9 @@ p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host,
     p2p_stream* stream{};
     Guard([&] {
         auto connection = GetConnection(account);
+        if (host && !p2p_account_device_id(account)) {
+            throw std::invalid_argument("请先将本机添加到账号设备");
+        }
         if (!host && (!remote_device || !*remote_device || !video_parent)) {
             throw std::invalid_argument("请选择目标设备并创建视频窗口");
         }

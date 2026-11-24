@@ -207,7 +207,7 @@ QWidget* SettingsDialog::buildGeneralPage() {
     auto* card = makeCard(container, &card_layout);
 
     close_to_tray_ = new QCheckBox(QStringLiteral("关闭主窗口时最小化到系统托盘（不退出后台接收）"), card);
-    auto_receive_ = new QCheckBox(QStringLiteral("登录成功后自动开启本机远程接收"), card);
+    auto_receive_ = new QCheckBox(QStringLiteral("登录后自动开启远程接收（本机已添加时）"), card);
     card_layout->addWidget(close_to_tray_);
     card_layout->addWidget(auto_receive_);
 

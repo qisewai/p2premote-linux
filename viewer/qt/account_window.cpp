@@ -14,6 +14,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
 #include <QShowEvent>
@@ -335,7 +336,7 @@ QWidget* AccountWindow::makeLoginPage() {
     layout->setContentsMargins(0, 8, 0, 4);
     layout->setSpacing(14);
     layout->addWidget(heading(QStringLiteral("登录 P2P Remote"), page));
-    auto* notice = new QLabel(QStringLiteral("登录后，同账号设备可连接本机。你可以随时暂停接收。"), page);
+    auto* notice = new QLabel(QStringLiteral("登录后可连接账号下的设备。添加本机并开启接收后，其他设备可连接本机。"), page);
     notice->setObjectName(QStringLiteral("muted"));
     notice->setWordWrap(true);
     layout->addWidget(notice);
@@ -415,6 +416,8 @@ QWidget* AccountWindow::makeDevicesPage() {
     auto* actions = new QHBoxLayout;
     actions->addWidget(new QLabel(QStringLiteral("本机接收"), receiver));
     actions->addStretch();
+    add_device_ = new QPushButton(QStringLiteral("添加本机"), receiver);
+    actions->addWidget(add_device_);
     screens_ = new QComboBox(receiver);
     screens_->setAccessibleName(QStringLiteral("共享显示器"));
     actions->addWidget(screens_);
@@ -450,8 +453,10 @@ QWidget* AccountWindow::makeDevicesPage() {
     connect_ = new QPushButton(QStringLiteral("连接设备"), page);
     connect_->setObjectName(QStringLiteral("primary"));
     refresh_button_ = new QPushButton(QStringLiteral("刷新列表"), page);
+    remove_device_ = new QPushButton(QStringLiteral("移除设备"), page);
     lower->addWidget(connect_);
     lower->addWidget(refresh_button_);
+    lower->addWidget(remove_device_);
     lower->addStretch();
     layout->addLayout(lower);
 
@@ -460,6 +465,8 @@ QWidget* AccountWindow::makeDevicesPage() {
     connect(service_button_, &QPushButton::clicked, this, &AccountWindow::toggleHostService);
     connect(elevate_button_, &QPushButton::clicked, this, &AccountWindow::relaunchAsAdmin);
     connect(refresh_button_, &QPushButton::clicked, this, &AccountWindow::refresh);
+    connect(add_device_, &QPushButton::clicked, this, &AccountWindow::addLocalDevice);
+    connect(remove_device_, &QPushButton::clicked, this, &AccountWindow::removeSelectedDevice);
     connect(connect_, &QPushButton::clicked, this, &AccountWindow::connectDevice);
     connect(devices_, &QListWidget::itemDoubleClicked, this, &AccountWindow::connectDevice);
     connect(devices_, &QListWidget::itemSelectionChanged, this, &AccountWindow::updateControls);
@@ -557,7 +564,7 @@ void AccountWindow::setStatus(const QString& text) { status_->setText(text); }
 void AccountWindow::updateControls() {
     if (!account_) return;
     const auto* local = p2p_account_device_id(account_.get());
-    const bool signed_in = local != nullptr;
+    const bool signed_in = p2p_account_signed_in(account_.get()) != 0;
     const bool busy = request_ != Request::none;
     pages_->setCurrentWidget(signed_in ? devices_page_ : login_page_);
     login_page_->setEnabled(!busy);
@@ -568,10 +575,13 @@ void AccountWindow::updateControls() {
     connect_->setEnabled(signed_in && item && item->data(device_state_role).toString() == QStringLiteral("online")
         && !is_self_device);
     refresh_button_->setEnabled(!busy);
+    add_device_->setVisible(!local);
+    add_device_->setEnabled(signed_in && !busy);
+    remove_device_->setEnabled(signed_in && !busy && !selected_id.isEmpty());
     const bool service_active = service_info_.running;
-    screens_->setEnabled(!host_ && !service_active);
+    screens_->setEnabled(local && !host_ && !service_active);
     receive_->setVisible(!service_active);
-    receive_->setEnabled(screens_->count() || host_);
+    receive_->setEnabled(local && (screens_->count() || host_));
     const auto label = host_ ? QStringLiteral("停止接收") : QStringLiteral("开始接收");
     receive_->setText(label);
     if (tray_receive_) {
@@ -583,13 +593,14 @@ void AccountWindow::updateControls() {
             ? QStringLiteral("[系统服务] 后台已启动，正在等待接收状态。")
             : service_info_.status);
     } else if (!host_) {
-        host_status_->setText(QStringLiteral("本机已暂停接收。"));
+        host_status_->setText(local ? QStringLiteral("本机已暂停接收。")
+            : QStringLiteral("添加本机后，可开启接收远程连接。"));
     }
 
     const bool has_service_exe = serviceExecutableExists();
     service_button_->setVisible(has_service_exe || service_info_.installed);
     service_button_->setText(service_info_.installed ? QStringLiteral("卸载系统服务") : QStringLiteral("启用系统服务"));
-    service_button_->setEnabled(signed_in || service_info_.installed);
+    service_button_->setEnabled(local || service_info_.installed);
     elevate_button_->setVisible(!elevated_ && !service_active);
     if (service_active) {
         privilege_status_->setText(QStringLiteral("SYSTEM 系统服务已托管 · 支持任务管理器 / UAC / 锁屏 / 开机自启"));
@@ -612,7 +623,7 @@ void AccountWindow::loadCredentials() {
 }
 
 void AccountWindow::signIn(bool create) {
-    if (request_ != Request::none || p2p_account_device_id(account_.get())) return;
+    if (request_ != Request::none || p2p_account_signed_in(account_.get())) return;
     pending_.emplace(server_->text().trimmed(), user_->text(), password_->text().toStdWString(), remember_->isChecked());
     const auto endpoint = pending_->server.toStdWString();
     const auto user = pending_->user.toStdWString();
@@ -624,13 +635,13 @@ void AccountWindow::signIn(bool create) {
     }
     password_->clear();
     request_ = Request::login;
-    setStatus(create ? QStringLiteral("正在注册并登记本机…") : QStringLiteral("正在登录并登记本机…"));
+    setStatus(create ? QStringLiteral("正在注册账号…") : QStringLiteral("正在登录…"));
     updateControls();
 }
 
 void AccountWindow::refresh() {
     refreshServiceStatus();
-    if (request_ != Request::none || !p2p_account_device_id(account_.get())) return;
+    if (request_ != Request::none || !p2p_account_signed_in(account_.get())) return;
     if (p2p_account_refresh(account_.get()) != P2P_OK) {
         setStatus(winText(p2p_last_error()));
         return;
@@ -639,7 +650,43 @@ void AccountWindow::refresh() {
     updateControls();
 }
 
+void AccountWindow::addLocalDevice() {
+    if (request_ != Request::none || !p2p_account_signed_in(account_.get()) || p2p_account_device_id(account_.get())) return;
+    if (p2p_account_add_local_device(account_.get()) != P2P_OK) {
+        setStatus(winText(p2p_last_error()));
+        return;
+    }
+    request_ = Request::add_device;
+    setStatus(QStringLiteral("正在添加本机…"));
+    updateControls();
+}
+
+void AccountWindow::removeSelectedDevice() {
+    if (request_ != Request::none || !p2p_account_signed_in(account_.get())) return;
+    const auto* item = devices_->currentItem();
+    if (!item) return;
+    const auto id = item->data(Qt::UserRole).toString().toStdWString();
+    const auto name = item->data(device_name_role).toString();
+    QMessageBox confirm(QMessageBox::Question, QStringLiteral("移除设备"),
+        QStringLiteral("确定移除「%1」？它将停止接收当前账号的远程连接，现有会话也会结束。").arg(name),
+        QMessageBox::Yes | QMessageBox::No, this);
+    confirm.setTextFormat(Qt::PlainText);
+    confirm.setDefaultButton(QMessageBox::No);
+    refresh_.stop();
+    const bool accepted = confirm.exec() == QMessageBox::Yes;
+    refresh_.start();
+    if (!accepted) return;
+    if (p2p_account_remove_device(account_.get(), id.c_str()) != P2P_OK) {
+        setStatus(winText(p2p_last_error()));
+        return;
+    }
+    request_ = Request::remove_device;
+    setStatus(QStringLiteral("正在移除设备…"));
+    updateControls();
+}
+
 void AccountWindow::completeRequest() {
+    const bool was_registered = p2p_account_device_id(account_.get()) != nullptr;
     const auto result = p2p_account_complete(account_.get());
     if (result == P2P_PENDING) return;
     const auto request = std::exchange(request_, Request::none);
@@ -658,15 +705,26 @@ void AccountWindow::completeRequest() {
             if (!service_info_.running && AppSettings::instance().data().auto_receive_on_login) startReceiving();
             refresh_.start();
             refresh();
-        } else if (request == Request::devices) {
+        } else if (request == Request::devices || request == Request::add_device || request == Request::remove_device) {
+            if (was_registered && !p2p_account_device_id(account_.get())) {
+                if (host_) stopReceiving();
+                setStatus(QStringLiteral("本机已从账号移除，接收已停止。"));
+            } else if (request == Request::add_device) {
+                setStatus(QStringLiteral("已添加本机。可点击「开始接收」上线。"));
+            } else if (request == Request::remove_device) {
+                setStatus(QStringLiteral("已移除设备。"));
+            }
             fillDevices();
+            if (request != Request::devices) refresh();
         } else {
             setStatus(QStringLiteral("已退出账号。"));
         }
     } else {
         const auto error = winText(p2p_last_error());
         if (result == P2P_LOGIN_EXPIRED) {
+            refresh_.stop();
             closeSessions();
+            active_credentials_.reset();
             devices_->clear();
         }
         pending_.reset();
@@ -676,7 +734,8 @@ void AccountWindow::completeRequest() {
 }
 
 void AccountWindow::signOut() {
-    if (!p2p_account_device_id(account_.get())) return;
+    if (!p2p_account_signed_in(account_.get())) return;
+    refresh_.stop();
     p2p_account_cancel(account_.get());
     request_ = Request::none;
     closeSessions();
@@ -830,15 +889,17 @@ void AccountWindow::toggleHostService() {
         return;
     }
 
-    if (!active_credentials_) {
-        setStatus(QStringLiteral("请先登录账号后再启用系统服务。"));
+    const auto* device_id = p2p_account_device_id(account_.get());
+    if (!active_credentials_ || !device_id) {
+        setStatus(QStringLiteral("请先添加本机，再启用系统服务。"));
         return;
     }
     stopReceiving();
     setStatus(QStringLiteral("正在安装并启动系统服务（请在弹出的 UAC 窗口确认）…"));
     const int monitor_index = std::max(0, screens_->currentIndex());
     if (!installHostService(active_credentials_->server, active_credentials_->user, active_credentials_->password,
-            monitor_index, options_.compatible_http, options_.relay_only, &error)) {
+            winText(p2p_account_installation_id(account_.get())), winText(device_id), monitor_index,
+            options_.compatible_http, options_.relay_only, &error)) {
         setStatus(error);
         refreshServiceStatus();
         if (!service_info_.running && p2p_account_device_id(account_.get())) startReceiving();

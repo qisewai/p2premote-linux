@@ -15,7 +15,11 @@ int main(void) {
 
     p2p_account* account = p2p_account_create();
     if (!check(account != NULL, "Account allocation failed")) return 1;
-    int passed = check(p2p_account_device_id(account) == NULL, "Unexpected initial login")
+    int passed = check(!p2p_account_signed_in(account) && p2p_account_device_id(account) == NULL, "Unexpected initial login")
+        && check(p2p_account_add_local_device(account) == P2P_ERROR, "Unauthenticated enrollment accepted")
+        && check(p2p_account_remove_device(account, L"device") == P2P_ERROR, "Unauthenticated removal accepted")
+        && check(p2p_account_service_login(account, L"http://127.0.0.1", L"test", L"test", NULL, NULL, 0, 0)
+            == P2P_ERROR, "Unbound service login accepted")
         && check(p2p_stream_create(account, 1, NULL, NULL, NULL) == NULL, "Unauthenticated stream accepted")
         && check(p2p_account_refresh(account) == P2P_ERROR, "Unauthenticated refresh accepted")
         && check(p2p_account_login(account, L"", L"test", L"test", 0, 0, 0) == P2P_ERROR, "Missing server accepted")

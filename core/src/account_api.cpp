@@ -169,6 +169,8 @@ AccountResponse CurlAccountRequest(std::stop_token stop, const std::wstring& end
     if (method.Method() == L"POST") {
         CheckCurl(curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str()));
         CheckCurl(curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(payload.size())));
+    } else if (method.Method() == L"DELETE") {
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE"));
     }
     CheckCurl(curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
@@ -199,6 +201,9 @@ winrt::hstring AccountRequest(std::stop_token stop, bool compatible_http, const 
     if (!token.empty() && status == static_cast<long>(HttpStatusCode::Unauthorized)) {
         throw LoginExpired("登录已失效，请重新登录");
     }
+    if (token.empty() && status == static_cast<long>(HttpStatusCode::NotFound)) {
+        throw std::runtime_error("服务器不支持手动设备管理，请更新账号服务后再登录");
+    }
     if (status < 200 || status >= 300) {
         JsonObject error{nullptr};
         if (JsonObject::TryParse(text, error)) {
@@ -209,47 +214,70 @@ winrt::hstring AccountRequest(std::stop_token stop, bool compatible_http, const 
     return text;
 }
 
+AccountDevice ReadDevice(const JsonObject& item) {
+    return {std::wstring(item.GetNamedString(L"id")), std::wstring(item.GetNamedString(L"name")),
+        std::wstring(item.GetNamedString(L"platform")), std::wstring(item.GetNamedString(L"state", L"offline"))};
+}
+
 } // namespace
 
 AccountLogin SignIn(std::stop_token stop, const std::wstring& server, const std::wstring& user,
-    const std::wstring& password, bool create_account, bool compatible_http, bool relay_only) {
+    const std::wstring& password, bool create_account, bool compatible_http, bool relay_only,
+    std::wstring_view installation_id, std::wstring_view service_device_id) {
     const auto origin = AccountOrigin(server);
+    auto installation = installation_id.empty() ? InstallationId() : std::wstring(installation_id);
     const JsonObject body;
     body.SetNamedValue(L"username", JsonValue::CreateStringValue(user));
     body.SetNamedValue(L"password", JsonValue::CreateStringValue(password));
-    body.SetNamedValue(L"installationId", JsonValue::CreateStringValue(InstallationId()));
+    body.SetNamedValue(L"installationId", JsonValue::CreateStringValue(installation));
     body.SetNamedValue(L"deviceName", JsonValue::CreateStringValue(ComputerName()));
     body.SetNamedValue(L"platform", JsonValue::CreateStringValue(L"Windows x64"));
+    if (!service_device_id.empty()) {
+        body.SetNamedValue(L"serviceDeviceId", JsonValue::CreateStringValue(service_device_id));
+    }
     auto auth = JsonObject::Parse(AccountRequest(stop, compatible_http,
-        origin + (create_account ? L"/api/v1/register" : L"/api/v1/login"), HttpMethod::Post(), {}, body));
+        origin + (create_account ? L"/api/v2/register" : L"/api/v2/login"), HttpMethod::Post(), {}, body));
     auto signal = origin;
     const bool secure = signal.starts_with(L"https:");
     signal.replace(0, secure ? 5 : 4, secure ? L"wss" : L"ws");
     auth.SetNamedValue(L"signalUrl", JsonValue::CreateStringValue(signal + L"/signal"));
     if (relay_only) auth.SetNamedValue(L"iceTransportPolicy", JsonValue::CreateStringValue(L"relay"));
     auto connection = ParseInternetConfig(auth.Stringify());
-    return {origin, std::wstring(auth.GetNamedObject(L"device").GetNamedString(L"id")), std::move(connection), compatible_http};
+    return {origin, std::wstring(auth.GetNamedString(L"currentDeviceId")), std::move(installation),
+        std::move(connection), compatible_http};
 }
 
-std::vector<AccountDevice> AccountDevices(std::stop_token stop, const AccountLogin& login) {
-    const auto data = JsonArray::Parse(AccountRequest(stop, login.compatible_http, login.server + L"/api/v1/devices",
+AccountDeviceList AccountDevices(std::stop_token stop, const AccountLogin& login) {
+    const auto data = JsonObject::Parse(AccountRequest(stop, login.compatible_http, login.server + L"/api/v2/devices",
         HttpMethod::Get(), login.connection.access_token));
-    std::vector<AccountDevice> devices;
-    for (const auto& entry : data) {
-        const auto item = entry.GetObject();
-        devices.push_back({std::wstring(item.GetNamedString(L"id")), std::wstring(item.GetNamedString(L"name")),
-            std::wstring(item.GetNamedString(L"platform")), std::wstring(item.GetNamedString(L"state"))});
+    AccountDeviceList snapshot{std::wstring(data.GetNamedString(L"currentDeviceId")), {}};
+    for (const auto& entry : data.GetNamedArray(L"devices")) {
+        snapshot.devices.push_back(ReadDevice(entry.GetObject()));
     }
-    std::sort(devices.begin(), devices.end(), [&login](const AccountDevice& a, const AccountDevice& b) {
-        if ((a.id == login.device_id) != (b.id == login.device_id)) return a.id == login.device_id;
+    std::sort(snapshot.devices.begin(), snapshot.devices.end(), [&snapshot](const AccountDevice& a, const AccountDevice& b) {
+        if ((a.id == snapshot.current_device_id) != (b.id == snapshot.current_device_id)) return a.id == snapshot.current_device_id;
         if (a.name == b.name) return a.id < b.id;
         return a.name < b.name;
     });
-    return devices;
+    return snapshot;
+}
+
+AccountDevice AddCurrentDevice(std::stop_token stop, const AccountLogin& login) {
+    return ReadDevice(JsonObject::Parse(AccountRequest(stop, login.compatible_http, login.server + L"/api/v2/devices/current",
+        HttpMethod::Post(), login.connection.access_token)));
+}
+
+void RemoveAccountDevice(std::stop_token stop, const AccountLogin& login, const std::wstring& device_id) {
+    if (device_id.size() != 24 || device_id.find_first_not_of(
+            L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != std::wstring::npos) {
+        throw std::invalid_argument("设备编号无效");
+    }
+    AccountRequest(stop, login.compatible_http, login.server + L"/api/v2/devices/" + device_id,
+        HttpMethod::Delete(), login.connection.access_token);
 }
 
 void SignOut(std::stop_token stop, const AccountLogin& login) {
-    AccountRequest(stop, login.compatible_http, login.server + L"/api/v1/logout", HttpMethod::Post(), login.connection.access_token);
+    AccountRequest(stop, login.compatible_http, login.server + L"/api/v2/logout", HttpMethod::Post(), login.connection.access_token);
 }
 
 } // namespace p2premote

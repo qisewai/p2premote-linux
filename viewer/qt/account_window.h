@@ -36,7 +36,7 @@ protected:
     bool nativeEvent(const QByteArray& type, void* message, qintptr* result) override;
 
 private:
-    enum class Request { none, login, devices, logout };
+    enum class Request { none, login, devices, add_device, remove_device, logout };
 
     QWidget* makeLoginPage();
     QWidget* makeDevicesPage();
@@ -50,6 +50,8 @@ private:
     void signIn(bool create);
     void completeRequest();
     void refresh();
+    void addLocalDevice();
+    void removeSelectedDevice();
     void signOut();
     void fillDevices();
     void refreshScreens();
@@ -92,6 +94,7 @@ private:
     QListWidget* devices_{};
     QComboBox* screens_{};
     QPushButton *login_{}, *register_{}, *connect_{}, *receive_{}, *refresh_button_{}, *logout_{};
+    QPushButton *add_device_{}, *remove_device_{};
     QPushButton *service_button_{}, *elevate_button_{};
     QSystemTrayIcon* tray_{};
     QAction* tray_receive_{};

@@ -24,11 +24,12 @@ import (
 const accountSessionLifetime = 24 * time.Hour
 
 var (
-	accountsBucket  = []byte("accounts")
-	devicesBucket   = []byte("devices")
-	accountName     = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,31}$`)
-	errAccountTaken = errors.New("账号已存在")
-	errBadLogin     = errors.New("账号或密码不正确")
+	accountsBucket   = []byte("accounts")
+	devicesBucket    = []byte("devices")
+	accountName      = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,31}$`)
+	errAccountTaken  = errors.New("账号已存在")
+	errBadLogin      = errors.New("账号或密码不正确")
+	errDeviceRemoved = errors.New("本机未添加或已从账号移除")
 )
 
 type savedDevice struct {
@@ -38,11 +39,23 @@ type savedDevice struct {
 }
 
 type accountSession struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	digest   string
-	account  string
-	deviceID string
+	ctx           context.Context
+	cancel        context.CancelFunc
+	digest        string
+	account       string
+	installation  string
+	deviceName    string
+	platform      string
+	serviceDevice string
+}
+
+type installationSession struct {
+	account, installation string
+	service               bool
+}
+
+func (s *accountSession) key() installationSession {
+	return installationSession{s.account, s.installation, s.serviceDevice != ""}
 }
 
 type managedService struct {
@@ -53,7 +66,7 @@ type managedService struct {
 
 	mu              sync.Mutex
 	sessions        map[string]*accountSession
-	byDevice        map[string]*accountSession
+	byInstallation  map[installationSession]*accountSession
 	attempts        map[netip.Addr]int
 	rateUntil       time.Time
 	total           int
@@ -84,7 +97,7 @@ func openManagedService(path string) (*managedService, error) {
 	}
 	m := &managedService{
 		db: db, dummyHash: dummy, sessions: make(map[string]*accountSession),
-		byDevice: make(map[string]*accountSession), attempts: make(map[netip.Addr]int),
+		byInstallation: make(map[installationSession]*accountSession), attempts: make(map[netip.Addr]int),
 		passwordWorkers: make(chan struct{}, 4),
 	}
 	m.signals = &hub{managed: m, deviceHosts: make(map[string]*room)}
@@ -106,6 +119,7 @@ type accountRequest struct {
 	InstallationID string `json:"installationId"`
 	DeviceName     string `json:"deviceName"`
 	Platform       string `json:"platform"`
+	ServiceDevice  string `json:"serviceDeviceId,omitempty"`
 }
 
 func makeToken(size int) (string, error) {
@@ -121,13 +135,15 @@ func tokenDigest(token string) string {
 	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
-func (m *managedService) issueSession(name, deviceID string) (string, *accountSession, error) {
+func (m *managedService) issueSession(req accountRequest) (string, *accountSession, error) {
 	token, err := makeToken(32)
 	if err != nil {
 		return "", nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), accountSessionLifetime)
-	s := &accountSession{ctx: ctx, cancel: cancel, digest: tokenDigest(token), account: name, deviceID: deviceID}
+	s := &accountSession{ctx: ctx, cancel: cancel, digest: tokenDigest(token), account: req.Name,
+		installation: tokenDigest(req.InstallationID), deviceName: req.DeviceName, platform: req.Platform,
+		serviceDevice: req.ServiceDevice}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, old := range m.sessions {
@@ -135,19 +151,20 @@ func (m *managedService) issueSession(name, deviceID string) (string, *accountSe
 			m.removeSessionLocked(old)
 		}
 	}
-	if old := m.byDevice[deviceID]; old != nil {
+	key := s.key()
+	if old := m.byInstallation[key]; old != nil {
 		m.removeSessionLocked(old)
 	}
 	m.sessions[s.digest] = s
-	m.byDevice[deviceID] = s
+	m.byInstallation[key] = s
 	return token, s, nil
 }
 
 func (m *managedService) removeSessionLocked(s *accountSession) {
 	s.cancel()
 	delete(m.sessions, s.digest)
-	if m.byDevice[s.deviceID] == s {
-		delete(m.byDevice, s.deviceID)
+	if key := s.key(); m.byInstallation[key] == s {
+		delete(m.byInstallation, key)
 	}
 }
 
@@ -169,59 +186,80 @@ func (m *managedService) authenticate(r *http.Request) *accountSession {
 	return m.sessionByDigest(tokenDigest(token))
 }
 
-func (m *managedService) enroll(req accountRequest, register bool) (savedDevice, error) {
-	var passwordHash []byte
+func (m *managedService) authenticateAccount(req accountRequest, register bool) error {
 	if register {
-		var err error
-		passwordHash, err = bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+		passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 		if err != nil {
-			return savedDevice{}, err
+			return err
 		}
-	} else {
-		if err := m.db.View(func(tx *bolt.Tx) error {
-			passwordHash = append([]byte(nil), tx.Bucket(accountsBucket).Get([]byte(req.Name))...)
-			return nil
-		}); err != nil {
-			return savedDevice{}, err
-		}
-		hash := passwordHash
-		if len(hash) == 0 {
-			hash = m.dummyHash
-		}
-		if err := bcrypt.CompareHashAndPassword(hash, []byte(req.Password)); err != nil || len(passwordHash) == 0 {
-			return savedDevice{}, errBadLogin
-		}
-	}
-	var device savedDevice
-	err := m.db.Update(func(tx *bolt.Tx) error {
-		accountKey := []byte(req.Name)
-		if register {
+		return m.db.Update(func(tx *bolt.Tx) error {
+			accountKey := []byte(req.Name)
 			accounts := tx.Bucket(accountsBucket)
 			if accounts.Get(accountKey) != nil {
 				return errAccountTaken
 			}
-			if err := accounts.Put(accountKey, passwordHash); err != nil {
-				return err
-			}
+			return accounts.Put(accountKey, passwordHash)
+		})
+	}
+	var passwordHash []byte
+	if err := m.db.View(func(tx *bolt.Tx) error {
+		passwordHash = append([]byte(nil), tx.Bucket(accountsBucket).Get([]byte(req.Name))...)
+		return nil
+	}); err != nil {
+		return err
+	}
+	hash := passwordHash
+	if len(hash) == 0 {
+		hash = m.dummyHash
+	}
+	if err := bcrypt.CompareHashAndPassword(hash, []byte(req.Password)); err != nil || len(passwordHash) == 0 {
+		return errBadLogin
+	}
+	return nil
+}
+
+func findDevice(tx *bolt.Tx, account, installation string) (savedDevice, error) {
+	var device savedDevice
+	if bucket := tx.Bucket(devicesBucket).Bucket([]byte(account)); bucket != nil {
+		if data := bucket.Get([]byte(installation)); data != nil {
+			err := json.Unmarshal(data, &device)
+			return device, err
 		}
-		devices, err := tx.Bucket(devicesBucket).CreateBucketIfNotExists(accountKey)
+	}
+	return device, nil
+}
+
+func (m *managedService) currentDevice(account, installation string) (savedDevice, error) {
+	var device savedDevice
+	err := m.db.View(func(tx *bolt.Tx) error {
+		var err error
+		device, err = findDevice(tx, account, installation)
+		return err
+	})
+	return device, err
+}
+
+func (m *managedService) addDevice(s *accountSession) (savedDevice, error) {
+	var device savedDevice
+	err := m.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		device, err = findDevice(tx, s.account, s.installation)
+		if err != nil || device.ID != "" {
+			return err
+		}
+		devices, err := tx.Bucket(devicesBucket).CreateBucketIfNotExists([]byte(s.account))
 		if err != nil {
 			return err
 		}
-		installationKey := []byte(tokenDigest(req.InstallationID))
-		if entry := devices.Get(installationKey); entry != nil {
-			if err := json.Unmarshal(entry, &device); err != nil {
-				return err
-			}
-		} else if device.ID, err = makeToken(18); err != nil {
+		if device.ID, err = makeToken(18); err != nil {
 			return err
 		}
-		device.Name, device.Platform = req.DeviceName, req.Platform
+		device.Name, device.Platform = s.deviceName, s.platform
 		data, err := json.Marshal(device)
 		if err != nil {
 			return err
 		}
-		return devices.Put(installationKey, data)
+		return devices.Put([]byte(s.installation), data)
 	})
 	return device, err
 }
@@ -266,12 +304,12 @@ func (m *managedService) login(w http.ResponseWriter, r *http.Request, register 
 	}
 	req.Name = strings.ToLower(strings.TrimSpace(req.Name))
 	req.DeviceName = strings.TrimSpace(req.DeviceName)
-	install, _ := base64.RawURLEncoding.DecodeString(req.InstallationID)
 	if !accountName.MatchString(req.Name) || len(req.Password) < 8 || len(req.Password) > 72 {
 		accountError(w, http.StatusBadRequest, "账号使用 3–32 位英文、数字或 ._-，密码为 8–72 字节")
 		return
 	}
-	if len(install) != 32 || !validDeviceLabel(req.DeviceName) || !validDeviceLabel(req.Platform) {
+	if !validID(req.InstallationID, 32) || !validDeviceLabel(req.DeviceName) || !validDeviceLabel(req.Platform) ||
+		(req.ServiceDevice != "" && (register || !validID(req.ServiceDevice, 18))) {
 		accountError(w, http.StatusBadRequest, "设备信息无效")
 		return
 	}
@@ -287,7 +325,7 @@ func (m *managedService) login(w http.ResponseWriter, r *http.Request, register 
 		return
 	}
 
-	device, err := m.enroll(req, register)
+	err := m.authenticateAccount(req, register)
 	switch {
 	case errors.Is(err, errAccountTaken):
 		accountError(w, http.StatusConflict, err.Error())
@@ -296,20 +334,40 @@ func (m *managedService) login(w http.ResponseWriter, r *http.Request, register 
 	case err != nil:
 		log.Printf("account storage: %v", err)
 		accountError(w, http.StatusInternalServerError, "账户存储暂不可用")
-	default:
-		token, s, err := m.issueSession(req.Name, device.ID)
-		if err != nil {
-			accountError(w, http.StatusInternalServerError, "无法创建登录会话")
-			return
-		}
-		servers := []managedIceServer{}
-		if m.relay != nil {
-			servers = m.relay.iceServers(s)
-		}
-		sendJSON(w, http.StatusOK, map[string]any{
-			"accessToken": token, "device": device, "iceServers": servers,
-		})
 	}
+	if err != nil {
+		return
+	}
+	device, err := m.currentDevice(req.Name, tokenDigest(req.InstallationID))
+	if err != nil {
+		log.Printf("current device: %v", err)
+		accountError(w, http.StatusInternalServerError, "无法读取本机设备")
+		return
+	}
+	if req.ServiceDevice != "" && req.ServiceDevice != device.ID {
+		accountError(w, http.StatusForbidden, "服务绑定的设备已移除，请在客户端重新配置")
+		return
+	}
+	token, s, err := m.issueSession(req)
+	if err != nil {
+		accountError(w, http.StatusInternalServerError, "无法创建登录会话")
+		return
+	}
+	servers := []managedIceServer{}
+	if m.relay != nil {
+		servers = m.relay.iceServers(s)
+	}
+	sendJSON(w, http.StatusOK, map[string]any{
+		"accessToken": token, "currentDeviceId": device.ID, "iceServers": servers,
+	})
+}
+
+func validID(id string, size int) bool {
+	if len(id) != base64.RawURLEncoding.EncodedLen(size) {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(id)
+	return err == nil && len(decoded) == size
 }
 
 func validDeviceLabel(text string) bool {
@@ -327,43 +385,124 @@ func (m *managedService) devices(w http.ResponseWriter, r *http.Request) {
 		State string `json:"state"`
 	}
 	list := []deviceStatus{}
+	current := ""
+	m.signals.mu.Lock()
 	err := m.db.View(func(tx *bolt.Tx) error {
 		devices := tx.Bucket(devicesBucket).Bucket([]byte(s.account))
-		return devices.ForEach(func(_, entry []byte) error {
+		if devices == nil {
+			return nil
+		}
+		return devices.ForEach(func(key, entry []byte) error {
 			var device savedDevice
 			if err := json.Unmarshal(entry, &device); err != nil {
 				return err
 			}
-			list = append(list, deviceStatus{savedDevice: device})
+			if string(key) == s.installation && (s.serviceDevice == "" || s.serviceDevice == device.ID) {
+				current = device.ID
+			}
+			state := "offline"
+			if host := m.signals.deviceHosts[device.ID]; host != nil && host.host.identity.ctx.Err() == nil {
+				state = "online"
+				if host.viewer != nil {
+					state = "busy"
+				}
+			}
+			list = append(list, deviceStatus{device, state})
 			return nil
 		})
 	})
+	m.signals.mu.Unlock()
 	if err != nil {
 		log.Printf("device listing: %v", err)
 		accountError(w, http.StatusInternalServerError, "无法读取设备列表")
 		return
 	}
+	sendJSON(w, http.StatusOK, map[string]any{"currentDeviceId": current, "devices": list})
+}
+
+func (m *managedService) deviceEditor(w http.ResponseWriter, r *http.Request) *accountSession {
+	s := m.authenticate(r)
+	if s == nil {
+		accountError(w, http.StatusUnauthorized, "登录已失效，请重新登录")
+	} else if s.serviceDevice != "" {
+		accountError(w, http.StatusForbidden, "请在客户端管理设备")
+		return nil
+	}
+	return s
+}
+
+func (m *managedService) addCurrentDevice(w http.ResponseWriter, r *http.Request) {
+	s := m.deviceEditor(w, r)
+	if s == nil {
+		return
+	}
 	m.signals.mu.Lock()
-	for i := range list {
-		d := &list[i]
-		d.State = "offline"
-		if host := m.signals.deviceHosts[d.ID]; host != nil && host.host.identity.ctx.Err() == nil {
-			d.State = "online"
-			if host.viewer != nil {
-				d.State = "busy"
+	device, err := m.addDevice(s)
+	m.signals.mu.Unlock()
+	if err != nil {
+		log.Printf("add device: %v", err)
+		accountError(w, http.StatusInternalServerError, "无法添加本机")
+		return
+	}
+	sendJSON(w, http.StatusOK, device)
+}
+
+func (m *managedService) removeDevice(w http.ResponseWriter, r *http.Request) {
+	s := m.deviceEditor(w, r)
+	if s == nil {
+		return
+	}
+	id := r.PathValue("id")
+	if !validID(id, 18) {
+		accountError(w, http.StatusBadRequest, "设备编号无效")
+		return
+	}
+	// Serialize removal with listen/relay. The room must be invalidated before
+	// another connection can see this device.
+	m.signals.mu.Lock()
+	removed := false
+	err := m.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(devicesBucket).Bucket([]byte(s.account))
+		if bucket == nil {
+			return nil
+		}
+		cursor := bucket.Cursor()
+		for key, entry := cursor.First(); key != nil; key, entry = cursor.Next() {
+			var device savedDevice
+			if err := json.Unmarshal(entry, &device); err != nil {
+				return err
 			}
+			if device.ID == id {
+				removed = true
+				return cursor.Delete()
+			}
+		}
+		return nil
+	})
+	if err == nil && removed {
+		if room := m.signals.deviceHosts[id]; room != nil {
+			m.signals.remove(room)
+			room.host.send("error", "本机已从账号移除，接收已停止")
+			room.viewer.send("ended", "设备已从账号移除")
 		}
 	}
 	m.signals.mu.Unlock()
-	sendJSON(w, http.StatusOK, list)
+	if err != nil {
+		log.Printf("remove device: %v", err)
+		accountError(w, http.StatusInternalServerError, "无法移除设备")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (m *managedService) routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/register", func(w http.ResponseWriter, r *http.Request) { m.login(w, r, true) })
-	mux.HandleFunc("POST /api/v1/login", func(w http.ResponseWriter, r *http.Request) { m.login(w, r, false) })
-	mux.HandleFunc("GET /api/v1/devices", m.devices)
-	mux.HandleFunc("POST /api/v1/logout", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/v2/register", func(w http.ResponseWriter, r *http.Request) { m.login(w, r, true) })
+	mux.HandleFunc("POST /api/v2/login", func(w http.ResponseWriter, r *http.Request) { m.login(w, r, false) })
+	mux.HandleFunc("GET /api/v2/devices", m.devices)
+	mux.HandleFunc("POST /api/v2/devices/current", m.addCurrentDevice)
+	mux.HandleFunc("DELETE /api/v2/devices/{id}", m.removeDevice)
+	mux.HandleFunc("POST /api/v2/logout", func(w http.ResponseWriter, r *http.Request) {
 		if s := m.authenticate(r); s != nil {
 			m.mu.Lock()
 			m.removeSessionLocked(s)

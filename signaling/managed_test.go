@@ -23,7 +23,8 @@ func testAccount(t *testing.T, account, device string) accountRequest {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return accountRequest{account, "local test password", installation, device, "Windows x64"}
+	return accountRequest{Name: account, Password: "local test password", InstallationID: installation,
+		DeviceName: device, Platform: "Windows x64"}
 }
 
 func TestManagedProxyRequests(t *testing.T) {
@@ -75,8 +76,8 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 	defer cancel()
 
 	type loginResult struct {
-		Token  string      `json:"accessToken"`
-		Device savedDevice `json:"device"`
+		Token   string `json:"accessToken"`
+		Current string `json:"currentDeviceId"`
 	}
 	call := func(method, path, token string, body any, want int, response any) {
 		t.Helper()
@@ -86,7 +87,7 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		req, err := http.NewRequestWithContext(ctx, method, server.URL+"/api/v1/"+path, &buffer)
+		req, err := http.NewRequestWithContext(ctx, method, server.URL+"/api/v2/"+path, &buffer)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,6 +113,9 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 	call("POST", "register", "", requestA, 409, nil)
 	call("POST", "login", "", requestB, 200, &b)
 	call("POST", "register", "", testAccount(t, "another", "Stranger"), 200, &stranger)
+	if a.Current != "" || b.Current != "" || stranger.Current != "" {
+		t.Fatal("authentication registered a device")
+	}
 	call("GET", "devices", "", nil, 401, nil)
 	bad := requestA
 	bad.Password = "wrong password"
@@ -143,25 +147,51 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 		ID    string `json:"id"`
 		State string `json:"state"`
 	}
-	host := open(a.Token, "listen_internet", "")
+	type deviceList struct {
+		Current string  `json:"currentDeviceId"`
+		Devices []state `json:"devices"`
+	}
+	var visible deviceList
+	call("GET", "devices", a.Token, nil, 200, &visible)
+	if visible.Current != "" || len(visible.Devices) != 0 {
+		t.Fatalf("new account has devices: %+v", visible)
+	}
+	expect(open(a.Token, "listen_internet", ""), "error")
+	var addedA, addedB, repeated savedDevice
+	call("POST", "devices/current", a.Token, nil, 200, &addedA)
+	call("POST", "devices/current", a.Token, nil, 200, &repeated)
+	if addedA.ID == "" || addedA != repeated {
+		t.Fatalf("manual add is not idempotent: %+v, %+v", addedA, repeated)
+	}
+	serviceRequest := requestA
+	serviceRequest.ServiceDevice = addedA.ID
+	var service loginResult
+	call("POST", "login", "", serviceRequest, 200, &service)
+	if service.Current != addedA.ID {
+		t.Fatal("service did not bind to the existing device")
+	}
+	call("POST", "devices/current", service.Token, nil, 403, nil)
+	host := open(service.Token, "listen_internet", "")
 	expect(host, "ready")
-	expect(open(stranger.Token, "join_internet", a.Device.ID), "error")
-	var visible []state
+	expect(open(a.Token, "join_internet", addedA.ID), "error")
+	expect(open(stranger.Token, "join_internet", addedA.ID), "error")
+	call("DELETE", "devices/"+addedA.ID, stranger.Token, nil, 204, nil)
 	call("GET", "devices", stranger.Token, nil, 200, &visible)
-	if len(visible) != 1 || visible[0].ID != stranger.Device.ID {
+	if len(visible.Devices) != 0 {
 		t.Fatalf("other account can see owner device: %+v", visible)
 	}
-	// The same device can maintain presence while acting as Viewer.
-	expect(open(b.Token, "listen_internet", ""), "ready")
-	viewer := open(b.Token, "join_internet", a.Device.ID)
+	// An unregistered installation can act as Viewer, then explicitly enroll.
+	viewer := open(b.Token, "join_internet", addedA.ID)
 	expect(viewer, "waiting")
 	expect(host, "request")
+	call("POST", "devices/current", b.Token, nil, 200, &addedB)
+	expect(open(b.Token, "listen_internet", ""), "ready")
 	call("GET", "devices", b.Token, nil, 200, &visible)
 	states := map[string]string{}
-	for _, d := range visible {
+	for _, d := range visible.Devices {
 		states[d.ID] = d.State
 	}
-	if len(states) != 2 || states[a.Device.ID] != "busy" || states[b.Device.ID] != "online" {
+	if visible.Current != addedB.ID || len(states) != 2 || states[addedA.ID] != "busy" || states[addedB.ID] != "online" {
 		t.Fatalf("unexpected presence: %+v", states)
 	}
 	if err := write(ctx, host, message{Type: "accept", Payload: "control"}); err != nil {
@@ -176,14 +206,31 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect(viewer, "minirtc")
+	call("DELETE", "devices/"+addedA.ID, b.Token, nil, 204, nil)
+	expect(host, "error")
+	if ended := expect(viewer, "ended"); ended.Retryable {
+		t.Fatal("removed device invited viewer to reconnect")
+	}
+	expect(open(service.Token, "listen_internet", ""), "error")
+	expect(open(a.Token, "listen_internet", ""), "error")
+	expect(open(b.Token, "join_internet", addedA.ID), "error")
+	call("GET", "devices", a.Token, nil, 200, &visible)
+	if visible.Current != "" || len(visible.Devices) != 1 || visible.Devices[0].ID != addedB.ID {
+		t.Fatalf("removal did not clear only the target device: %+v", visible)
+	}
+	call("POST", "login", "", serviceRequest, 403, nil)
 	call("POST", "logout", a.Token, nil, 204, nil)
-	expect(viewer, "ended")
 	call("GET", "devices", a.Token, nil, 401, nil)
 	var again loginResult
 	call("POST", "login", "", requestA, 200, &again)
-	if again.Device.ID != a.Device.ID || again.Token == a.Token {
-		t.Fatal("repeat login duplicated the device or reused its token")
+	if again.Current != "" || again.Token == a.Token {
+		t.Fatal("repeat login restored the removed device or reused its token")
 	}
+	call("POST", "devices/current", again.Token, nil, 200, &repeated)
+	if repeated.ID == "" || repeated.ID == addedA.ID {
+		t.Fatal("re-added device reused its removed ID")
+	}
+	expect(open(service.Token, "listen_internet", ""), "error")
 	server.Close()
 	m.close()
 	reopened, err := openManagedService(db)
@@ -191,8 +238,8 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.close()
-	stored, err := reopened.enroll(requestA, false)
-	if err != nil || stored.ID != a.Device.ID {
+	stored, err := reopened.currentDevice(requestA.Name, tokenDigest(requestA.InstallationID))
+	if err != nil || stored.ID != repeated.ID {
 		t.Fatalf("device did not survive server restart: %+v (%v)", stored, err)
 	}
 }
@@ -215,7 +262,7 @@ func TestManagedTURNForwardsUDPAndTCPClients(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer relay.server.Close()
-	_, session, err := m.issueSession("owner", "test-device")
+	_, session, err := m.issueSession(testAccount(t, "owner", "test-device"))
 	if err != nil {
 		t.Fatal(err)
 	}

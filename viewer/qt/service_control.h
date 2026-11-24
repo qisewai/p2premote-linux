@@ -22,6 +22,7 @@ HostServiceInfo queryHostServiceInfo();
 HostServiceInfo queryHostWorkerStatus(HostServiceInfo info);
 
 bool installHostService(const QString& server, const QString& user, const std::wstring& password,
-    int monitor_index, bool compatible_http, bool relay_only, QString* error = nullptr);
+    const QString& installation_id, const QString& device_id, int monitor_index,
+    bool compatible_http, bool relay_only, QString* error = nullptr);
 bool uninstallHostService(QString* error = nullptr);
 bool relaunchClientElevated(QString* error = nullptr);

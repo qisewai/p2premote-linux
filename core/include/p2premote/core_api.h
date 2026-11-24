@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define P2P_CORE_ABI_VERSION 1u
+#define P2P_CORE_ABI_VERSION 2u
 /* The viewer posts this message to video_parent for a local F11 fullscreen toggle. */
 #define P2P_VIDEO_FULLSCREEN_MESSAGE 0x8042u
 
@@ -105,12 +105,21 @@ P2P_CORE_API void p2p_account_destroy(p2p_account* account);
 P2P_CORE_API void* p2p_account_event(const p2p_account* account);
 P2P_CORE_API int32_t p2p_account_login(p2p_account* account, const wchar_t* server,
     const wchar_t* user, const wchar_t* password, int32_t create, int32_t compatible_http, int32_t relay_only);
+/* A Windows receive service binds to an already registered installation. */
+P2P_CORE_API int32_t p2p_account_service_login(p2p_account* account, const wchar_t* server,
+    const wchar_t* user, const wchar_t* password, const wchar_t* installation_id, const wchar_t* device_id,
+    int32_t compatible_http, int32_t relay_only);
 P2P_CORE_API int32_t p2p_account_refresh(p2p_account* account);
+P2P_CORE_API int32_t p2p_account_add_local_device(p2p_account* account);
+P2P_CORE_API int32_t p2p_account_remove_device(p2p_account* account, const wchar_t* device_id);
 P2P_CORE_API int32_t p2p_account_logout(p2p_account* account);
 P2P_CORE_API void p2p_account_cancel(p2p_account* account);
 P2P_CORE_API int32_t p2p_account_complete(p2p_account* account);
+/* Login and device registration are independent. An unregistered installation has no device ID. */
+P2P_CORE_API int32_t p2p_account_signed_in(const p2p_account* account);
 /* Account and device string views expire on the next completed request or logout. */
 P2P_CORE_API const wchar_t* p2p_account_device_id(const p2p_account* account);
+P2P_CORE_API const wchar_t* p2p_account_installation_id(const p2p_account* account);
 P2P_CORE_API size_t p2p_account_device_count(const p2p_account* account);
 P2P_CORE_API int32_t p2p_account_device(const p2p_account* account, size_t index, p2p_device* device);
 

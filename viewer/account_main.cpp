@@ -30,7 +30,8 @@ constexpr UINT_PTR refresh_timer = 1;
 
 enum ControlId {
     server_field = 300, user_field, password_field, login_button, register_button,
-    device_list, connect_button, receive_button, refresh_button, logout_button, account_status
+    device_list, connect_button, receive_button, refresh_button, logout_button, account_status,
+    add_device_button, remove_device_button
 };
 
 std::wstring Text(HWND control) {
@@ -56,7 +57,9 @@ struct Apartment {
 
 struct Result {
     std::optional<AccountLogin> login;
-    std::optional<std::vector<AccountDevice>> devices;
+    std::optional<p2premote::AccountDeviceList> devices;
+    std::optional<AccountDevice> added_device;
+    std::optional<std::wstring> removed_device;
     std::wstring detail;
     bool expired{};
 };
@@ -145,6 +148,8 @@ private:
             case connect_button: Connect(); return 0;
             case receive_button: ToggleReceiving(); return 0;
             case refresh_button: Refresh(); return 0;
+            case add_device_button: AddLocalDevice(); return 0;
+            case remove_device_button: RemoveSelectedDevice(); return 0;
             case logout_button: Logout(); return 0;
             }
             break;
@@ -213,13 +218,15 @@ private:
         SendMessageW(password_, EM_SETLIMITTEXT, 72, 0);
         login_button_ = Control(L"BUTTON", L"登录", button, login_button);
         register_button_ = Control(L"BUTTON", L"注册并登录", button, register_button);
-        notice_ = Control(L"STATIC", L"登录后，本机会允许同账号设备发起远程控制。");
+        notice_ = Control(L"STATIC", L"登录后可连接账号下的设备。添加本机并开启接收后，其他设备可连接本机。");
         account_label_ = Control(L"STATIC", L"");
         list_ = Control(L"LISTBOX", L"", WS_BORDER | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             device_list);
         connect_ = Control(L"BUTTON", L"连接设备", button, connect_button);
         receive_ = Control(L"BUTTON", L"停止接收", button, receive_button);
         refresh_ = Control(L"BUTTON", L"刷新", button, refresh_button);
+        add_device_ = Control(L"BUTTON", L"添加本机", button, add_device_button);
+        remove_device_ = Control(L"BUTTON", L"移除设备", button, remove_device_button);
         logout_ = Control(L"BUTTON", L"退出登录", button, logout_button);
         status_ = Control(L"STATIC", L"请输入账号和密码。", WS_VISIBLE, account_status);
     }
@@ -246,11 +253,13 @@ private:
         place(register_button_, 193, 153, 113, 28);
         place(notice_, 20, 204, width - 40, 40);
         place(account_label_, 20, 25, width - 40, 25);
-        place(list_, 20, 57, width - 40, std::max(50, height - 154));
-        place(connect_, 20, height - 83, 100, 28);
+        place(list_, 20, 57, width - 40, std::max(50, height - 185));
+        place(connect_, 20, height - 119, 100, 28);
+        place(refresh_, 130, height - 119, 70, 28);
+        place(remove_device_, 210, height - 119, 100, 28);
+        place(add_device_, 20, height - 83, 100, 28);
         place(receive_, 130, height - 83, 100, 28);
-        place(refresh_, 240, height - 83, 70, 28);
-        place(logout_, width - 110, height - 83, 90, 28);
+        place(logout_, width - 110, height - 119, 90, 28);
         place(status_, 20, height - 42, width - 40, 40);
     }
 
@@ -270,12 +279,16 @@ private:
             ShowWindow(child, signed_in ? SW_HIDE : SW_SHOWNA);
             EnableWindow(child, !busy_);
         }
-        for (auto child : {account_label_, list_, connect_, receive_, refresh_, logout_}) {
+        for (auto child : {account_label_, list_, connect_, receive_, refresh_, logout_, add_device_, remove_device_}) {
             ShowWindow(child, signed_in ? SW_SHOWNA : SW_HIDE);
         }
         const auto selected = Selection();
+        const bool registered = signed_in && !login_->device_id.empty();
         EnableWindow(connect_, signed_in && selected && selected->state == L"online" && selected->id != login_->device_id);
         EnableWindow(refresh_, !busy_);
+        EnableWindow(add_device_, signed_in && !registered && !busy_);
+        EnableWindow(remove_device_, signed_in && selected && !busy_);
+        EnableWindow(receive_, registered);
         SetWindowTextW(receive_, receiving_ ? L"停止接收" : L"开始接收");
     }
 
@@ -318,7 +331,7 @@ private:
             return;
         }
         SetWindowTextW(password_, L"");
-        SetStatus(create ? L"正在注册并登记本机…" : L"正在登录并登记本机…");
+        SetStatus(create ? L"正在注册账号…" : L"正在登录…");
         Request([server, user, password = std::move(password), create, compatible_http = compatible_http_,
                  relay_only = ice_.relay_only](std::stop_token stop) {
             Result r;
@@ -336,6 +349,35 @@ private:
         });
     }
 
+    void AddLocalDevice() {
+        if (!login_ || busy_ || !login_->device_id.empty()) return;
+        SetStatus(L"正在添加本机…");
+        Request([login = *login_](std::stop_token stop) {
+            Result r;
+            r.added_device = p2premote::AddCurrentDevice(stop, login);
+            return r;
+        });
+    }
+
+    void RemoveSelectedDevice() {
+        const auto* selected = Selection();
+        if (!login_ || busy_ || !selected) return;
+        const auto id = selected->id;
+        const auto message = L"确定移除「" + selected->name + L"」？它将停止接收远程连接，现有会话也会结束。";
+        KillTimer(window_, refresh_timer);
+        const auto confirmed = MessageBoxW(window_, message.c_str(), L"移除设备",
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+        SetTimer(window_, refresh_timer, 3'000, nullptr);
+        if (!confirmed) return;
+        SetStatus(L"正在移除设备…");
+        Request([login = *login_, id](std::stop_token stop) {
+            Result r;
+            p2premote::RemoveAccountDevice(stop, login, id);
+            r.removed_device = id;
+            return r;
+        });
+    }
+
     void OnResult() {
         std::optional<Result> pending;
         {
@@ -349,12 +391,40 @@ private:
         if (pending->login) {
             login_ = std::move(pending->login);
             SetWindowTextW(account_label_, (L"我的设备 · " + Text(user_)).c_str());
-            SetStatus(L"已登录，正在上线本机。");
-            ToggleReceiving();
+            if (!login_->device_id.empty()) ToggleReceiving();
+            else SetStatus(L"已登录。需要接收远程连接时，可手动添加本机。");
             winrt::check_bool(SetTimer(window_, refresh_timer, 3'000, nullptr) != 0);
             Refresh();
         }
-        if (pending->devices) SetDevices(std::move(*pending->devices));
+        if (pending->devices && login_) {
+            const bool removed = !login_->device_id.empty() && pending->devices->current_device_id.empty();
+            if (removed && receiving_) ToggleReceiving();
+            login_->device_id = std::move(pending->devices->current_device_id);
+            SetDevices(std::move(pending->devices->devices));
+            if (removed) SetStatus(L"本机已从账号移除，接收已停止。");
+        }
+        if (pending->added_device && login_) {
+            login_->device_id = pending->added_device->id;
+            auto visible = devices_;
+            if (std::ranges::find(visible, login_->device_id, &AccountDevice::id) == visible.end()) {
+                visible.insert(visible.begin(), std::move(*pending->added_device));
+                SetDevices(std::move(visible));
+            }
+            SetStatus(L"已添加本机。可点击「开始接收」上线。");
+            Refresh();
+        }
+        if (pending->removed_device && login_) {
+            const auto& id = *pending->removed_device;
+            if (login_->device_id == id) {
+                if (receiving_) ToggleReceiving();
+                login_->device_id.clear();
+            }
+            auto visible = devices_;
+            std::erase_if(visible, [&id](const auto& device) { return device.id == id; });
+            SetDevices(std::move(visible));
+            SetStatus(L"已移除设备。");
+            Refresh();
+        }
         Update();
     }
 
@@ -373,7 +443,6 @@ private:
                 if (d.id == current) SendMessageW(list_, LB_SETCURSEL, i, 0);
             }
         }
-        SetStatus(receiving_ ? L"本机已登记。可在设备列表查看上线状态。" : L"本机已暂停接收远程控制。");
     }
 
     void OpenStream(bool host, p2premote::ConnectionOptions connection) {
@@ -404,7 +473,7 @@ private:
     }
 
     void ToggleReceiving() {
-        if (!login_) return;
+        if (!login_ || login_->device_id.empty()) return;
         if (receiving_) {
             Cancel(host_);
             SetStatus(L"本机已暂停接收远程控制。");
@@ -460,6 +529,7 @@ private:
     HWND window_{}, server_label_{}, user_label_{}, password_label_{};
     HWND server_{}, user_{}, password_{}, login_button_{}, register_button_{}, notice_{};
     HWND account_label_{}, list_{}, connect_{}, receive_{}, refresh_{}, logout_{}, status_{};
+    HWND add_device_{}, remove_device_{};
     bool busy_{}, receiving_{};
     std::optional<AccountLogin> login_;
     std::vector<AccountDevice> devices_;

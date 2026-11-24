@@ -2,6 +2,7 @@
 
 #include <p2premote/service_identity.h>
 
+#include <algorithm>
 #include <array>
 #include <mutex>
 #include <optional>
@@ -19,7 +20,9 @@ struct AccountResult {
     int32_t status{P2P_OK};
     std::array<wchar_t, std::size(error_text)> error{};
     std::optional<AccountLogin> login;
-    std::optional<std::vector<AccountDevice>> devices;
+    std::optional<AccountDeviceList> devices;
+    std::optional<AccountDevice> added_device;
+    std::optional<std::wstring> removed_device;
 };
 }
 
@@ -117,8 +120,10 @@ p2p_account* p2p_account_create() {
 void p2p_account_destroy(p2p_account* account) { delete account; }
 void* p2p_account_event(const p2p_account* account) { return account ? account->ready.get() : nullptr; }
 
-int32_t p2p_account_login(p2p_account* account, const wchar_t* server, const wchar_t* user,
-    const wchar_t* password, int32_t create, int32_t compatible_http, int32_t relay_only) {
+namespace {
+int32_t StartLogin(p2p_account* account, const wchar_t* server, const wchar_t* user,
+    const wchar_t* password, int32_t create, int32_t compatible_http, int32_t relay_only,
+    std::wstring_view installation = {}, std::wstring_view service_device = {}) {
     return Guard([&] {
         auto& state = Required(account);
         if (state.login) throw std::logic_error("请先退出当前账号");
@@ -126,14 +131,32 @@ int32_t p2p_account_login(p2p_account* account, const wchar_t* server, const wch
             throw std::invalid_argument("请输入服务地址、账号和密码");
         }
         state.Run([server = std::wstring(server), user = std::wstring(user), password = std::wstring(password),
-                      create, compatible_http, relay_only](std::stop_token stop, AccountResult& result) mutable {
+                      create, compatible_http, relay_only, installation = std::wstring(installation),
+                      service_device = std::wstring(service_device)](std::stop_token stop, AccountResult& result) mutable {
             struct ErasePassword {
                 std::wstring& password;
                 ~ErasePassword() { SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t)); }
             } erase{password};
-            result.login = SignIn(stop, server, user, password, create != 0, compatible_http != 0, relay_only != 0);
+            result.login = SignIn(stop, server, user, password, create != 0, compatible_http != 0, relay_only != 0,
+                installation, service_device);
         });
     });
+}
+} // namespace
+
+int32_t p2p_account_login(p2p_account* account, const wchar_t* server, const wchar_t* user,
+    const wchar_t* password, int32_t create, int32_t compatible_http, int32_t relay_only) {
+    return StartLogin(account, server, user, password, create, compatible_http, relay_only);
+}
+
+int32_t p2p_account_service_login(p2p_account* account, const wchar_t* server, const wchar_t* user,
+    const wchar_t* password, const wchar_t* installation_id, const wchar_t* device_id,
+    int32_t compatible_http, int32_t relay_only) {
+    if (!installation_id || !*installation_id || !device_id || !*device_id) {
+        SetError(L"系统服务需要绑定已添加的本机设备");
+        return P2P_ERROR;
+    }
+    return StartLogin(account, server, user, password, 0, compatible_http, relay_only, installation_id, device_id);
 }
 
 int32_t p2p_account_refresh(p2p_account* account) {
@@ -142,6 +165,28 @@ int32_t p2p_account_refresh(p2p_account* account) {
         if (!state.login) throw std::logic_error("请先登录");
         state.Run([login = *state.login](std::stop_token stop, AccountResult& result) {
             result.devices = AccountDevices(stop, login);
+        });
+    });
+}
+
+int32_t p2p_account_add_local_device(p2p_account* account) {
+    return Guard([&] {
+        auto& state = Required(account);
+        if (!state.login) throw std::logic_error("请先登录");
+        state.Run([login = *state.login](std::stop_token stop, AccountResult& result) {
+            result.added_device = AddCurrentDevice(stop, login);
+        });
+    });
+}
+
+int32_t p2p_account_remove_device(p2p_account* account, const wchar_t* device_id) {
+    return Guard([&] {
+        auto& state = Required(account);
+        if (!state.login) throw std::logic_error("请先登录");
+        if (!device_id || !*device_id) throw std::invalid_argument("请选择要移除的设备");
+        state.Run([login = *state.login, id = std::wstring(device_id)](std::stop_token stop, AccountResult& result) mutable {
+            RemoveAccountDevice(stop, login, id);
+            result.removed_device = std::move(id);
         });
     });
 }
@@ -176,13 +221,34 @@ int32_t p2p_account_complete(p2p_account* account) {
         status = static_cast<p2p_result>(result.status);
         if (status != P2P_OK) SetError(result.error.data());
         if (result.login) account->login = std::move(result.login);
-        if (result.devices) account->devices = std::move(*result.devices);
+        if (result.devices && account->login) {
+            account->login->device_id = std::move(result.devices->current_device_id);
+            account->devices = std::move(result.devices->devices);
+        }
+        if (result.added_device && account->login) {
+            auto& device = *result.added_device;
+            account->login->device_id = device.id;
+            if (std::ranges::find(account->devices, device.id, &AccountDevice::id) == account->devices.end()) {
+                account->devices.insert(account->devices.begin(), std::move(device));
+            }
+        }
+        if (result.removed_device && account->login) {
+            const auto& id = *result.removed_device;
+            if (account->login->device_id == id) account->login->device_id.clear();
+            std::erase_if(account->devices, [&id](const auto& device) { return device.id == id; });
+        }
     });
     return guarded == P2P_OK ? status : guarded;
 }
 
+int32_t p2p_account_signed_in(const p2p_account* account) { return account && account->login; }
+
 const wchar_t* p2p_account_device_id(const p2p_account* account) {
-    return account && account->login ? account->login->device_id.c_str() : nullptr;
+    return p2p_account_signed_in(account) && !account->login->device_id.empty() ? account->login->device_id.c_str() : nullptr;
+}
+
+const wchar_t* p2p_account_installation_id(const p2p_account* account) {
+    return p2p_account_signed_in(account) ? account->login->installation_id.c_str() : nullptr;
 }
 
 size_t p2p_account_device_count(const p2p_account* account) { return account ? account->devices.size() : 0; }
