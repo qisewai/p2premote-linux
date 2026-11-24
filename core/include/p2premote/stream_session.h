@@ -20,6 +20,13 @@ enum class StreamState { idle, waiting, approval, negotiating, streaming, reconn
 enum class StreamFrameRate { fps30 = 30, fps60 = 60 };
 enum class StreamInputMode { view_only, desktop };
 
+struct StreamAudioOptions {
+    bool speaker_enabled{true};
+    bool mic_enabled{false};
+    float speaker_volume{1.0f};
+    bool mic_speaker_fallback{true};
+};
+
 struct StreamStatistics {
     std::uint64_t captured{};
     std::uint64_t submitted{};
@@ -59,6 +66,8 @@ public:
     void Approve(StreamInputMode input = StreamInputMode::view_only);
     void SetQuality(StreamQuality quality);
     void SetVideoBitratePreset(VideoBitratePreset preset);
+    void SetAudioOptions(StreamAudioOptions options);
+    StreamAudioOptions AudioOptions() const noexcept;
     void Stop(std::wstring status);
     void Resize(bool drawable) noexcept;
     void DisplayChanged() noexcept;
@@ -97,6 +106,7 @@ private:
     void Close(std::wstring status, bool intentional);
     void Recover(std::wstring status);
     void UpdateVideoSettings();
+    void ApplyAudioOptions();
     void ProcessPluginActions();
 
     struct Impl;

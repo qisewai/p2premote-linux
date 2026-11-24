@@ -47,6 +47,8 @@ bool ValidCode(InputKind kind, std::uint16_t code) {
     case InputKind::video_settings_reply:
         return code >= static_cast<std::uint16_t>(StreamQuality::p720)
             && code <= static_cast<std::uint16_t>(StreamQuality::p1440);
+    case InputKind::set_audio_settings:
+        return code <= (audio_flag_speaker | audio_flag_mic | audio_flag_mic_fallback);
     }
     return false;
 }
@@ -101,6 +103,7 @@ std::optional<InputPacket> DecodeInput(std::span<const std::uint8_t> bytes) {
     if (IsVideoSettingsMessage(kind) && (x < static_cast<std::uint16_t>(VideoBitratePreset::economy)
             || x > static_cast<std::uint16_t>(VideoBitratePreset::detail)
             || y > (kind == InputKind::video_settings_reply ? 1 : 0))) return std::nullopt;
+    if (IsAudioSettingsMessage(kind) && (x != 0 || y != 0)) return std::nullopt;
     return InputPacket{kind, code, x, y, sequence, ReadLittleEndian(bytes.subspan<12, 8>())};
 }
 

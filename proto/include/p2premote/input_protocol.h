@@ -10,7 +10,7 @@ namespace p2premote {
 
 enum class InputKind : std::uint8_t {
     move = 1, button_down, button_up, wheel, key_down, key_up, text, reset, heartbeat, cursor_ready,
-    set_video_settings, video_settings_reply
+    set_video_settings, video_settings_reply, set_audio_settings
 };
 
 enum class InputButton : std::uint16_t { left = 1, right, middle };
@@ -28,6 +28,14 @@ constexpr int VideoBitrateLimit(VideoBitratePreset preset) noexcept {
 
 constexpr bool IsVideoSettingsMessage(InputKind kind) noexcept {
     return kind == InputKind::set_video_settings || kind == InputKind::video_settings_reply;
+}
+
+constexpr std::uint16_t audio_flag_speaker = 1u << 0;
+constexpr std::uint16_t audio_flag_mic = 1u << 1;
+constexpr std::uint16_t audio_flag_mic_fallback = 1u << 2;
+
+constexpr bool IsAudioSettingsMessage(InputKind kind) noexcept {
+    return kind == InputKind::set_audio_settings;
 }
 
 struct InputPacket {

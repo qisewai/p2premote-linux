@@ -32,7 +32,7 @@ target_compile_features(plugin_protocol PUBLIC cxx_std_20)
 target_compile_options(plugin_protocol PRIVATE /W4 /permissive- /utf-8)
 
 include(cmake/lua-target.cmake)
-add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp core/src/plugin_settings.cpp)
+add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp core/src/file_clipboard.cpp core/src/plugin_settings.cpp)
 target_include_directories(plugin_host PUBLIC core/include)
 target_compile_features(plugin_host PRIVATE cxx_std_20)
 target_compile_definitions(plugin_host PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -40,6 +40,7 @@ target_compile_options(plugin_host PRIVATE /W4 /permissive- /utf-8 /EHsc)
 target_link_libraries(plugin_host PUBLIC input_protocol PRIVATE plugin_protocol p2premote_lua bcrypt user32 imm32 shell32 ole32 windowsapp)
 
 add_library(core STATIC
+    core/src/audio_engine.cpp
     core/src/d3d11_preview.cpp
     core/src/d3d11_video.cpp
     core/src/wgc_capturer.cpp
@@ -58,7 +59,7 @@ target_include_directories(core PUBLIC core/include PRIVATE "${P2PREMOTE_MINIRTC
 target_compile_features(core PUBLIC cxx_std_20)
 target_compile_definitions(core PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(core PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(core PUBLIC input_protocol PRIVATE plugin_host d3d11 dxgi d3dcompiler dxguid crypt32 windowsapp)
+target_link_libraries(core PUBLIC input_protocol PRIVATE plugin_host d3d11 dxgi d3dcompiler dxguid crypt32 ole32 avrt mmdevapi windowsapp)
 
 add_library(stream_window STATIC viewer/stream_window.cpp)
 target_include_directories(stream_window PRIVATE core/src)
@@ -93,7 +94,7 @@ add_custom_target(p2premote_minirtc_runtime
 add_dependencies(p2premote p2premote_minirtc_runtime)
 
 set(plugin_assets)
-set(P2PREMOTE_BUILTIN_PLUGINS clipboard-sync shortcut-macros keyboard-sync adaptive-quality file-transfer)
+set(P2PREMOTE_BUILTIN_PLUGINS clipboard-sync file-clipboard shortcut-macros keyboard-sync adaptive-quality file-transfer)
 foreach(plugin IN LISTS P2PREMOTE_BUILTIN_PLUGINS)
     set(plugin_dir "${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}")
     set(plugin_output "$<TARGET_FILE_DIR:p2premote>/plugins/${plugin}")
@@ -125,6 +126,14 @@ target_link_libraries(input_protocol_test PRIVATE input_protocol)
 target_compile_options(input_protocol_test PRIVATE /W4 /permissive- /utf-8)
 add_test(NAME input_protocol_test COMMAND input_protocol_test)
 
+add_executable(audio_engine_test core/src/audio_engine_test.cpp core/src/audio_engine.cpp)
+target_include_directories(audio_engine_test PRIVATE core/src)
+target_compile_features(audio_engine_test PRIVATE cxx_std_20)
+target_compile_definitions(audio_engine_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(audio_engine_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(audio_engine_test PRIVATE ole32 avrt mmdevapi windowsapp)
+add_test(NAME audio_engine_test COMMAND audio_engine_test)
+
 add_executable(plugin_protocol_test proto/plugin_protocol_test.cpp)
 target_link_libraries(plugin_protocol_test PRIVATE plugin_protocol)
 target_compile_options(plugin_protocol_test PRIVATE /W4 /permissive- /utf-8)
@@ -136,7 +145,8 @@ target_compile_definitions(plugin_host_test PRIVATE UNICODE _UNICODE WIN32_LEAN_
 target_compile_options(plugin_host_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
 add_test(NAME plugin_host_test COMMAND plugin_host_test)
 add_test(NAME clipboard_plugin_test COMMAND plugin_host_test "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
+add_test(NAME file_clipboard_plugin_test COMMAND plugin_host_test --file-clipboard "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 add_test(NAME office_plugin_test COMMAND plugin_host_test --office "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 add_test(NAME file_transfer_plugin_test COMMAND plugin_host_test --file-transfer "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
-set_tests_properties(plugin_host_test clipboard_plugin_test office_plugin_test file_transfer_plugin_test PROPERTIES TIMEOUT 20)
-set_tests_properties(clipboard_plugin_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(plugin_host_test clipboard_plugin_test file_clipboard_plugin_test office_plugin_test file_transfer_plugin_test PROPERTIES TIMEOUT 20)
+set_tests_properties(clipboard_plugin_test file_clipboard_plugin_test PROPERTIES SKIP_RETURN_CODE 77)

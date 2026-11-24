@@ -81,6 +81,15 @@ typedef struct p2p_ui_command {
     const char* json;
 } p2p_ui_command;
 
+typedef struct p2p_audio_options_v1 {
+    int32_t speaker_enabled;
+    int32_t mic_enabled;
+    /* Linear speaker gain in [0.0, 1.0]. */
+    float speaker_volume;
+    /* When the host has no virtual cable sink, play incoming mic audio on host speakers. */
+    int32_t mic_speaker_fallback;
+} p2p_audio_options_v1;
+
 /*
  * Windows x64, default C calling convention. Strings are UTF-16 unless marked char (UTF-8).
  * Use each handle from its creating thread and release it with its DLL destroy function.
@@ -119,6 +128,7 @@ P2P_CORE_API int32_t p2p_stream_stop(p2p_stream* stream, const wchar_t* reason);
 P2P_CORE_API int32_t p2p_stream_approve(p2p_stream* stream, int32_t desktop);
 P2P_CORE_API int32_t p2p_stream_quality(p2p_stream* stream, uint32_t quality);
 P2P_CORE_API int32_t p2p_stream_bitrate(p2p_stream* stream, uint32_t bitrate);
+P2P_CORE_API int32_t p2p_stream_set_audio(p2p_stream* stream, const p2p_audio_options_v1* options);
 P2P_CORE_API int32_t p2p_stream_resize(p2p_stream* stream, int32_t drawable);
 P2P_CORE_API int32_t p2p_stream_display_changed(p2p_stream* stream);
 P2P_CORE_API int32_t p2p_stream_tick(p2p_stream* stream);

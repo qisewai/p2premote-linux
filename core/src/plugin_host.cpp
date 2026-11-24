@@ -1,6 +1,7 @@
 #include "plugin_host.h"
 
 #include "clipboard_bridge.h"
+#include "file_clipboard.h"
 #include "plugin_settings.h"
 
 #include <p2premote/plugin_protocol.h>
@@ -50,6 +51,7 @@ struct Manifest {
     std::string id;
     bool channel{};
     bool clipboard{};
+    bool file_clipboard{};
     bool log{};
     bool ui{};
     bool input{};
@@ -113,6 +115,7 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
         const auto name = permission.GetString();
         if (name == L"channel") manifest.channel = true;
         else if (name == L"clipboard") manifest.clipboard = true;
+        else if (name == L"file_clipboard") manifest.file_clipboard = true;
         else if (name == L"log") manifest.log = true;
         else if (name == L"ui") manifest.ui = true;
         else if (name == L"input") manifest.input = true;
@@ -290,6 +293,21 @@ std::int64_t FileTimeToUnixSeconds(const FILETIME& ft) noexcept {
     constexpr std::uint64_t epoch_diff = 116444736000000000ULL;
     if (uli.QuadPart < epoch_diff) return 0;
     return static_cast<std::int64_t>((uli.QuadPart - epoch_diff) / 10000000ULL);
+}
+
+lua_Integer FileTimeStamp(const FILETIME& time) noexcept {
+    ULARGE_INTEGER stamp{};
+    stamp.LowPart = time.dwLowDateTime;
+    stamp.HighPart = time.dwHighDateTime;
+    return static_cast<lua_Integer>(stamp.QuadPart);
+}
+
+bool PlainAncestors(const std::filesystem::path& path) {
+    for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+        if (!IsPlainPath(parent, true)) return false;
+        if (!parent.has_relative_path()) break;
+    }
+    return true;
 }
 
 std::string FileTimeToLocalText(const FILETIME& ft) {
@@ -726,11 +744,13 @@ UINT NamedVirtualKey(std::string_view name) noexcept {
     return 0;
 }
 
+class LuaPlugin;
+
 class PluginRuntime {
 public:
     PluginRuntime(bool host, const PluginHost::SendFrame& send, const std::atomic_bool& connected,
-        Workspace& workspace, std::filesystem::path config_root)
-        : host(host), workspace(workspace), config_root(std::move(config_root)), send_(send), connected_(connected) {}
+        Workspace& workspace, std::filesystem::path config_root, HANDLE wake)
+        : host(host), workspace(workspace), config_root(std::move(config_root)), wake(wake), send_(send), connected_(connected) {}
 
     bool Connected() const noexcept { return connected_.load(); }
 
@@ -755,7 +775,10 @@ public:
     const bool host;
     Workspace& workspace;
     const std::filesystem::path config_root;
+    const HANDLE wake;
     std::optional<ClipboardBridge> clipboard;
+    std::optional<FileClipboard> file_clipboard;
+    LuaPlugin* file_clipboard_owner{};
 
 private:
     const PluginHost::SendFrame& send_;
@@ -800,6 +823,44 @@ public:
 
     void ClipboardChanged(std::string_view text) {
         if (manifest_.clipboard) Call(callbacks_.clipboard, 1, text);
+    }
+
+    void ClipboardFilesChanged(const std::vector<LocalClipboardFile>& files) {
+        if (!healthy_ || callbacks_.clipboard_files == LUA_NOREF) return;
+        struct Change {
+            int ref;
+            const std::vector<LocalClipboardFile>& files;
+        } change{callbacks_.clipboard_files, files};
+        Run([](lua_State* state) {
+            const auto& args = *static_cast<const Change*>(lua_touserdata(state, 1));
+            lua_rawgeti(state, LUA_REGISTRYINDEX, args.ref);
+            lua_createtable(state, static_cast<int>(args.files.size()), 0);
+            for (std::size_t i = 0; i < args.files.size(); ++i) {
+                lua_createtable(state, 0, 2);
+                PushString(state, args.files[i].path);
+                lua_setfield(state, -2, "path");
+                PushString(state, args.files[i].name);
+                lua_setfield(state, -2, "name");
+                lua_rawseti(state, -2, static_cast<lua_Integer>(i + 1));
+            }
+            lua_call(state, 1, 0);
+            return 0;
+        }, &change);
+    }
+
+    void ClipboardRead(ClipboardReadRequest request) {
+        if (healthy_ && callbacks_.clipboard_read != LUA_NOREF && Run([](lua_State* state) {
+            const auto& req = *static_cast<const ClipboardReadRequest*>(lua_touserdata(state, 1));
+            lua_rawgeti(state, LUA_REGISTRYINDEX, Self(state).callbacks_.clipboard_read);
+            lua_pushinteger(state, req.id);
+            lua_pushinteger(state, req.offer);
+            lua_pushinteger(state, req.index);
+            lua_pushinteger(state, static_cast<lua_Integer>(req.offset));
+            lua_pushinteger(state, req.size);
+            lua_call(state, 5, 0);
+            return 0;
+        }, &request)) return;
+        runtime_.file_clipboard->Reply(request.id, std::nullopt);
     }
 
     void LockStateChanged() {
@@ -1049,6 +1110,72 @@ private:
         return 1;
     }
 
+    static std::uint32_t ClipboardId(lua_State* state) {
+        const auto id = luaL_checkinteger(state, 1);
+        if (id <= 0 || id > UINT32_MAX) luaL_argerror(state, 1, "invalid clipboard ID");
+        return static_cast<std::uint32_t>(id);
+    }
+
+    static bool ReadFileDescriptors(lua_State* state, std::vector<ClipboardFile>& files) {
+        const auto count = lua_rawlen(state, 2);
+        if (!count || count > max_clipboard_files) return false;
+        files.reserve(count);
+        for (std::size_t i = 1; i <= count; ++i) {
+            if (lua_rawgeti(state, 2, static_cast<lua_Integer>(i)) != LUA_TTABLE) return false;
+            lua_rawgeti(state, -1, 1);
+            lua_rawgeti(state, -2, 2);
+            lua_rawgeti(state, -3, 3);
+            if (lua_type(state, -3) != LUA_TSTRING || !lua_isinteger(state, -2) || !lua_isboolean(state, -1)) return false;
+            std::size_t length{};
+            const auto* name = lua_tolstring(state, -3, &length);
+            if (!length || length >= 4 * MAX_PATH) return false;
+            auto wide = Utf8ToWide({name, length});
+            const auto size = lua_tointeger(state, -2);
+            if (!wide || size < 0) return false;
+            files.push_back({std::move(*wide), static_cast<std::uint64_t>(size), lua_toboolean(state, -1) != 0});
+            lua_pop(state, 4);
+        }
+        return true;
+    }
+
+    static int PublishFiles(lua_State* state) {
+        auto& self = Self(state);
+        auto& runtime = self.runtime_;
+        const auto offer = ClipboardId(state);
+        luaL_checktype(state, 2, LUA_TTABLE);
+        bool published{};
+        try {
+            std::vector<ClipboardFile> files;
+            if (runtime.Connected() && runtime.file_clipboard && ReadFileDescriptors(state, files)) {
+                published = runtime.file_clipboard->Publish(offer, files);
+                if (published) {
+                    runtime.file_clipboard_owner = &self;
+                    runtime.clipboard->CancelWrite();
+                }
+            }
+        } catch (...) {}
+        lua_pushboolean(state, published);
+        return 1;
+    }
+
+    static int ClearPublishedFiles(lua_State* state) {
+        auto& self = Self(state);
+        const auto offer = ClipboardId(state);
+        if (self.runtime_.file_clipboard_owner == &self) self.runtime_.file_clipboard->Clear(offer);
+        return 0;
+    }
+
+    static int ReplyToClipboardRead(lua_State* state) {
+        auto& self = Self(state);
+        const auto id = ClipboardId(state);
+        std::optional<std::string_view> data;
+        if (!lua_isnoneornil(state, 2)) data = CheckString(state, 2);
+        const bool accepted = self.runtime_.file_clipboard_owner == &self &&
+            self.runtime_.file_clipboard->Reply(id, data);
+        lua_pushboolean(state, accepted);
+        return 1;
+    }
+
     static int AddMenu(lua_State* state) {
         auto& self = Self(state);
         const auto text = CheckString(state, 1);
@@ -1279,6 +1406,7 @@ private:
         if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
         const auto path = SafeFsPath(CheckString(state, 1));
         if (!path) return FsError(state, "路径无效");
+        if (lua_toboolean(state, 2) && !PlainAncestors(*path)) return FsError(state, "路径包含重解析点或无法访问");
         WIN32_FILE_ATTRIBUTE_DATA data{};
         if (!GetFileAttributesExW(path->c_str(), GetFileExInfoStandard, &data)) {
             const DWORD err = GetLastError();
@@ -1299,7 +1427,7 @@ private:
         ULARGE_INTEGER sz{};
         sz.LowPart = data.nFileSizeLow;
         sz.HighPart = data.nFileSizeHigh;
-        lua_createtable(state, 0, 4);
+        lua_createtable(state, 0, 6);
         lua_pushboolean(state, 1);
         lua_setfield(state, -2, "exists");
         lua_pushboolean(state, (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
@@ -1308,6 +1436,10 @@ private:
         lua_setfield(state, -2, "size");
         lua_pushinteger(state, static_cast<lua_Integer>(FileTimeToUnixSeconds(data.ftLastWriteTime)));
         lua_setfield(state, -2, "mtime");
+        lua_pushinteger(state, FileTimeStamp(data.ftLastWriteTime));
+        lua_setfield(state, -2, "stamp");
+        lua_pushboolean(state, (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        lua_setfield(state, -2, "reparse");
         return 1;
     }
 
@@ -1326,9 +1458,14 @@ private:
         if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
         const auto path = SafeFsPath(CheckString(state, 1));
         if (!path) return FsError(state, "路径无效");
+        const bool strict = lua_toboolean(state, 2) != 0;
+        const auto entry_limit = strict ? static_cast<std::size_t>(std::clamp<lua_Integer>(
+            luaL_optinteger(state, 3, max_fs_list_entries), 0, max_fs_list_entries)) : max_fs_list_entries;
+        if (strict && !PlainAncestors(*path)) return FsError(state, "路径包含重解析点或无法访问");
         const auto attrs = GetFileAttributesW(path->c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES) return FsError(state, Win32ErrorUtf8(GetLastError()));
         if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return FsError(state, "目标不是目录");
+        if (strict && (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return FsError(state, "目录是重解析点");
 
         const auto pattern = (*path / L"*").native();
         WIN32_FIND_DATAW data{};
@@ -1354,9 +1491,9 @@ private:
                 const std::wstring_view wname(data.cFileName);
                 if (wname == L"." || wname == L"..") continue;
                 if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-                if ((data.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) ==
+                if (!strict && (data.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) ==
                     (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
-                if (entries.size() >= max_fs_list_entries) {
+                if (entries.size() >= entry_limit) {
                     truncated = true;
                     break;
                 }
@@ -1370,7 +1507,9 @@ private:
                     sz.QuadPart, FileTimeToUnixSeconds(data.ftLastWriteTime),
                     FileTimeToLocalText(data.ftLastWriteTime)});
             } while (FindNextFileW(find, &data));
+            const auto error = GetLastError();
             FindClose(find);
+            if (strict && !truncated && error != ERROR_NO_MORE_FILES) return FsError(state, Win32ErrorUtf8(error));
         }
 
         std::ranges::sort(entries, [](const DirEntry& a, const DirEntry& b) {
@@ -1410,6 +1549,8 @@ private:
         if (!self.runtime_.Connected()) return FsError(state, "未连接");
         const auto path = SafeFsPath(CheckString(state, 1));
         if (!path) return FsError(state, "路径无效");
+        const bool strict = lua_toboolean(state, 2) != 0;
+        if (strict && !PlainAncestors(*path)) return FsError(state, "路径包含重解析点或无法访问");
         const auto slot = std::ranges::find(self.files_, 0, &FileSlot::id);
         if (slot == self.files_.end()) return FsError(state, "同时打开的文件过多");
         const auto attrs = GetFileAttributesW(path->c_str());
@@ -1417,14 +1558,21 @@ private:
         if ((attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
             return FsError(state, "只能读取普通文件");
         }
-        HANDLE file = CreateFileW(path->c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        HANDLE file = CreateFileW(path->c_str(), GENERIC_READ, strict ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
+                (strict ? FILE_FLAG_OPEN_REPARSE_POINT : 0), nullptr);
         if (file == INVALID_HANDLE_VALUE) return FsError(state, Win32ErrorUtf8(GetLastError()));
         LARGE_INTEGER size{};
         if (!GetFileSizeEx(file, &size)) {
             const DWORD err = GetLastError();
             CloseHandle(file);
             return FsError(state, Win32ErrorUtf8(err));
+        }
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (strict && (!GetFileInformationByHandle(file, &info) || GetFileType(file) != FILE_TYPE_DISK ||
+            (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))) {
+            CloseHandle(file);
+            return FsError(state, "只能读取普通文件");
         }
         slot->id = ++self.next_file_;
         slot->handle = file;
@@ -1433,7 +1581,26 @@ private:
         slot->temp_path.clear();
         lua_pushinteger(state, slot->id);
         lua_pushinteger(state, static_cast<lua_Integer>(size.QuadPart));
+        if (strict) {
+            lua_pushinteger(state, FileTimeStamp(info.ftLastWriteTime));
+            return 3;
+        }
         return 2;
+    }
+
+    static int FsSeek(lua_State* state) {
+        auto& self = Self(state);
+        if (!self.runtime_.Connected()) return FsBoolError(state, "未连接");
+        const auto id = luaL_checkinteger(state, 1);
+        LARGE_INTEGER offset{};
+        offset.QuadPart = luaL_checkinteger(state, 2);
+        const auto slot = std::ranges::find(self.files_, id, &FileSlot::id);
+        if (offset.QuadPart < 0 || slot == self.files_.end() || !slot->id || slot->writable) {
+            return FsBoolError(state, "无效的读取句柄或偏移量");
+        }
+        if (!SetFilePointerEx(slot->handle, offset, nullptr, FILE_BEGIN)) return FsBoolError(state, Win32ErrorUtf8(GetLastError()));
+        lua_pushboolean(state, true);
+        return 1;
     }
 
     static int FsRead(lua_State* state) {
@@ -1798,6 +1965,18 @@ private:
             {"on_change", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.clipboard); return 0; }},
             {nullptr, nullptr}
         };
+        static const luaL_Reg file_clipboard[] = {
+            {"available", [](lua_State* l) {
+                const auto& runtime = Self(l).runtime_;
+                lua_pushboolean(l, runtime.clipboard && runtime.clipboard->Available() &&
+                    runtime.file_clipboard && runtime.file_clipboard->Available());
+                return 1;
+            }},
+            {"on_change", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.clipboard_files); return 0; }},
+            {"on_read", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.clipboard_read); return 0; }},
+            {"publish", PublishFiles}, {"clear", ClearPublishedFiles}, {"reply", ReplyToClipboardRead},
+            {nullptr, nullptr}
+        };
         static const luaL_Reg crypto[] = {{"sha256", Sha256}, {nullptr, nullptr}};
         static const luaL_Reg timer[] = {
             {"after", [](lua_State* l) { return AddTimer(l, false); }},
@@ -1828,7 +2007,7 @@ private:
         static const luaL_Reg fs[] = {
             {"roots", FsRoots}, {"home", FsHome}, {"list", FsList}, {"stat", FsStat},
             {"mkdir", FsMkdir}, {"join", FsJoin},
-            {"open_read", FsOpenRead}, {"read", FsRead},
+            {"open_read", FsOpenRead}, {"read", FsRead}, {"seek", FsSeek},
             {"open_write", FsOpenWrite}, {"write", FsWrite}, {"commit", FsCommit}, {"close", FsClose},
             {nullptr, nullptr}
         };
@@ -1839,6 +2018,7 @@ private:
         Namespace(state, "json", json);
         if (manifest_.channel) Namespace(state, "channel", channel);
         if (manifest_.clipboard) Namespace(state, "clipboard", clipboard);
+        if (manifest_.file_clipboard) Namespace(state, "file_clipboard", file_clipboard);
         if (manifest_.log) Namespace(state, "log", log);
         if (manifest_.ui) Namespace(state, "ui", ui);
         if (manifest_.input) Namespace(state, "input", input);
@@ -1897,6 +2077,8 @@ private:
         int disconnected{LUA_NOREF};
         int message{LUA_NOREF};
         int clipboard{LUA_NOREF};
+        int clipboard_files{LUA_NOREF};
+        int clipboard_read{LUA_NOREF};
         int lock_state{LUA_NOREF};
     } callbacks_;
     std::array<Timer, 32> timers_{};
@@ -1923,8 +2105,12 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
             auto manifest = ReadManifest(json_factory, directory.path(), runtime.host, entry);
             if (!manifest) continue;
             const auto script = ReadFile(entry, 128 * 1024);
-            if (manifest->clipboard && !runtime.clipboard) {
-                runtime.clipboard.emplace();
+            if (manifest->clipboard || manifest->file_clipboard) {
+                if (!runtime.clipboard) runtime.clipboard.emplace();
+                if (manifest->file_clipboard && !runtime.file_clipboard) {
+                    runtime.clipboard->WatchFiles();
+                    if (runtime.clipboard->Available()) runtime.file_clipboard.emplace(runtime.wake);
+                }
                 runtime.clipboard->Poll(GetTickCount64());
             }
             auto plugin = std::make_unique<LuaPlugin>(std::move(*manifest), runtime);
@@ -1960,7 +2146,7 @@ struct PluginHost::Impl {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
             PluginRuntime runtime(host, send, connected, workspace,
-                config_root.empty() ? DefaultPluginSettingsDirectory() : config_root);
+                config_root.empty() ? DefaultPluginSettingsDirectory() : config_root, wake.get());
             std::vector<std::unique_ptr<LuaPlugin>> plugins;
             LoadPlugins(root.empty() ? PluginDirectory() : root, runtime, plugins);
             for (const auto& plugin : plugins) {
@@ -1972,6 +2158,13 @@ struct PluginHost::Impl {
                 auto now = GetTickCount64();
                 if (runtime.clipboard && connected.load() && runtime.clipboard->Poll(now)) {
                     for (const auto& plugin : plugins) plugin->ClipboardChanged(runtime.clipboard->Text());
+                    for (const auto& plugin : plugins) plugin->ClipboardFilesChanged(runtime.clipboard->Files());
+                }
+                if (runtime.file_clipboard && connected.load()) {
+                    if (auto request = runtime.file_clipboard->TakeRequest()) {
+                        if (runtime.file_clipboard_owner) runtime.file_clipboard_owner->ClipboardRead(*request);
+                        else runtime.file_clipboard->Reply(request->id, std::nullopt);
+                    }
                 }
 
                 std::string frame;
@@ -2026,6 +2219,7 @@ struct PluginHost::Impl {
             }
             connected = false;
             if (runtime.clipboard) runtime.clipboard->CancelWrite();
+            if (runtime.file_clipboard) runtime.file_clipboard->Clear();
             for (const auto& plugin : plugins) plugin->ConnectionChanged(false);
         } catch (...) {
             Log("host", "error", "Plugin worker stopped");

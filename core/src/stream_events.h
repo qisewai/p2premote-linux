@@ -35,7 +35,8 @@ struct RtcCounters {
 };
 
 enum class StreamEventType {
-    signal, signal_lost, media_lost, error, connected, stats, input_ready, input, cursor, minirtc_signal, video_settings
+    signal, signal_lost, media_lost, error, connected, stats, input_ready, input, cursor, minirtc_signal,
+    video_settings, audio_settings
 };
 
 struct StreamEvent {

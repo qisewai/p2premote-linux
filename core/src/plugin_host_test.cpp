@@ -3,6 +3,9 @@
 #include <p2premote/plugin_protocol.h>
 
 #include <windows.h>
+#include <ole2.h>
+#include <shlobj.h>
+#include <winrt/base.h>
 
 #include <atomic>
 #include <chrono>
@@ -27,8 +30,8 @@ void Check(bool condition, const char* message) {
 
 class Fixture {
 public:
-    Fixture() : root(std::filesystem::temp_directory_path() /
-        ("p2premote-plugin-test-" + std::to_string(GetCurrentProcessId()))) {
+    explicit Fixture(std::string_view suffix = {}) : root(std::filesystem::temp_directory_path() /
+        ("p2premote-plugin-test-" + std::to_string(GetCurrentProcessId()) + std::string(suffix))) {
         Check(std::filesystem::create_directory(root), "Test directory already exists");
     }
 
@@ -86,6 +89,22 @@ public:
     bool Wait(PluginPacket event, std::size_t count = 1) {
         std::unique_lock lock(mutex);
         return ready.wait_for(lock, 3s, [&] { return CountLocked(event) >= count; });
+    }
+
+    std::optional<std::string> WaitForType(std::string_view id, std::string_view type, std::chrono::milliseconds timeout = 3s) {
+        std::optional<std::string> payload;
+        std::unique_lock lock(mutex);
+        ready.wait_for(lock, timeout, [&] {
+            for (const auto& frame : frames) {
+                const auto packet = DecodePluginPacket(frame);
+                if (packet && packet->id == id && packet->type == type) {
+                    payload.emplace(packet->payload);
+                    return true;
+                }
+            }
+            return false;
+        });
+        return payload;
     }
 
 private:
@@ -228,17 +247,32 @@ public:
             std::memcpy(memory, text.c_str(), size);
             GlobalUnlock(block);
         }
-        bool written{};
-        for (int attempt = 0; memory && attempt < 50; ++attempt) {
-            if (OpenClipboard(window)) {
-                written = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, block) != nullptr;
-                CloseClipboard();
-                break;
-            }
-            std::this_thread::sleep_for(10ms);
+        if (memory && PutBlock(CF_UNICODETEXT, block)) return true;
+        GlobalFree(block);
+        return false;
+    }
+
+    bool PutFiles(std::initializer_list<std::filesystem::path> files) {
+        std::wstring paths;
+        for (const auto& file : files) {
+            paths.append(file.native());
+            paths.push_back(L'\0');
         }
-        if (!written) GlobalFree(block);
-        return written;
+        paths.push_back(L'\0');
+        const auto size = paths.size() * sizeof(wchar_t);
+        const auto block = GlobalAlloc(GMEM_MOVEABLE, sizeof(DROPFILES) + size);
+        if (!block) return false;
+        auto* drop = static_cast<DROPFILES*>(GlobalLock(block));
+        if (drop) {
+            *drop = {};
+            drop->pFiles = sizeof(DROPFILES);
+            drop->fWide = TRUE;
+            std::memcpy(drop + 1, paths.data(), size);
+            GlobalUnlock(block);
+        }
+        if (drop && PutBlock(CF_HDROP, block)) return true;
+        GlobalFree(block);
+        return false;
     }
 
     bool Contains(const std::wstring& expected) {
@@ -264,6 +298,18 @@ public:
     }
 
 private:
+    bool PutBlock(UINT format, HGLOBAL block) {
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            if (OpenClipboard(window)) {
+                const bool written = EmptyClipboard() && SetClipboardData(format, block);
+                CloseClipboard();
+                return written;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+        return false;
+    }
+
     HWINSTA original_station{GetProcessWindowStation()};
     HDESK original_desktop{GetThreadDesktop(GetCurrentThreadId())};
     HWINSTA station{};
@@ -419,6 +465,138 @@ int TestClipboard(const std::filesystem::path& root) {
         "Clipboard contents were sent before peer support was confirmed");
     Deliver(viewer, {"clipboard-sync", "ready", ""});
     Check(viewer_log.Wait({"clipboard-sync", "text", "被控 → 主控\r\nOffice"}), "Viewer did not send its initial clipboard");
+    return 0;
+}
+
+int TestFileClipboard(const std::filesystem::path& root) {
+    PrivateClipboard clipboard;
+    if (!clipboard.Available()) return 77;
+    Check(SUCCEEDED(OleInitialize(nullptr)), "Could not initialize the OLE test client");
+    struct OleScope { ~OleScope() { OleUninitialize(); } } ole;
+
+    Fixture fixture;
+    fixture.CopyPlugin(root / "file-clipboard");
+    Fixture sources("-sources");
+    const auto folder = sources.root / L"资料";
+    const auto subfolder = folder / L"子目录";
+    const auto file = subfolder / L"文件.bin";
+    const auto empty = sources.root / L"空.txt";
+    Check(std::filesystem::create_directories(subfolder), "Could not create the source directory");
+    for (const auto& path : {folder, subfolder, file, empty}) sources.RemoveOnExit(path);
+    std::string expected(600 * 1024 + 37, '\0');
+    for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<char>((i + i / 251) % 251);
+    Check(static_cast<bool>(std::ofstream(file, std::ios::binary).write(expected.data(),
+        static_cast<std::streamsize>(expected.size()))), "Could not create source file");
+    Check(static_cast<bool>(std::ofstream(empty)), "Could not create empty source file");
+
+    constexpr std::string_view plugin = "file-clipboard";
+    WireLog source_log, receiver_log;
+    std::mutex link_mutex;
+    PluginHost* link{};
+    std::atomic_bool hold_reads{};
+    winrt::handle read_pending{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    Check(static_cast<bool>(read_pending), "Could not create the pending read event");
+    PluginHost source(true, [&](std::string_view frame) {
+        const std::lock_guard lock(link_mutex);
+        if (link) link->Receive(frame);
+        return source_log.Send(frame);
+    }, fixture.root, {}, fixture.root);
+    source.SetConnected(true);
+    Deliver(source, {plugin, "hello", "1"});
+    Check(source_log.Wait({plugin, "ready", "1"}), "Source file clipboard did not negotiate");
+    Check(clipboard.PutFiles({folder, empty}), "Could not copy paths to the clipboard");
+    const auto manifest = source_log.WaitForType(plugin, "offer");
+    Check(manifest && manifest->find("文件.bin") != std::string::npos &&
+        manifest->find("p2premote-plugin-test-") == std::string::npos, "Copy did not send only relative file descriptors");
+
+    PluginHost receiver(false, [&](std::string_view frame) {
+        const auto packet = DecodePluginPacket(frame);
+        if (hold_reads && packet && packet->id == plugin && packet->type == "read") SetEvent(read_pending.get());
+        else source.Receive(frame);
+        return receiver_log.Send(frame);
+    }, fixture.root, {}, fixture.root);
+    struct ScopedLink {
+        std::mutex& mutex;
+        PluginHost*& link;
+        ScopedLink(std::mutex& mutex, PluginHost*& link, PluginHost& receiver) : mutex(mutex), link(link) {
+            const std::lock_guard lock(mutex);
+            link = &receiver;
+        }
+        ~ScopedLink() {
+            const std::lock_guard lock(mutex);
+            link = nullptr;
+        }
+    } connection(link_mutex, link, receiver);
+    receiver.SetConnected(true);
+    Check(source_log.Wait({plugin, "ready", "1"}, 2), "Destination file clipboard did not negotiate");
+
+    Deliver(receiver, {plugin, "offer", R"({"id":2,"files":[["..\\\\outside",1,false]]})"});
+    Deliver(receiver, {plugin, "offer", *manifest});
+    const auto format = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW));
+    const auto deadline = GetTickCount64() + 3000;
+    while (GetTickCount64() < deadline && !IsClipboardFormatAvailable(format)) {
+        MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
+    }
+    Check(IsClipboardFormatAvailable(format), "The OLE file clipboard was not published");
+    winrt::com_ptr<IDataObject> object;
+    Check(SUCCEEDED(OleGetClipboard(object.put())) && object, "Could not obtain the OLE clipboard");
+    struct Medium {
+        STGMEDIUM value{};
+        ~Medium() { ReleaseStgMedium(&value); }
+    } descriptors, data, zero;
+    FORMATETC descriptor_request{format, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    Check(SUCCEEDED(object->GetData(&descriptor_request, &descriptors.value)), "Could not read file descriptors");
+    const auto* group = static_cast<const FILEGROUPDESCRIPTORW*>(GlobalLock(descriptors.value.hGlobal));
+    Check(group != nullptr, "Could not lock file descriptors");
+    const auto* entries = reinterpret_cast<const FILEDESCRIPTORW*>(
+        reinterpret_cast<const char*>(group) + offsetof(FILEGROUPDESCRIPTORW, fgd));
+    const bool valid = group->cItems == 4 && std::wstring_view(entries[0].cFileName) == L"资料" &&
+        (entries[0].dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && std::wstring_view(entries[3].cFileName) == L"空.txt" &&
+        std::wstring_view(entries[2].cFileName) == L"资料\\子目录\\文件.bin" && entries[2].nFileSizeLow == expected.size();
+    GlobalUnlock(descriptors.value.hGlobal);
+    Check(valid, "OLE descriptors lost a name, directory, size or nesting information");
+    Check(IsClipboardFormatAvailable(CF_HDROP) == FALSE, "Virtual files unexpectedly advertised local paths");
+
+    FORMATETC content_request{static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILECONTENTS)),
+        nullptr, DVASPECT_CONTENT, 2, TYMED_ISTREAM};
+    Check(SUCCEEDED(object->GetData(&content_request, &data.value)), "Could not obtain the remote file stream");
+    content_request.lindex = 3;
+    Check(SUCCEEDED(object->GetData(&content_request, &zero.value)), "Could not obtain the empty file stream");
+    char byte{};
+    ULONG count{};
+    Check(zero.value.pstm->Read(&byte, 1, &count) == S_FALSE && count == 0, "An empty file did not immediately return EOF");
+    Check(!receiver_log.WaitForType(plugin, "read", 100ms), "Opening the clipboard or stream requested file bytes");
+
+    LARGE_INTEGER offset{};
+    offset.QuadPart = 17;
+    Check(SUCCEEDED(data.value.pstm->Seek(offset, STREAM_SEEK_SET, nullptr)), "Could not seek the virtual file");
+    Check(SUCCEEDED(data.value.pstm->Read(&byte, 1, &count)) && count == 1 && byte == expected[17],
+        "A range was not read at the requested offset");
+    offset.QuadPart = 0;
+    Check(SUCCEEDED(data.value.pstm->Seek(offset, STREAM_SEEK_SET, nullptr)), "Could not rewind the virtual file");
+    std::string pasted(expected.size() + 1, '\0');
+    Check(data.value.pstm->Read(pasted.data(), static_cast<ULONG>(pasted.size()), &count) == S_FALSE &&
+        count == expected.size() && std::string_view(pasted).substr(0, count) == expected, "Pasted bytes did not match the source");
+
+    Check(static_cast<bool>(std::ofstream(file, std::ios::binary | std::ios::trunc) << "changed"),
+        "Could not change the source file");
+    content_request.lindex = 2;
+    Medium changed;
+    Check(SUCCEEDED(object->GetData(&content_request, &changed.value)), "Could not reopen the virtual file stream");
+    Check(FAILED(changed.value.pstm->Read(&byte, 1, &count)), "An altered source file was accepted");
+    Medium pending;
+    Check(SUCCEEDED(object->GetData(&content_request, &pending.value)), "Could not open a stream for the disconnect test");
+    hold_reads = true;
+    std::jthread disconnect([&] {
+        if (WaitForSingleObject(read_pending.get(), 3000) == WAIT_OBJECT_0) receiver.Stop();
+    });
+    const auto start = GetTickCount64();
+    Check(FAILED(pending.value.pstm->Read(&byte, 1, &count)) && WaitForSingleObject(read_pending.get(), 0) == WAIT_OBJECT_0 &&
+        GetTickCount64() - start < 3000, "Disconnect did not cancel a pending file read");
+    disconnect.join();
+    Check(FAILED(data.value.pstm->Read(&byte, 1, &count)), "A stream remained readable after disconnect");
     return 0;
 }
 
@@ -608,6 +786,7 @@ int wmain(int argc, wchar_t** argv) {
             TestFileTransfer(argv[2]);
             return 0;
         }
+        if (argc == 3 && std::wstring_view(argv[1]) == L"--file-clipboard") return TestFileClipboard(argv[2]);
         if (argc == 2) return TestClipboard(argv[1]);
         TestSandbox();
         TestWorkspace();

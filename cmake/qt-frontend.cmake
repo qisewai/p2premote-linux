@@ -7,6 +7,7 @@ add_executable(p2premote_qt WIN32
     viewer/qt/plugin_dialog.cpp
     viewer/qt/plugin_dialog.h
     viewer/qt/remote_window.cpp
+    viewer/qt/remote_window.h
     viewer/qt/stream_driver.cpp
     viewer/qt/stream_driver.h)
 set_target_properties(p2premote_qt PROPERTIES

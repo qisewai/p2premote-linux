@@ -9,10 +9,12 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace p2premote {
@@ -35,7 +37,13 @@ public:
     bool SendInput(const InputPacket& input);
     bool SendInputCommand(const InputCommand& command);
     bool WorkspaceInputReady() const noexcept { return workspace_peer_.load(); }
+    using AudioReceiver = std::function<void(std::string_view source, const char* data, std::size_t size)>;
+
     bool SendVideoSettings(const InputPacket& settings);
+    bool SendAudioSettings(const InputPacket& settings);
+    bool SendAudio(const char* data, std::size_t size, const char* stream_id);
+    bool SetAudioSendPaused(bool paused);
+    void SetAudioReceiver(AudioReceiver receiver);
     bool SendCursor(const std::string& packet);
     void SetPluginsConnected(bool connected) noexcept;
     void ProbeWorkspace() noexcept;
@@ -48,6 +56,7 @@ private:
     static void SignalOut(const char*, size_t, void*) noexcept;
     static void Status(ConnectionStatus, const char*, size_t, void*);
     static void Video(const MiniRtcVideoFrame*, const char*, size_t, const char*, size_t, void*);
+    static void Audio(const char*, size_t, const char*, size_t, const char*, size_t, void*);
     static void Data(const char*, size_t, const char*, size_t, const char*, size_t, void*);
     static void Network(const char*, size_t, TraversalMode, const MiniRtcNetTrafficStats*, const char*, size_t, void*);
     void SendWorkspaceMessage(std::string_view kind) noexcept;
@@ -64,6 +73,8 @@ private:
     std::optional<DecodedFrame> latest_;
     std::uint64_t replaced_{};
     RtcCounters counters_;
+    std::mutex audio_mutex_;
+    AudioReceiver audio_receiver_;
     std::unique_ptr<PluginHost> plugins_;
     std::atomic_bool plugin_transport_{};
     std::atomic_bool workspace_peer_{};

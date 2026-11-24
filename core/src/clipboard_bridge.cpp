@@ -1,4 +1,7 @@
 #include "clipboard_bridge.h"
+#include "file_clipboard.h"
+
+#include <shellapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +42,28 @@ std::string UnicodeClipboardText() {
     std::string utf8(size, '\0');
     if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, length, utf8.data(), size, nullptr, nullptr) != size) return {};
     return utf8;
+}
+
+std::vector<LocalClipboardFile> DroppedFiles() {
+    const auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+    if (!drop) return {};
+    const auto count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
+    if (count > max_clipboard_files) return {};
+    std::vector<LocalClipboardFile> files;
+    files.reserve(count);
+    for (UINT index = 0; index < count; ++index) {
+        wchar_t path[MAX_PATH]{};
+        const auto length = DragQueryFileW(drop, index, nullptr, 0);
+        if (!length || length >= std::size(path) || DragQueryFileW(drop, index, path, MAX_PATH) != length) return {};
+        const auto size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, length, nullptr, 0, nullptr, nullptr);
+        if (!size) return {};
+        std::string utf8(size, '\0');
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, length, utf8.data(), size, nullptr, nullptr) != size) return {};
+        const auto last_slash = utf8.find_last_of("\\/");
+        auto name = utf8.substr(last_slash == std::string::npos ? 0 : last_slash + 1);
+        if (!name.empty()) files.push_back({std::move(utf8), std::move(name)});
+    }
+    return files;
 }
 
 } // namespace
@@ -127,6 +152,7 @@ ClipboardBridge::WriteResult ClipboardBridge::Write() {
             const auto sequence = GetClipboardSequenceNumber();
             remote_sequence.store(sequence);
             text_ = pending_utf8_;
+            files_.clear();
             sequence_ = sequence;
             initialized_ = true;
             dirty_ = false;
@@ -145,11 +171,16 @@ bool ClipboardBridge::Read() {
         dirty_ = false;
         return false;
     }
-    text_ = IsClipboardFormatAvailable(CF_UNICODETEXT) ? UnicodeClipboardText() : std::string{};
+    const auto marker = watch_files_ ? VirtualFileClipboardMarker() : 0;
+    const bool virtual_files = marker && IsClipboardFormatAvailable(marker);
+    const bool dropped_files = watch_files_ && IsClipboardFormatAvailable(CF_HDROP);
+    text_ = !virtual_files && !dropped_files && IsClipboardFormatAvailable(CF_UNICODETEXT) ?
+        UnicodeClipboardText() : std::string{};
+    files_ = !virtual_files && dropped_files ? DroppedFiles() : std::vector<LocalClipboardFile>{};
     sequence_ = GetClipboardSequenceNumber();
     dirty_ = false;
     if (!std::exchange(initialized_, true)) return false;
-    return sequence_ == 0 || sequence_ != remote_sequence.load();
+    return !virtual_files && (sequence_ == 0 || sequence_ != remote_sequence.load());
 }
 
 bool ClipboardBridge::Poll(ULONGLONG now) {

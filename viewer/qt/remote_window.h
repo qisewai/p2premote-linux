@@ -2,49 +2,59 @@
 
 #include "stream_driver.h"
 
+#include <QTimer>
 #include <QWidget>
 
-class QCheckBox;
-class QComboBox;
+#include <vector>
+
+class QFrame;
 class QLabel;
 class QPushButton;
+class QStackedWidget;
+class QTabBar;
 class QVBoxLayout;
-class PluginDialogManager;
+class RemoteSessionTab;
 
 class RemoteWindow final : public QWidget {
+    Q_OBJECT
+
 public:
-    RemoteWindow(p2p_account* account, const QString& device, const QString& name,
-        const LaunchOptions& options, QWidget* parent);
+    explicit RemoteWindow(QWidget* parent = nullptr);
     ~RemoteWindow() override;
-    void start();
+
+    void openSession(p2p_account* account, const QString& device, const QString& name,
+        const LaunchOptions& options);
 
 protected:
-    bool eventFilter(QObject* watched, QEvent* event) override;
     void changeEvent(QEvent* event) override;
 
 private:
-    void showState(const p2p_stream_snapshot_v1& snapshot);
-    void syncVideo();
+    RemoteSessionTab* currentSession() const;
+    RemoteSessionTab* sessionAt(int index) const;
+    int findSession(const QString& device) const;
+    void onTabChanged(int index);
+    void onTabMoved(int from, int to);
+    void closeTab(int index);
+    void refreshChrome();
     void toggleFullscreen();
     void positionFullscreenToolbar();
-    void showPlugins();
-    void exportCsv();
+    void showDisplayMenu();
+    void showAudioMenu();
+    void showPluginsMenu();
+    void showActionsMenu();
 
-    std::unique_ptr<StreamDriver> driver_;
-    PluginDialogManager* dialogs_{};
     QVBoxLayout* layout_{};
-    QWidget* toolbar_{};
-    QWidget* video_{};
-    QLabel* status_{};
-    QLabel* metrics_{};
-    QPushButton *connect_{}, *stop_{}, *plugins_{}, *fullscreen_{}, *export_{};
-    QComboBox *quality_{}, *bitrate_{};
-    QCheckBox* diagnostics_{};
+    QFrame* topbar_{};
+    QTabBar* tabs_{};
+    QPushButton *add_tab_{}, *perf_pill_{};
+    QPushButton *display_menu_{}, *audio_menu_{}, *plugins_menu_{}, *actions_menu_{}, *fullscreen_{};
+    QStackedWidget* stack_{};
+    QFrame* statusbar_{};
+    QLabel* status_text_{};
+    QLabel* metrics_text_{};
     QTimer hover_;
     bool fullscreen_mode_{};
     bool was_maximized_{};
-    bool playing_{};
-    QString metrics_text_;
-    double previous_seconds_{}, fps_{};
-    uint64_t previous_frames_{};
+    bool show_diagnostics_{false};
+    std::vector<RemoteSessionTab*> sessions_;
 };

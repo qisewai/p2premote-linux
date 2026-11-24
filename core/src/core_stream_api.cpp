@@ -218,6 +218,19 @@ int32_t p2p_stream_bitrate(p2p_stream* stream, uint32_t bitrate) {
     });
 }
 
+int32_t p2p_stream_set_audio(p2p_stream* stream, const p2p_audio_options_v1* options) {
+    return Guard([&] {
+        auto& state = Required(stream);
+        const auto& opt = Required(options);
+        state.session.SetAudioOptions({
+            opt.speaker_enabled != 0,
+            opt.mic_enabled != 0,
+            opt.speaker_volume,
+            opt.mic_speaker_fallback != 0
+        });
+    });
+}
+
 int32_t p2p_stream_resize(p2p_stream* stream, int32_t drawable) {
     return Guard([&] { Required(stream).Resize(drawable != 0); });
 }

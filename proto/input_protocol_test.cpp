@@ -46,6 +46,13 @@ int main() {
         && !DecodeInput(EncodeInput({InputKind::set_video_settings, hd, economy, 1, 27, 50}))
         && !DecodeInput(EncodeInput({InputKind::video_settings_reply, hd, economy, 2, 27, 50})),
         "Accepted malformed video settings");
+    const std::uint16_t audio_flags = p2premote::audio_flag_speaker | p2premote::audio_flag_mic;
+    const auto audio_req = DecodeInput(EncodeInput({InputKind::set_audio_settings, audio_flags, 0, 0, 28, 55}));
+    passed &= check(audio_req && audio_req->kind == InputKind::set_audio_settings && audio_req->code == audio_flags
+        && audio_req->x == 0 && audio_req->y == 0, "Could not decode valid audio settings");
+    passed &= check(!DecodeInput(EncodeInput({InputKind::set_audio_settings, 0x08, 0, 0, 28, 55}))
+        && !DecodeInput(EncodeInput({InputKind::set_audio_settings, audio_flags, 1, 0, 28, 55})),
+        "Accepted malformed audio settings");
 
     InputReceiveClock clock;
     passed &= check(clock.IsFresh(900'000, 2'010), "Rejected input from a peer with longer uptime");

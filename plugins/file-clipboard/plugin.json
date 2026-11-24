@@ -1,0 +1,9 @@
+{
+  "id": "file-clipboard",
+  "name": "文件剪贴板",
+  "version": "1.0.0",
+  "entry": "main.lua",
+  "roles": ["host", "viewer"],
+  "enabled": true,
+  "permissions": ["channel", "file_clipboard", "fs", "log"]
+}

@@ -1,5 +1,6 @@
 #include <p2premote/stream_session.h>
 
+#include "audio_engine.h"
 #include "cursor_shape.h"
 #include "d3d11_preview.h"
 #include "d3d11_video.h"
@@ -223,6 +224,11 @@ struct ActiveStream {
         : events(std::make_shared<StreamEvents>(std::move(trace))) {}
 
     ~ActiveStream() {
+        if (audio_capture) audio_capture->Stop();
+        audio_capture.reset();
+        if (rtc) rtc->SetAudioReceiver({});
+        if (audio_player) audio_player->Stop();
+        audio_player.reset();
         events->SetDesktopInput(nullptr);
         DestroyDecodedCursor(remote_cursor);
     }
@@ -230,6 +236,11 @@ struct ActiveStream {
     std::shared_ptr<StreamEvents> events;
     std::unique_ptr<SignalSocket> signal;
     std::unique_ptr<MiniRtcCall> rtc;
+    std::unique_ptr<AudioCapture> audio_capture;
+    std::unique_ptr<AudioPlayer> audio_player;
+    bool remote_speaker_enabled{true};
+    bool remote_mic_enabled{false};
+    bool remote_mic_fallback{true};
     std::unique_ptr<DesktopInput> desktop;
     winrt::com_ptr<ID3D11Device> device;
     std::unique_ptr<IVideoCapturer> capture;
@@ -410,6 +421,7 @@ struct StreamSession::Impl {
     StreamStatistics stats;
     StreamQuality requested_quality{StreamQuality::p1080};
     VideoBitratePreset requested_bitrate{VideoBitratePreset::automatic};
+    StreamAudioOptions audio_options{};
     std::int64_t start{};
     double capture_to_submit_total{};
     double draw_to_present_total{};
@@ -481,6 +493,52 @@ void StreamSession::SetVideoBitratePreset(VideoBitratePreset preset) {
     UpdateVideoSettings();
 }
 
+void StreamSession::SetAudioOptions(StreamAudioOptions options) {
+    options.speaker_volume = std::clamp(options.speaker_volume, 0.0f, 1.0f);
+    impl_->audio_options = options;
+    ApplyAudioOptions();
+}
+
+StreamAudioOptions StreamSession::AudioOptions() const noexcept {
+    return impl_->audio_options;
+}
+
+void StreamSession::ApplyAudioOptions() {
+    if (impl_->host || impl_->state != StreamState::streaming || !impl_->active) return;
+    auto& active = *impl_->active;
+    if (!active.rtc || active.transport_close_deadline) return;
+    const auto& opt = impl_->audio_options;
+
+    if (active.audio_player) {
+        active.audio_player->SetMuted(!opt.speaker_enabled);
+        active.audio_player->SetVolume(opt.speaker_volume);
+    }
+    if (opt.mic_enabled) {
+        if (!active.audio_capture) {
+            active.audio_capture = std::make_unique<AudioCapture>(AudioCapture::Mode::microphone,
+                [rtc = active.rtc.get()](const char* data, std::size_t size) {
+                    rtc->SendAudio(data, size, "mic_audio");
+                });
+        }
+        active.audio_capture->SetPaused(false);
+        active.rtc->SetAudioSendPaused(false);
+    } else {
+        if (active.audio_capture) {
+            active.audio_capture->Stop();
+            active.audio_capture.reset();
+        }
+        active.rtc->SetAudioSendPaused(true);
+    }
+
+    std::uint16_t flags{};
+    if (opt.speaker_enabled) flags |= audio_flag_speaker;
+    if (opt.mic_enabled) flags |= audio_flag_mic;
+    if (opt.mic_speaker_fallback) flags |= audio_flag_mic_fallback;
+    const InputPacket packet{InputKind::set_audio_settings, flags, 0, 0,
+        ++active.outgoing_input_sequence, GetTickCount64()};
+    active.rtc->SendAudioSettings(packet);
+}
+
 void StreamSession::UpdateVideoSettings() {
     if (impl_->host || impl_->state != StreamState::streaming) return;
     auto& active = *impl_->active;
@@ -520,7 +578,10 @@ void StreamSession::Stop(std::wstring status) {
 
 void StreamSession::Close(std::wstring status, bool intentional) {
     if (auto active = std::move(impl_->active)) {
+        if (active->audio_capture) active->audio_capture->Stop();
+        active->audio_capture.reset();
         if (active->rtc) {
+            active->rtc->SetAudioReceiver({});
             active->rtc->SetPluginsConnected(false);
             if (!impl_->host) {
                 if (auto* plugins = active->rtc->Plugins()) {
@@ -531,6 +592,8 @@ void StreamSession::Close(std::wstring status, bool intentional) {
                 }
             }
         }
+        if (active->audio_player) active->audio_player->Stop();
+        active->audio_player.reset();
         active->events->SetDesktopInput(nullptr);
         active->desktop.reset();
         active->capture.reset();
@@ -684,6 +747,20 @@ void StreamSession::ProcessEvents() {
                 impl_->reconnect.reset();
                 if (active.input_ready) active.events->SetDesktopInput(active.desktop.get());
                 impl_->detail = impl_->host ? active.SharingStatus() : L"正在接收视频";
+                if (impl_->host) {
+                    active.audio_capture = std::make_unique<AudioCapture>(AudioCapture::Mode::desktop_loopback,
+                        [rtc = active.rtc.get()](const char* data, std::size_t size) {
+                            rtc->SendAudio(data, size, "desktop_audio");
+                        });
+                    active.audio_capture->SetPaused(!active.remote_speaker_enabled);
+                } else {
+                    active.audio_player = std::make_unique<AudioPlayer>(AudioPlayer::Target::default_speaker);
+                    active.rtc->SetAudioReceiver([player = active.audio_player.get()](
+                        std::string_view source, const char* data, std::size_t size) {
+                        if (source.empty() || source == "desktop_audio") player->PushPcm(data, size);
+                    });
+                    ApplyAudioOptions();
+                }
                 active.rtc->SetPluginsConnected(true);
             }
             break;
@@ -767,6 +844,33 @@ void StreamSession::ProcessEvents() {
                     impl_->detail = L"画质设置未生效";
                 }
             }
+            break;
+        }
+        case StreamEventType::audio_settings: {
+            if (!impl_->host || impl_->state != StreamState::streaming || active.transport_close_deadline) break;
+            const auto flags = event.input.code;
+            active.remote_speaker_enabled = (flags & audio_flag_speaker) != 0;
+            const bool want_mic = (flags & audio_flag_mic) != 0 && active.input_mode == StreamInputMode::desktop;
+            const bool want_fallback = (flags & audio_flag_mic_fallback) != 0;
+            if (active.audio_capture) active.audio_capture->SetPaused(!active.remote_speaker_enabled);
+            if (active.rtc) active.rtc->SetAudioSendPaused(!active.remote_speaker_enabled);
+            if (want_mic) {
+                if (!active.audio_player || active.remote_mic_fallback != want_fallback) {
+                    active.rtc->SetAudioReceiver({});
+                    active.audio_player.reset();
+                    active.audio_player = std::make_unique<AudioPlayer>(
+                        AudioPlayer::Target::virtual_mic_or_speaker, want_fallback);
+                    active.rtc->SetAudioReceiver([player = active.audio_player.get()](
+                        std::string_view source, const char* data, std::size_t size) {
+                        if (source.empty() || source == "mic_audio") player->PushPcm(data, size);
+                    });
+                }
+            } else {
+                if (active.rtc) active.rtc->SetAudioReceiver({});
+                active.audio_player.reset();
+            }
+            active.remote_mic_enabled = want_mic;
+            active.remote_mic_fallback = want_fallback;
             break;
         }
         case StreamEventType::input:

@@ -683,11 +683,9 @@ void AccountWindow::stopReceiving() {
 void AccountWindow::connectDevice() {
     if (!connect_->isEnabled()) return;
     const auto* item = devices_->currentItem();
-    delete viewer_.data();
-    viewer_ = new RemoteWindow(account_.get(), item->data(Qt::UserRole).toString(),
-        item->data(device_name_role).toString(), options_, this);
-    viewer_->show();
-    viewer_->start();
+    if (!viewer_) viewer_ = new RemoteWindow(this);
+    viewer_->openSession(account_.get(), item->data(Qt::UserRole).toString(),
+        item->data(device_name_role).toString(), options_);
 }
 
 void AccountWindow::closeSessions() {

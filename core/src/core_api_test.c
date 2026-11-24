@@ -33,8 +33,10 @@ int main(void) {
     passed &= check(p2p_account_complete(account) == P2P_PENDING, "Cancelled result was published");
     {
         p2p_ui_command ui_cmd = {0};
+        p2p_audio_options_v1 audio = {1, 0, 1.0f, 1};
         passed &= check(p2p_stream_poll_ui_command(NULL, &ui_cmd) == P2P_ERROR, "Null stream poll accepted")
-            && check(p2p_stream_send_ui_event(NULL, 1, "btn", "click", "{}") == P2P_ERROR, "Null stream UI event accepted");
+            && check(p2p_stream_send_ui_event(NULL, 1, "btn", "click", "{}") == P2P_ERROR, "Null stream UI event accepted")
+            && check(p2p_stream_set_audio(NULL, &audio) == P2P_ERROR, "Null stream audio options accepted");
     }
     p2p_account_destroy(account);
     return passed ? 0 : 1;

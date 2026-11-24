@@ -24,6 +24,8 @@ namespace {
 
 using namespace winrt::Windows::Data::Json;
 constexpr char video_name[] = "desktop";
+constexpr char desktop_audio_name[] = "desktop_audio";
+constexpr char mic_audio_name[] = "mic_audio";
 constexpr char controls_name[] = "control";
 constexpr char motion_name[] = "pointer";
 constexpr char cursor_name[] = "cursor";
@@ -93,24 +95,45 @@ std::optional<DecodedFrame> RetainNv12(const MiniRtcVideoFrame& frame, std::int6
     };
 }
 
-const native_minirtc::Api* NativeApi() {
-    static const auto* api = []() -> const native_minirtc::Api* {
+struct AudioApi {
+    decltype(&AddAudioStream) add_audio{};
+    decltype(&SendAudioFrame) send_audio{};
+    decltype(&SetAudioSendPaused) set_audio_paused{};
+};
+
+struct LoadedMiniRtc {
+    const native_minirtc::Api* api{};
+    AudioApi audio;
+};
+
+const LoadedMiniRtc& LoadMiniRtc() {
+    static const LoadedMiniRtc loaded = []() -> LoadedMiniRtc {
         wchar_t executable[32768]{};
         const auto length = GetModuleFileNameW(nullptr, executable, std::size(executable));
-        if (!length || length >= std::size(executable)) return nullptr;
+        if (!length || length >= std::size(executable)) return {};
         const auto dll = std::filesystem::path(executable).parent_path() / L"p2premote_minirtc.dll";
         const auto module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!module) return nullptr;
+        if (!module) return {};
         const auto exported = GetProcAddress(module, "P2PRemoteMiniRtcApi");
         const auto get_api = reinterpret_cast<native_minirtc::GetApi>(exported);
         if (get_api) {
-            if (const auto* result = get_api(native_minirtc::abi_version)) return result;
+            if (const auto* result = get_api(native_minirtc::abi_version)) {
+                LoadedMiniRtc out;
+                out.api = result;
+                out.audio.add_audio = reinterpret_cast<decltype(&AddAudioStream)>(GetProcAddress(module, "AddAudioStream"));
+                out.audio.send_audio = reinterpret_cast<decltype(&SendAudioFrame)>(GetProcAddress(module, "SendAudioFrame"));
+                out.audio.set_audio_paused = reinterpret_cast<decltype(&SetAudioSendPaused)>(GetProcAddress(module, "SetAudioSendPaused"));
+                return out;
+            }
         }
         FreeLibrary(module);
-        return nullptr;
+        return {};
     }();
-    return api;
+    return loaded;
 }
+
+const native_minirtc::Api* NativeApi() { return LoadMiniRtc().api; }
+const AudioApi& NativeAudioApi() { return LoadMiniRtc().audio; }
 
 JsonObject IceConfiguration(const std::vector<IceServerOptions>& options) {
     using namespace std::chrono;
@@ -185,6 +208,7 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
     params.on_signal_status = [](SignalStatus, const char*, size_t, void*) {};
     params.on_connection_status = Status;
     params.on_receive_video_frame = Video;
+    params.on_receive_audio_buffer = Audio;
     params.on_receive_data_buffer = Data;
     params.on_net_status_report = Network;
     if (allow_input_) {
@@ -201,6 +225,12 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
     if (peer && plugins_ && api_->add_data(peer.get(), plugin_name, true) != 0) {
         plugins_.reset();
         OutputDebugStringW(L"P2PRemote: could not register plugin channel\n");
+    }
+    if (peer && NativeAudioApi().add_audio) {
+        const char* outgoing_audio = host_ ? desktop_audio_name : mic_audio_name;
+        if (NativeAudioApi().add_audio(peer.get(), outgoing_audio) != 0) {
+            OutputDebugStringW(L"P2PRemote: could not register audio stream\n");
+        }
     }
     if (!peer || api_->add_video(peer.get(), video_name) != 0 || api_->add_data(peer.get(), controls_name, true) != 0 ||
         api_->add_data(peer.get(), motion_name, false) != 0 || api_->add_data(peer.get(), cursor_name, true) != 0 ||
@@ -355,6 +385,10 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
             if (label == controls_name && input->kind == (self.host_ ? InputKind::set_video_settings : InputKind::video_settings_reply)) {
                 self.events_->Push({StreamEventType::video_settings, {}, {}, {}, *input});
             }
+        } else if (IsAudioSettingsMessage(input->kind)) {
+            if (label == controls_name && self.host_) {
+                self.events_->Push({StreamEventType::audio_settings, {}, {}, {}, *input});
+            }
         } else if (self.host_ && self.allow_input_ && ((input->kind == InputKind::move) == (label == motion_name))) {
             if (const auto& trace = self.events_->Trace()) trace->Pointer("input_received", *input);
             self.events_->PushInput(*input);
@@ -376,6 +410,22 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
                 self.workspace_peer_ = true;
             }
         }
+    }
+}
+
+void MiniRtcCall::Audio(const char* data, size_t size, const char*, size_t, const char* source, size_t source_size,
+    void* context) {
+    auto& self = *static_cast<MiniRtcCall*>(context);
+    if (!data || !size || !self.connected_.load()) return;
+    AudioReceiver receiver;
+    {
+        const std::lock_guard lock(self.audio_mutex_);
+        receiver = self.audio_receiver_;
+    }
+    if (receiver) {
+        try {
+            receiver(source ? std::string_view(source, source_size) : std::string_view{}, data, size);
+        } catch (...) {}
     }
 }
 
@@ -481,6 +531,31 @@ bool MiniRtcCall::SendVideoSettings(const InputPacket& settings) {
     if (!connected_.load() || settings.kind != (host_ ? InputKind::video_settings_reply : InputKind::set_video_settings)) return false;
     const auto bytes = EncodeInput(settings);
     return api_->send_reliable(peer_, reinterpret_cast<const char*>(bytes.data()), bytes.size(), controls_name) == 0;
+}
+
+bool MiniRtcCall::SendAudioSettings(const InputPacket& settings) {
+    if (host_ || !connected_.load() || settings.kind != InputKind::set_audio_settings) return false;
+    const auto bytes = EncodeInput(settings);
+    return api_->send_reliable(peer_, reinterpret_cast<const char*>(bytes.data()), bytes.size(), controls_name) == 0;
+}
+
+bool MiniRtcCall::SendAudio(const char* data, std::size_t size, const char* stream_id) {
+    const auto& audio = NativeAudioApi();
+    if (!connected_.load() || !peer_ || !audio.send_audio || !data || !size || !stream_id) return false;
+    MiniRtcAudioFrame frame{data, size, 0};
+    return audio.send_audio(peer_, &frame, stream_id) == 0;
+}
+
+bool MiniRtcCall::SetAudioSendPaused(bool paused) {
+    const auto& audio = NativeAudioApi();
+    if (!connected_.load() || !peer_ || !audio.set_audio_paused) return false;
+    const char* remote_id = host_ ? "viewer" : "host";
+    return audio.set_audio_paused(peer_, remote_id, std::strlen(remote_id), paused) == 0;
+}
+
+void MiniRtcCall::SetAudioReceiver(AudioReceiver receiver) {
+    const std::lock_guard lock(audio_mutex_);
+    audio_receiver_ = std::move(receiver);
 }
 
 bool MiniRtcCall::SendCursor(const std::string& packet) {
