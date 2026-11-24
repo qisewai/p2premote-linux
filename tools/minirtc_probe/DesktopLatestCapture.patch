@@ -1,0 +1,304 @@
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+index d151b7f..9d4c6c4 100644
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -763,16 +763,30 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
+   }
+
+   if (task_queue_encode_) {
++    const bool replaceable = native_frame &&
++        native_frame->type == MiniRtcNativeVideoFrameD3d11Nv12 &&
++        media_config_.video_content_type == VideoContentType::ScreenContent &&
++        media_config_.video_degradation_preference ==
++            VideoDegradationPreference::MaintainResolution;
++    const auto pending = replaceable ? context->pending_native_frame : nullptr;
+     auto& cadence = video_frame_cadences_[channel_name];
+     const int64_t now_us = clock_->CurrentTimeUs();
+     const bool resume_desktop =
+         media_config_.video_content_type == VideoContentType::ScreenContent &&
+         cadence.CanResumeDesktop(now_us);
+-    if (!cadence.Accept(now_us, media_config_.max_frame_rate, resume_desktop))
++    // Replacing an already queued native capture does not increase encode or
++    // pacer volume, so keep the pending slot fresh even when cadence or pacer
++    // admission would reject an additional frame.
++    if (pending) {
++      cadence.Accept(now_us, media_config_.max_frame_rate, resume_desktop);
++    } else if (!cadence.Accept(now_us, media_config_.max_frame_rate,
++                               resume_desktop)) {
+       return 0;
++    }
+     context->capture_input_frame_total.fetch_add(1,
+                                                  std::memory_order_relaxed);
+-    if (media_config_.video_content_type == VideoContentType::ScreenContent &&
++    if (!pending &&
++        media_config_.video_content_type == VideoContentType::ScreenContent &&
+         paced_sender_ &&
+         (paced_sender_->ExpectedQueueTime() >=
+              TimeDelta::Millis(kDesktopFrameAdmissionQueueMs) ||
+@@ -786,12 +800,9 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
+       return 0;
+     }
+
+-    // Reject coalesced frames before copying the full desktop buffer. At 4K,
+-    // copying frames that are known to be dropped can consume hundreds of MB/s
+-    // and slow the capture callback itself below its configured frame rate.
+-    // At resume, the idle refresh may still be waiting for the encoder.
+-    // Permit its successor while keeping the pacer and backlog limits.
+-    if (task_queue_encode_->PendingTasks() > (resume_desktop ? 1 : 0)) {
++    // A new native capture can replace the one queued for this stream. Other
++    // captures keep the existing backlog limit before copying any pixels.
++    if (!pending && task_queue_encode_->PendingTasks() > (resume_desktop ? 1 : 0)) {
+       context->encode_queue_dropped_frame_total.fetch_add(
+           1, std::memory_order_relaxed);
+       return 0;
+@@ -911,99 +922,112 @@ int IceTransportController::SendVideo(const MiniRtcVideoFrame* video_frame,
+         context->target_height.value_or(source_height));
+     const int target_width = target_resolution.first;
+     const int target_height = target_resolution.second;
+-    auto post_encode = [weak_self, weak_context, encode_queue, channel_name,
+-                        force_i_frame, target_width, target_height,
+-                        settings_generation](RawFrame&& frame) mutable {
+-      encode_queue->PostTask([weak_self, weak_context, encode_queue,
+-                              channel_name, force_i_frame, target_width,
+-                              target_height, settings_generation,
+-                              frame = std::move(frame)]() mutable {
+-        auto self = weak_self.lock();
+-        auto context = weak_context.lock();
+-        if (!self || !context || !self->is_running_.load()) {
+-          return;
+-        }
++    StreamContext::VideoEncodeJob latest{std::move(raw_frame), force_i_frame,
++        target_width, target_height, settings_generation, clock_->CurrentTimeMs()};
++    if (pending) {
++      if (pending->settings_generation == settings_generation) {
++        latest.force_i_frame |= pending->force_i_frame;
++      }
++      *pending = std::move(latest);
++      context->encode_queue_dropped_frame_total.fetch_add(
++          1, std::memory_order_relaxed);
++      return 0;
++    }
+
+-        {
+-          std::shared_lock lock(self->stream_senders_mutex_);
+-          if (self->video_send_paused_ ||
+-              context->video_settings_generation != settings_generation) return;
+-        }
+-        // The transport may have become unavailable after frame admission.
+-        // Restore the request consumed above so the next frame can resync.
+-        if (!self->media_transport_ready_.load()) {
+-          self->FullIntraRequest(channel_name);
+-          return;
++    auto job = std::make_shared<StreamContext::VideoEncodeJob>(std::move(latest));
++    if (replaceable) context->pending_native_frame = job;
++    encode_queue->PostTask([weak_self, weak_context, channel_name, job = std::move(job)] {
++      auto self = weak_self.lock();
++      auto context = weak_context.lock();
++      if (!self || !context || !self->is_running_.load()) {
++        return;
++      }
++
++      {
++        std::unique_lock lock(self->stream_senders_mutex_);
++        if (context->pending_native_frame == job) {
++          context->pending_native_frame.reset();
+         }
++        if (self->video_send_paused_ ||
++            context->video_settings_generation != job->settings_generation) return;
++      }
++      // No capture can replace this frame once the pending slot is released.
++      auto& frame = job->frame;
++      const int target_width = job->target_width;
++      const int target_height = job->target_height;
++      const auto settings_generation = job->settings_generation;
++      const auto queue_delay_ms = self->clock_->CurrentTimeMs() - job->queued_at_ms;
++      // The transport may have become unavailable after frame admission.
++      // Restore the request consumed above so the next frame can resync.
++      if (!self->media_transport_ready_.load()) {
++        self->FullIntraRequest(channel_name);
++        return;
++      }
+
+-        if (!context->codec) {
++      if (!context->codec) {
++        return;
++      }
++      const bool needs_scaling =
++          target_width > 0 && target_height > 0 &&
++          (target_width < frame.Width() || target_height < frame.Height());
++      if (const auto* native_frame = frame.NativeFrame();
++          native_frame &&
++          (needs_scaling ||
++           !context->codec->SupportsNativeFrameInput(native_frame->type))) {
++        if (!frame.MaterializeNativeFrame()) {
++          LOG_ERROR("Failed to materialize native video frame for stream [{}]",
++                    channel_name);
+           return;
+         }
+-        const bool needs_scaling =
+-            target_width > 0 && target_height > 0 &&
+-            (target_width < frame.Width() || target_height < frame.Height());
+-        if (const auto* native_frame = frame.NativeFrame();
+-            native_frame &&
+-            (needs_scaling ||
+-             !context->codec->SupportsNativeFrameInput(native_frame->type))) {
+-          if (!frame.MaterializeNativeFrame()) {
+-            LOG_ERROR("Failed to materialize native video frame for stream [{}]",
+-                      channel_name);
+-            return;
+-          }
+-        }
+-        if (needs_scaling) {
+-          RawFrame scaled_frame(static_cast<size_t>(target_width) *
+-                                    target_height * 3 / 2);
+-          scaled_frame.SetCapturedTimestamp(frame.CapturedTimestamp());
+-          if (self->resolution_adapter_->ResolutionDowngrade(
+-                  frame, target_width, target_height, scaled_frame) != 0) {
+-            LOG_ERROR("Failed to scale video frame from [{}x{}] to [{}x{}]",
+-                      frame.Width(), frame.Height(), target_width,
+-                      target_height);
+-            return;
+-          }
+-          frame = std::move(scaled_frame);
++      }
++      if (needs_scaling) {
++        RawFrame scaled_frame(static_cast<size_t>(target_width) *
++                                  target_height * 3 / 2);
++        scaled_frame.SetCapturedTimestamp(frame.CapturedTimestamp());
++        if (self->resolution_adapter_->ResolutionDowngrade(
++                frame, target_width, target_height, scaled_frame) != 0) {
++          LOG_ERROR("Failed to scale video frame from [{}x{}] to [{}x{}]",
++                    frame.Width(), frame.Height(), target_width,
++                    target_height);
++          return;
+         }
+-        int64_t queue_delay_ms = encode_queue->CurrentTaskQueueDelayMs();
+-        if (force_i_frame) {
+-          if (context->codec->ForceIdr() != 0) {
+-            // Keep the request pending so a transient encoder failure cannot
+-            // turn a recoverable loss into a long wait for the periodic IDR.
+-            std::lock_guard<std::mutex> lock(
+-                self->force_i_frame_streams_mutex_);
+-            self->force_i_frame_streams_.insert(channel_name);
+-            LOG_ERROR("Failed to force I frame for stream [{}]", channel_name);
+-          } else {
+-            LOG_DEBUG("Force I frame for stream [{}]", channel_name);
+-          }
++        frame = std::move(scaled_frame);
++      }
++      if (job->force_i_frame) {
++        if (context->codec->ForceIdr() != 0) {
++          // Keep the request pending so a transient encoder failure cannot
++          // turn a recoverable loss into a long wait for the periodic IDR.
++          std::lock_guard<std::mutex> lock(
++              self->force_i_frame_streams_mutex_);
++          self->force_i_frame_streams_.insert(channel_name);
++          LOG_ERROR("Failed to force I frame for stream [{}]", channel_name);
++        } else {
++          LOG_DEBUG("Force I frame for stream [{}]", channel_name);
+         }
+-        context->codec->Encode(
+-            std::move(frame),
+-            [weak_self, weak_context, channel_name, queue_delay_ms,
+-             settings_generation, is_first_callback = true](
+-                const EncodedFrame& encoded_frame) mutable -> int {
+-              auto self = weak_self.lock();
+-              auto context = weak_context.lock();
+-              if (!self || !context || !self->is_running_.load()) {
+-                return -1;
+-              }
+-
+-              {
+-                std::shared_lock lock(self->stream_senders_mutex_);
+-                if (context->video_settings_generation != settings_generation)
+-                  return 0;
+-              }
+-              const bool measure_encode_delay = is_first_callback;
+-              is_first_callback = false;
+-              return self->OnVideoEncoded(
+-                  channel_name, context, static_cast<int>(queue_delay_ms),
+-                  measure_encode_delay, encoded_frame, settings_generation);
+-            });
+-      });
+-    };
++      }
++      context->codec->Encode(
++          std::move(frame),
++          [weak_self, weak_context, channel_name, queue_delay_ms,
++           settings_generation, is_first_callback = true](
++              const EncodedFrame& encoded_frame) mutable -> int {
++            auto self = weak_self.lock();
++            auto context = weak_context.lock();
++            if (!self || !context || !self->is_running_.load()) {
++              return -1;
++            }
+
+-    post_encode(std::move(raw_frame));
++            {
++              std::shared_lock lock(self->stream_senders_mutex_);
++              if (context->video_settings_generation != settings_generation)
++                return 0;
++            }
++            const bool measure_encode_delay = is_first_callback;
++            is_first_callback = false;
++            return self->OnVideoEncoded(
++                channel_name, context, static_cast<int>(queue_delay_ms),
++                measure_encode_delay, encoded_frame, settings_generation);
++          });
++    });
+   }
+
+   return 0;
+@@ -2760,6 +2784,10 @@ int IceTransportController::SetVideoSendPaused(bool paused) {
+     // Invalidate queued raw frames and late asynchronous encoder callbacks,
+     // even if they finish after a quick pause/resume cycle.
+     ++context->video_settings_generation;
++    if (paused && context->pending_native_frame) {
++      context->pending_native_frame->frame = RawFrame{};
++      context->pending_native_frame.reset();
++    }
+     if (!paused) {
+       context->ResetEncodedFrameRateTracking();
+       context->ResetEncoderQualityTracking();
+@@ -2797,6 +2825,9 @@ int IceTransportController::UpdateVideoResolution(int width, int height) {
+     // resets adaptation with the new bound and produces a fresh keyframe.
+     if (changed) {
+       ++context->video_settings_generation;
++      if (context->pending_native_frame) {
++        context->pending_native_frame->frame = RawFrame{};
++      }
+       context->source_width = context->source_height = 0;
+       context->target_width.reset();
+       context->target_height.reset();
+@@ -2881,6 +2912,10 @@ int IceTransportController::UpdateVideoSettings(
+       retired_encoders.push_back(std::move(context->codec));
+       context->codec = std::move(codec);
+       ++context->video_settings_generation;
++      if (context->pending_native_frame) {
++        context->pending_native_frame->frame = RawFrame{};
++        context->pending_native_frame.reset();
++      }
+       context->encoding_speed_priority_enabled =
+           preference == VideoDegradationPreference::MaintainFrameRate &&
+           context->codec->SupportsDynamicEncodingSpeedPriority() &&
+diff --git a/src/transport/ice_transport_controller.h b/src/transport/ice_transport_controller.h
+index b6a1b25..6443d64 100644
+--- a/src/transport/ice_transport_controller.h
++++ b/src/transport/ice_transport_controller.h
+@@ -263,6 +263,16 @@ class IceTransportController
+     };
+     std::optional<KeyframeResolutionRecovery> keyframe_resolution_recovery;
+     uint64_t video_settings_generation = 0;
++    struct VideoEncodeJob {
++      RawFrame frame;
++      bool force_i_frame;
++      int target_width;
++      int target_height;
++      uint64_t settings_generation;
++      int64_t queued_at_ms;
++    };
++    // Accessed under stream_senders_mutex_ until consumed by the encode task.
++    std::shared_ptr<VideoEncodeJob> pending_native_frame;
+     bool initial_resolution_recovery = true;
+     bool native_resolution_probe_attempted = false;
+     int encode_exceed_count = 0;

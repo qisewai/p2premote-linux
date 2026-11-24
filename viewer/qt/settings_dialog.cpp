@@ -252,7 +252,7 @@ QWidget* SettingsDialog::buildStreamAudioPage() {
     vform->addRow(QStringLiteral("默认分辨率"), quality_combo_);
 
     bitrate_combo_ = new QComboBox(video_card);
-    bitrate_combo_->addItem(QStringLiteral("省流 · 4 Mbps"), 0);
+    bitrate_combo_->addItem(QStringLiteral("省流 · 2 Mbps"), 0);
     bitrate_combo_->addItem(QStringLiteral("自动 · 8 Mbps"), 1);
     bitrate_combo_->addItem(QStringLiteral("清晰 · 16 Mbps"), 2);
     vform->addRow(QStringLiteral("默认画质码率"), bitrate_combo_);

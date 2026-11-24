@@ -3,8 +3,10 @@
 #include "qpc.h"
 
 #include <winrt/Windows.Data.Json.h>
+#include <d3d11_4.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -20,9 +22,15 @@ using namespace winrt::Windows::Data::Json;
 namespace {
 using Clock = std::chrono::steady_clock;
 
-void Relay(StreamEvents& events, MiniRtcCall& target, const wchar_t* sender, bool& connected) {
+struct PeerState {
+    bool connected{};
+    RtcCounters stats;
+};
+
+void Relay(StreamEvents& events, MiniRtcCall& target, const wchar_t* sender, PeerState& peer) {
     for (const auto& event : events.Drain()) {
-        if (event.type == StreamEventType::connected) connected = true;
+        if (event.type == StreamEventType::connected) peer.connected = true;
+        if (event.type == StreamEventType::stats) peer.stats = event.counters;
         if (event.type == StreamEventType::media_lost || event.type == StreamEventType::error)
             throw std::runtime_error("MiniRTC loopback connection failed");
         if (event.type != StreamEventType::minirtc_signal || !MiniRtcCall::IsSessionSignal(event.payload)) continue;
@@ -97,7 +105,8 @@ bool Matches(const DecodedFrame& frame, int expected) {
     return y && std::abs(y[(frame.height / 8) * stride + frame.width / 8] - expected) < 20;
 }
 
-int CheckContinuous(ID3D11Device* device, MiniRtcCall& host, MiniRtcCall& viewer, const std::function<void()>& pump) {
+int CheckContinuous(ID3D11Device* device, MiniRtcCall& host, MiniRtcCall& viewer, const std::function<void()>& pump,
+    const PeerState& host_state, const PeerState& viewer_state) {
     const auto frames = ScrollingPage(device);
     if (!host.SetVideoBitrate(8'000'000)) throw std::runtime_error("Cannot set test bitrate");
     winrt::handle timer{CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)};
@@ -107,12 +116,23 @@ int CheckContinuous(ID3D11Device* device, MiniRtcCall& host, MiniRtcCall& viewer
     const auto start = QpcNow(), hz = QpcFrequency();
     const auto begin = start + hz, end = begin + 8 * hz;
     auto next = start, last_send = start, last_decode = begin;
+    auto next_stats = begin;
+    std::vector<std::uint32_t> sent_bps, received_bps;
     size_t sent = 0, decoded = 0, phase = 0;
     double worst_send = 0, worst_decode = 0;
     while (QpcNow() < end) {
         winrt::check_bool(WaitForSingleObject(timer.get(), 100) == WAIT_OBJECT_0);
         pump();
         const auto now = QpcNow();
+        if (now >= next_stats) {
+            if (host_state.stats.upload_bps.value_or(0) && viewer_state.stats.download_bps.value_or(0)) {
+                sent_bps.push_back(*host_state.stats.upload_bps);
+                received_bps.push_back(*viewer_state.stats.download_bps);
+            }
+            host.RequestStats();
+            viewer.RequestStats();
+            next_stats += hz;
+        }
         if (now >= next) {
             host.Submit(frames[phase++ % frames.size()]);
             if (now >= begin) {
@@ -136,10 +156,59 @@ int CheckContinuous(ID3D11Device* device, MiniRtcCall& host, MiniRtcCall& viewer
     std::printf("scroll sent=%zu decoded=%zu max_submit_gap_ms=%.2f max_update_gap_ms=%.2f\n",
         sent, decoded, worst_send, worst_decode);
     if (worst_send >= 50 || sent < 450) throw std::runtime_error("Timing inconclusive: sender missed its cadence");
+    if (sent_bps.size() < 4) throw std::runtime_error("Not enough paired RTP bitrate samples");
+    std::ranges::sort(sent_bps);
+    std::ranges::sort(received_bps);
+    const auto tx = sent_bps[sent_bps.size() / 2];
+    const auto rx = received_bps[received_bps.size() / 2];
+    std::printf("RTP bitrate: host_tx_bps=%u viewer_rx_bps=%u\n", tx, rx);
+    // Statistics windows start independently on the two peers.
+    if (rx < tx * 0.75 || rx > tx * 1.25) throw std::runtime_error("Loopback RTP byte counts do not agree");
     return decoded >= 440 && worst_decode < 100 ? 0 : 1;
 }
 
-int Run(bool continuous) {
+int CheckEncoderBacklog(ID3D11Device* device, MiniRtcCall& host, MiniRtcCall& viewer,
+    const std::function<void()>& pump) {
+    const auto still = MakeFrame(device, 32);
+    const std::array updates{MakeFrame(device, 72), MakeFrame(device, 110), MakeFrame(device, 150), MakeFrame(device, 220)};
+    const auto warmup = Clock::now() + 2s;
+    while (true) {
+        host.Submit(still);
+        std::this_thread::sleep_for(25ms);
+        pump();
+        if (const auto frame = viewer.TakeFrame(); frame && Matches(*frame, 32)) break;
+        if (Clock::now() >= warmup) throw std::runtime_error("Encoder backlog warmup failed");
+    }
+
+    // Stall GPU access briefly while the capture path submits more recent textures.
+    winrt::com_ptr<ID3D11Multithread> multithread;
+    winrt::check_hresult(device->QueryInterface(__uuidof(ID3D11Multithread), multithread.put_void()));
+    {
+        struct GpuHold {
+            ID3D11Multithread& context;
+            explicit GpuHold(ID3D11Multithread& context) : context(context) { context.Enter(); }
+            ~GpuHold() { context.Leave(); }
+        } hold{*multithread.get()};
+        for (const auto& frame : updates) {
+            std::this_thread::sleep_for(21ms);
+            host.Submit(frame);
+        }
+    }
+
+    const auto released = Clock::now();
+    do {
+        pump();
+        if (const auto frame = viewer.TakeFrame(); frame && Matches(*frame, 220)) {
+            std::printf("Newest drag frame after GPU stall: %.2f ms\n",
+                std::chrono::duration<double, std::milli>(Clock::now() - released).count());
+            return 0;
+        }
+        std::this_thread::sleep_for(1ms);
+    } while (Clock::now() - released < 500ms);
+    throw std::runtime_error("Timed out waiting for the newest frame after GPU stall");
+}
+
+int Run(std::string_view mode) {
     winrt::com_ptr<ID3D11Device> device;
     try {
         device = CreateD3d11Device(true);
@@ -154,19 +223,20 @@ int Run(bool continuous) {
     options.ice_trace_dir = std::filesystem::temp_directory_path() / L"P2PRemote" / L"idle-scroll-test";
     MiniRtcCall host(true, host_events, options, false, 60, device.get());
     MiniRtcCall viewer(false, viewer_events, options, false, 60, device.get());
-    bool host_ready{}, viewer_ready{};
+    PeerState host_state, viewer_state;
     const auto pump = [&] {
-        Relay(*host_events, viewer, L"host", host_ready);
-        Relay(*viewer_events, host, L"viewer", viewer_ready);
+        Relay(*host_events, viewer, L"host", host_state);
+        Relay(*viewer_events, host, L"viewer", viewer_state);
     };
     const auto deadline = Clock::now() + 12s;
-    while (!host_ready || !viewer_ready) {
+    while (!host_state.connected || !viewer_state.connected) {
         pump();
         if (Clock::now() >= deadline) throw std::runtime_error("Timed out connecting local peers");
         std::this_thread::sleep_for(1ms);
     }
 
-    if (continuous) return CheckContinuous(device.get(), host, viewer, pump);
+    if (mode == "--continuous") return CheckContinuous(device.get(), host, viewer, pump, host_state, viewer_state);
+    if (mode == "--encoder-backlog") return CheckEncoderBacklog(device.get(), host, viewer, pump);
     const auto still = MakeFrame(device.get(), 32);
     const auto scroll = MakeFrame(device.get(), 220);
     int misses = 0, mistimed = 0;
@@ -216,10 +286,12 @@ int Run(bool continuous) {
 
 int main(int argc, char** argv) {
     try {
-        const bool continuous = argc == 2 && std::string_view(argv[1]) == "--continuous";
-        if (argc != 1 && !continuous) throw std::runtime_error("Usage: idle_scroll_test [--continuous]");
+        const std::string_view mode = argc == 2 ? argv[1] : "";
+        if (argc != 1 && mode != "--continuous" && mode != "--encoder-backlog") {
+            throw std::runtime_error("Usage: idle_scroll_test [--continuous | --encoder-backlog]");
+        }
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        return Run(continuous);
+        return Run(mode);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "Idle scroll test failed: %s\n", error.what());
         return 1;

@@ -136,7 +136,10 @@ target_link_libraries(idle_scroll_test PRIVATE core windowsapp)
 target_compile_options(idle_scroll_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
 add_dependencies(idle_scroll_test p2premote_minirtc_runtime)
 add_test(NAME idle_scroll_test COMMAND idle_scroll_test)
-set_tests_properties(idle_scroll_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 60 SKIP_RETURN_CODE 77)
+add_test(NAME continuous_scroll_test COMMAND idle_scroll_test --continuous)
+add_test(NAME encoder_backlog_test COMMAND idle_scroll_test --encoder-backlog)
+set_tests_properties(idle_scroll_test continuous_scroll_test encoder_backlog_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 60
+    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
 add_executable(dxgi_cursor_check_test core/src/dxgi_cursor_check_test.cpp)
 target_compile_features(dxgi_cursor_check_test PRIVATE cxx_std_20)

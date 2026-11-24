@@ -286,7 +286,7 @@ struct ActiveStream {
     VideoBitratePreset plugin_bitrate{VideoBitratePreset::automatic};
     std::wstring plugin_notice;
     ULONGLONG plugin_notice_until{};
-    std::optional<std::pair<StreamQuality, VideoBitratePreset>> rejected_video_settings;
+    std::optional<std::pair<StreamQuality, std::uint32_t>> settled_video_settings;
     StreamInputMode input_mode{};
     bool input_ready{};
     bool cursor_requested{};
@@ -599,13 +599,13 @@ void StreamSession::Approve(StreamInputMode input) {
 
 void StreamSession::SetQuality(StreamQuality quality) {
     impl_->requested_quality = quality;
-    if (impl_->active) impl_->active->rejected_video_settings.reset();
+    if (impl_->active) impl_->active->settled_video_settings.reset();
     UpdateVideoSettings();
 }
 
 void StreamSession::SetVideoBitratePreset(VideoBitratePreset preset) {
     impl_->requested_bitrate = preset;
-    if (impl_->active) impl_->active->rejected_video_settings.reset();
+    if (impl_->active) impl_->active->settled_video_settings.reset();
     UpdateVideoSettings();
 }
 
@@ -659,10 +659,10 @@ void StreamSession::UpdateVideoSettings() {
     if (impl_->host || impl_->state != StreamState::streaming) return;
     auto& active = *impl_->active;
     if (active.transport_close_deadline) return;
-    auto& stats = impl_->stats;
     const auto now = GetTickCount64();
     const auto resolution = impl_->requested_quality;
     const auto preset = impl_->requested_bitrate == VideoBitratePreset::automatic ? active.plugin_bitrate : impl_->requested_bitrate;
+    const auto bitrate = VideoBitrateLimit(preset);
 
     if (active.video_request) {
         auto& request = *active.video_request;
@@ -672,16 +672,15 @@ void StreamSession::UpdateVideoSettings() {
             }
             return;
         }
-        active.rejected_video_settings = std::pair{static_cast<StreamQuality>(request.packet.code),
-            static_cast<VideoBitratePreset>(request.packet.x)};
+        active.settled_video_settings = std::pair{static_cast<StreamQuality>(request.packet.code),
+            VideoSettingsBitrate(request.packet)};
         active.video_request.reset();
         impl_->detail = L"画质设置未获确认";
     }
-    if ((active.quality == resolution && stats.video_bitrate_limit_bps == VideoBitrateLimit(preset))
-            || active.rejected_video_settings == std::pair{resolution, preset}) return;
+    if (active.settled_video_settings == std::pair{resolution, bitrate}) return;
 
-    const InputPacket request{InputKind::set_video_settings, static_cast<std::uint16_t>(resolution),
-        static_cast<std::uint16_t>(preset), 0, ++active.outgoing_input_sequence, now};
+    const auto request = VideoSettingsPacket(InputKind::set_video_settings, resolution, bitrate,
+        ++active.outgoing_input_sequence, now);
     if (active.rtc->SendVideoSettings(request)) {
         active.video_request = ActiveStream::VideoRequest{request, now + video_settings_timeout_ms};
     }
@@ -943,25 +942,24 @@ void StreamSession::ProcessEvents() {
             if (impl_->state != StreamState::streaming || active.transport_close_deadline) break;
             const auto& settings = event.input;
             const auto resolution = static_cast<StreamQuality>(settings.code);
-            const auto preset = static_cast<VideoBitratePreset>(settings.x);
+            const auto bitrate = VideoSettingsBitrate(settings);
             if (impl_->host) {
                 if (settings.kind != InputKind::set_video_settings) break;
-                auto reply = settings;
-                reply.kind = InputKind::video_settings_reply;
-                reply.y = impl_->ApplyVideoSettings(active, resolution, VideoBitrateLimit(preset)) ? 0 : 1;
-                active.rtc->SendVideoSettings(reply);
+                const auto applied = impl_->ApplyVideoSettings(active, resolution, static_cast<int>(bitrate))
+                    ? impl_->stats.video_bitrate_limit_bps.value_or(0) : 0;
+                active.rtc->SendVideoSettings(VideoSettingsPacket(InputKind::video_settings_reply, resolution,
+                    static_cast<std::uint32_t>(applied), settings.sequence, settings.sent_ms));
             } else {
                 if (settings.kind != InputKind::video_settings_reply || !active.video_request) break;
                 const auto& request = active.video_request->packet;
-                if (settings.sequence != request.sequence || settings.code != request.code || settings.x != request.x) break;
+                if (settings.sequence != request.sequence || settings.code != request.code) break;
+                active.settled_video_settings = std::pair{resolution, VideoSettingsBitrate(request)};
                 active.video_request.reset();
-                if (!settings.y) {
+                if (bitrate) {
                     active.quality = resolution;
-                    impl_->stats.video_bitrate_limit_bps = VideoBitrateLimit(preset);
-                    active.rejected_video_settings.reset();
+                    impl_->stats.video_bitrate_limit_bps = static_cast<int>(bitrate);
                     impl_->detail = L"正在接收视频";
                 } else {
-                    active.rejected_video_settings = std::pair{resolution, preset};
                     impl_->detail = L"画质设置未生效";
                 }
             }
@@ -1100,7 +1098,7 @@ void StreamSession::ProcessPluginActions() {
         case PluginAction::Kind::bitrate:
             if (active.plugin_bitrate != action.bitrate) {
                 active.plugin_bitrate = action.bitrate;
-                if (impl_->requested_bitrate == VideoBitratePreset::automatic) active.rejected_video_settings.reset();
+                if (impl_->requested_bitrate == VideoBitratePreset::automatic) active.settled_video_settings.reset();
             }
             break;
         }
@@ -1192,7 +1190,7 @@ void StreamSession::Capture() {
         return;
     }
     if (active.dxgi_capture && active.capture_interval && active.next_capture) {
-        const auto tolerance = active.capture_interval / 8;
+        const auto tolerance = active.capture_interval / 5;
         if (QpcNow() + tolerance < active.next_capture) return;
     }
     // A recovered DXGI source already has a verified frame from the parallel probe.
@@ -1223,12 +1221,16 @@ void StreamSession::Capture() {
     const auto stamp = (!active.dxgi_capture && frame->metadata.source_qpc)
         ? frame->metadata.source_qpc : frame->metadata.capture_qpc;
     if (const auto interval = active.capture_interval) {
-        const auto tolerance = interval / 8;
-        if (stamp + tolerance < active.next_capture) return;
-        if (!active.next_capture || stamp - active.next_capture > interval || stamp <= active.next_capture + tolerance) {
-            active.next_capture = stamp;
+        const auto tolerance = interval / 5;
+        if (!active.dxgi_capture && stamp + tolerance < active.next_capture) return;
+        if (!active.next_capture || stamp >= active.next_capture + interval) {
+            const auto anchor = (frame->metadata.source_qpc && stamp >= frame->metadata.source_qpc
+                && stamp - frame->metadata.source_qpc <= interval / 2)
+                ? frame->metadata.source_qpc : stamp;
+            active.next_capture = anchor + interval;
+        } else {
+            active.next_capture = std::max(active.next_capture + interval, stamp + interval / 2);
         }
-        active.next_capture += interval;
     }
     if (!active.ShouldSubmit(*frame)) return;
 

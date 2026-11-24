@@ -14,7 +14,7 @@ int main() {
         return passed;
     };
 
-    const InputBytes wire{1, 5, 0x4d, 0x01, 0xff, 0xff, 0x34, 0x12,
+    const InputBytes wire{3, 5, 0x4d, 0x01, 0xff, 0xff, 0x34, 0x12,
         0x78, 0x56, 0x34, 0x12, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01};
     const auto packet = DecodeInput(wire);
     bool passed = check(packet && packet->kind == InputKind::key_down && packet->code == 0x14d
@@ -24,27 +24,34 @@ int main() {
     passed &= check(!DecodeInput(std::span(wire).first(19)), "Accepted a truncated packet");
 
     auto invalid = wire;
-    invalid[0] = 2;
-    passed &= check(!DecodeInput(invalid), "Accepted an unsupported version");
+    invalid[0] = 1;
+    passed &= check(!DecodeInput(invalid), "Accepted input from the previous protocol");
     passed &= check(!DecodeInput(EncodeInput({static_cast<InputKind>(255), 0, 0, 0, 1, 1})), "Accepted an unknown event");
     passed &= check(!DecodeInput(EncodeInput({InputKind::button_down, 4, 0, 0, 1, 1})), "Accepted an unsupported button");
     passed &= check(!DecodeInput(EncodeInput({InputKind::key_up, 512, 0, 0, 1, 1})), "Accepted an invalid scan code");
     passed &= check(!DecodeInput(EncodeInput({InputKind::move, 0, 0, 0, 0, 1})), "Accepted sequence number zero");
     passed &= check(DecodeInput(EncodeInput({InputKind::wheel, 0xff88, 0, 0, 1, 1})).has_value(), "Rejected negative wheel delta");
-    passed &= check(DecodeInput(EncodeInput({InputKind::text, u'字', 0, 0, 1, 1})).has_value(), "Rejected UTF-16 character");
-    const auto hd = static_cast<std::uint16_t>(p2premote::StreamQuality::p1080);
-    const auto economy = static_cast<std::uint16_t>(p2premote::VideoBitratePreset::economy);
-    const auto request = DecodeInput(EncodeInput({InputKind::set_video_settings, hd, economy, 0, 27, 50}));
-    passed &= check(request && request->kind == InputKind::set_video_settings && request->code == hd
-        && request->x == economy && request->y == 0 && request->sequence == 27,
-        "Could not request 1080p at the economy bitrate independently");
-    const auto reply = DecodeInput(EncodeInput({InputKind::video_settings_reply, hd, economy, 1, 27, 50}));
-    passed &= check(reply && reply->kind == InputKind::video_settings_reply && reply->sequence == 27 && reply->y == 1,
-        "Could not decode a correlated video settings rejection");
-    passed &= check(!DecodeInput(EncodeInput({InputKind::set_video_settings, 0xffff, economy, 0, 27, 50}))
-        && !DecodeInput(EncodeInput({InputKind::set_video_settings, hd, 0, 0, 27, 50}))
-        && !DecodeInput(EncodeInput({InputKind::set_video_settings, hd, economy, 1, 27, 50}))
-        && !DecodeInput(EncodeInput({InputKind::video_settings_reply, hd, economy, 2, 27, 50})),
+    using namespace p2premote;
+    constexpr auto hd = StreamQuality::p1080;
+    const auto encode_settings = [](InputKind kind, StreamQuality resolution, std::uint32_t bps) {
+        return EncodeInput(VideoSettingsPacket(kind, resolution, bps, 27, 50));
+    };
+    auto request_bytes = encode_settings(InputKind::set_video_settings, hd, 16'000'000);
+    const auto request = DecodeInput(request_bytes);
+    passed &= check(request && request->kind == InputKind::set_video_settings
+        && request->code == static_cast<std::uint16_t>(hd) && request->sequence == 27
+        && VideoSettingsBitrate(*request) == 16'000'000, "Could not decode the exact requested bitrate");
+    request_bytes[0] = 1;
+    passed &= check(!DecodeInput(request_bytes), "Accepted a video request from the previous protocol");
+    const auto reply = DecodeInput(encode_settings(InputKind::video_settings_reply, hd, 7'850'000));
+    passed &= check(reply && reply->kind == InputKind::video_settings_reply && reply->sequence == 27
+        && VideoSettingsBitrate(*reply) == 7'850'000, "Could not decode the independent applied bitrate");
+    const auto rejected = DecodeInput(encode_settings(InputKind::video_settings_reply, hd, 0));
+    passed &= check(rejected && VideoSettingsBitrate(*rejected) == 0, "Could not decode a video settings rejection");
+    passed &= check(!DecodeInput(encode_settings(InputKind::set_video_settings, static_cast<StreamQuality>(0xffff), 2'000'000))
+        && !DecodeInput(encode_settings(InputKind::set_video_settings, hd, 0))
+        && !DecodeInput(encode_settings(InputKind::set_video_settings, hd, 1'999'999))
+        && !DecodeInput(encode_settings(InputKind::video_settings_reply, hd, 16'000'001)),
         "Accepted malformed video settings");
     const std::uint16_t audio_flags = p2premote::audio_flag_speaker | p2premote::audio_flag_mic;
     const auto audio_req = DecodeInput(EncodeInput({InputKind::set_audio_settings, audio_flags, 0, 0, 28, 55}));
@@ -70,12 +77,14 @@ int main() {
     const auto stale_button = input.Accept({InputKind::button_up, 1, 1, 1, 4, 70}, 2300);
     passed &= check(stale_button && stale_button->kind == InputKind::reset, "Stale button release did not clear held input");
 
-    using namespace p2premote;
     const InputCommand chord{InputCommandKind::shortcut, {0xa2, 0xa0, 0x1b}, 73};
     const auto chord_bytes = EncodeInputCommand(chord);
     const auto decoded_chord = DecodeInputCommand(chord_bytes);
     passed &= check(decoded_chord && decoded_chord->kind == chord.kind && decoded_chord->units == chord.units
-        && decoded_chord->sent_ms == 73 && !DecodeInput(chord_bytes), "Keyboard chord lost order or fell through to old input");
+        && decoded_chord->sent_ms == 73 && !DecodeInput(chord_bytes), "Keyboard chord lost order or decoded as a fixed input packet");
+    auto old_chord = chord_bytes;
+    old_chord[0] = 2;
+    passed &= check(!DecodeInputCommand(old_chord), "Accepted a keyboard command from the previous protocol");
     passed &= check(!DecodeInputCommand(std::span(chord_bytes).first(chord_bytes.size() - 1))
         && EncodeInputCommand({InputCommandKind::shortcut, {0x1d, 0x1d}, 0}).empty()
         && EncodeInputCommand({InputCommandKind::shortcut, {512}, 0}).empty(), "Accepted an invalid key sequence");

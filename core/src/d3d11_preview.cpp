@@ -4,6 +4,7 @@
 
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
+#include <dxgi1_5.h>
 
 #include <algorithm>
 #include <utility>
@@ -116,22 +117,32 @@ D3d11Preview::D3d11Preview(HWND window, winrt::com_ptr<ID3D11Device> device)
     winrt::check_hresult(adapter->GetParent(__uuidof(IDXGIFactory2), factory.put_void()));
 
     const auto [width, height] = ClientSize(window_);
+    if (const auto factory5 = factory.try_as<IDXGIFactory5>()) {
+        BOOL supported = FALSE;
+        if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &supported, sizeof(supported)))) {
+            allow_tearing_ = supported != FALSE;
+        }
+    }
+    swap_flags_ = swap_flags | (allow_tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = width;
     desc.Height = height;
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount = 2;
+    // Allow mailbox replacement before VSync so a newly decoded frame can be
+    // submitted immediately instead of waiting a full refresh on the 1-credit
+    // waitable semaphore.
+    desc.BufferCount = 3;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    desc.Flags = swap_flags;
+    desc.Flags = swap_flags_;
 
     winrt::com_ptr<IDXGISwapChain1> swap_chain;
     winrt::check_hresult(factory->CreateSwapChainForHwnd(device_.get(), window_, &desc,
         nullptr, nullptr, swap_chain.put()));
     winrt::check_hresult(factory->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER));
     swap_chain_ = swap_chain.as<IDXGISwapChain2>();
-    winrt::check_hresult(swap_chain_->SetMaximumFrameLatency(1));
+    winrt::check_hresult(swap_chain_->SetMaximumFrameLatency(2));
     present_event_.attach(swap_chain_->GetFrameLatencyWaitableObject());
     if (!present_event_) {
         throw winrt::hresult_error(E_FAIL, L"无法获取 DXGI 帧等待对象。");
@@ -179,7 +190,7 @@ void D3d11Preview::ResizeToWindow() {
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     target_ = nullptr;
     back_buffer_ = nullptr;
-    winrt::check_hresult(swap_chain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, swap_flags));
+    winrt::check_hresult(swap_chain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, swap_flags_));
     target_width_ = width;
     target_height_ = height;
     CreateTarget();
@@ -339,7 +350,8 @@ void D3d11Preview::Draw(bool enhance_text) {
 }
 
 bool D3d11Preview::Present(unsigned sync_interval) {
-    const auto result = swap_chain_->Present(sync_interval, 0);
+    const UINT flags = (sync_interval == 0 && allow_tearing_) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    const auto result = swap_chain_->Present(sync_interval, flags);
     winrt::check_hresult(result);
     return result != DXGI_STATUS_OCCLUDED;
 }

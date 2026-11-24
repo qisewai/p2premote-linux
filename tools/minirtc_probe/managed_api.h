@@ -21,7 +21,7 @@ struct Api {
     decltype(&UpdateVideoBitrateLimit) set_bitrate;
 };
 
-inline constexpr unsigned abi_version = 4;
+inline constexpr unsigned abi_version = 5;
 using GetApi = const Api* (*)(unsigned);
 
 } // namespace p2premote::native_minirtc

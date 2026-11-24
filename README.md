@@ -16,7 +16,7 @@
 
 主控工具栏的「插件」菜单提供快捷键、输入文本模板、键盘状态同步和智能画质。键盘同步与智能画质首次使用时默认关闭，开关会在下次连接时恢复。智能画质只在「自动」画质下切换码率，分辨率独立设置。可在主控的 `%LOCALAPPDATA%\P2PRemote\plugin-config\shortcut-macros.viewer.json` 中设置文本模板，例如 `{"template":"您好，已收到。"}`。快捷输入和键盘同步需两端更新客户端。
 
-远控窗口顶部可分别选择 720p、1080p 或 1440p 的传输分辨率，以及省流、自动或清晰画质。默认使用 1080p、自动。三个画质档分别将视频码率上限设为 4、8、16 Mbps，实际码率随网络和画面变化调整。传输尺寸受被控屏幕大小约束。状态区显示实际收到的尺寸、带宽及被控端确认的码率上限。与旧客户端连接时，窗口会显示兼容的分辨率和码率组合档。
+远控窗口顶部可分别选择 720p、1080p 或 1440p 的传输分辨率，以及省流、自动或清晰画质。默认使用 1080p、自动。三个画质档的视频码率预算上限分别为 2、8、16 Mbps，画面菜单显示被控端确认的值。浮层显示解码分辨率和 RTP 收发带宽，包含音频、数据、重传、填充和 SRTP 开销。会话两端都需要支持当前控制协议。
 
 选择 720p 时，MiniRTC 主控端对收到的画面做轻量亮度边缘增强，让放大的文字更易辨认。源桌面缩小时损失的细节取决于原始字号和画面尺寸。
 
@@ -191,7 +191,7 @@ Viewer 的连接状态面板显示实际选中的 ICE 路径和 UDP/TCP 协议�
 
 已建立的局域网直连遇到信令或视频中断时，Viewer 会在约 30 秒内自动重试，Host 也会恢复监听。在 Host 使用确认模式时，重连仍需要确认。任一端主动结束会话、明确拒绝请求，或 Viewer 在重连期间点击「断开」，都会结束本轮重连。恢复后重新点击画面接管键鼠。测试自动重连时使用同一版本的 Host、Viewer 和信令程序。
 
-新版 Host 和 Viewer 在局域网整桌面控制中会协商本地光标。Host 单独传输指针形状和热点，Viewer 接管后在鼠标当前位置显示。旧版对端或无法关闭光标采集的 Windows 仍可使用画面里的光标。
+Host 和 Viewer 在局域网整桌面控制中会协商本地光标。Host 单独传输指针形状和热点，Viewer 接管后在鼠标当前位置显示。Windows 采集源无法分离指针时，指针随视频显示。
 
 用 `Start-Viewer-SyncedCursor.cmd` 或给局域网 Viewer 加 `--video-cursor`，可以对照画面同步光标。Windows 将 Host 光标与桌面合到同一条视频流里，拖拽时 Viewer 看到两者一起更新。这个模式下光标响应也受视频回显延迟影响。
 
@@ -228,7 +228,9 @@ ctest --test-dir out/build/windows-x64-qt -R '^idle_scroll_test$' -V
 
 测试在 1080p、60 fps 下先确认接收端看到静止图，再等待一秒、补发旧帧，随后只提交一次带新标记的画面。补帧后 2 ms 和 250 ms 两组各跑 5 次。输出记录实际提交间隔和从提交到解码的毫秒数。500 ms 内未解码出新标记会输出 `MISS` 并返回非零退出码。把 `idle_scroll_test.exe` 复制到另一份解压的 Windows 发布包中运行，即可检验那一份 DLL。
 
-持续滚动的回归测试可运行 `out\build\windows-x64-qt\idle_scroll_test.exe --continuous`。它以 1080p、60 fps 和 8 Mbps 上限在本机传输滚动的文字与图像，预热后记录 8 秒。输出中的 `max_submit_gap_ms` 是发送端最长提交间隔，`max_update_gap_ms` 是主控端取得的相邻解码画面之间的最长间隔。该测试要求至少取得 440 帧且最长更新间隔小于 100 ms。若发送机自身未能按时提交，会单独报告计时无效。
+持续滚动的回归测试可运行 `out\build\windows-x64-qt\idle_scroll_test.exe --continuous`。它以 1080p、60 fps 和 8 Mbps 视频预算在本机传输滚动的文字与图像，预热后记录 8 秒。输出中的 `max_submit_gap_ms` 是发送端最长提交间隔，`max_update_gap_ms` 是主控端取得的相邻解码画面之间的最长间隔。该测试要求至少取得 440 帧且最长更新间隔小于 100 ms，同时比对两端的 RTP 码率统计。若发送机自身未能按时提交，会单独报告计时无效。
+
+运行 `idle_scroll_test.exe --encoder-backlog` 可检查编码积压时的拖动回显。测试短暂阻塞 GPU，同时提交多个位置不同的画面，释放 GPU 后验证主控能收到最后一个位置。
 
 ## 公网连接测试
 
@@ -329,7 +331,7 @@ cmake --preset windows-x64-webrtc -DP2PREMOTE_MINIRTC_DIR=out/minirtc
 cmake --build --preset windows-x64-webrtc-release --target p2premote
 ```
 
-账号服务使用当前 `signaling` 源码构建，沿用现有数据库、HTTPS 和 TURN 配置。服务端在同账号设备通过授权后协商媒体后端。带 MiniRTC 模块的两端会优先使用 MiniRTC，符合配置时同时尝试公网直连和 TURN 中继。旧客户端、旧服务和需要 TLS TURN 的配置继续使用 WebRTC。可用 `-stun-urls stun:103.236.93.69:23969` 指定西安 STUN。
+账号服务使用当前 `signaling` 源码构建，沿用现有数据库、HTTPS 和 TURN 配置。两端使用 MiniRTC 建立会话，符合配置时同时尝试公网直连和 TURN 中继。可用 `-stun-urls stun:103.236.93.69:23969` 指定西安 STUN。
 
 从设备列表发起连接后，状态区显示 `H264 (MiniRTC)` 和实际选中的路径。诊断模式 `--ice-trace <目录>` 会把 MiniRTC 的候选对和握手记录写到该目录的 `minirtc.log`。
 

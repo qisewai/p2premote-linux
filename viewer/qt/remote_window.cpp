@@ -137,6 +137,7 @@ public:
     bool canExport() const { return !active() && seconds_ > 0; }
     int qualityIndex() const { return quality_index_; }
     int bitrateIndex() const { return bitrate_index_; }
+    std::uint32_t confirmedBitrate() const { return confirmed_bitrate_; }
     bool speakerEnabled() const { return speaker_enabled_; }
     bool micEnabled() const { return mic_enabled_; }
     float speakerVolume() const { return speaker_volume_; }
@@ -292,6 +293,7 @@ private:
         seconds_ = snapshot.seconds;
         width_ = snapshot.width;
         height_ = snapshot.height;
+        confirmed_bitrate_ = snapshot.bitrate_limit_bps;
         has_plugin_menu_ = snapshot.has_plugin_menu != 0;
 
         if (dialogs_) {
@@ -319,6 +321,7 @@ private:
     bool has_plugin_menu_{};
     int quality_index_{1};
     int bitrate_index_{1};
+    std::uint32_t confirmed_bitrate_{};
     bool speaker_enabled_{true};
     bool mic_enabled_{false};
     float speaker_volume_{1.0f};
@@ -733,12 +736,14 @@ void RemoteWindow::showDisplayMenu() {
     }
 
     menu->addSeparator();
-    auto* br_header = menu->addAction(QStringLiteral("画质码率"));
+    auto* br_header = menu->addAction(session->playing() && session->confirmedBitrate()
+        ? QStringLiteral("画质码率 · 被控端上限 %1 Mbps").arg(session->confirmedBitrate() / 1'000'000.0, 0, 'g', 4)
+        : QStringLiteral("画质码率"));
     br_header->setEnabled(false);
     auto* br_group = new QActionGroup(menu);
     br_group->setExclusive(true);
     const QStringList bitrates = {
-        QStringLiteral("省流 · 4 Mbps"),
+        QStringLiteral("省流 · 2 Mbps"),
         QStringLiteral("自动 · 8 Mbps"),
         QStringLiteral("清晰 · 16 Mbps")
     };

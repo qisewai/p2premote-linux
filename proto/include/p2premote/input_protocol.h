@@ -9,7 +9,7 @@
 namespace p2premote {
 
 enum class InputKind : std::uint8_t {
-    move = 1, button_down, button_up, wheel, key_down, key_up, text, reset, heartbeat, cursor_ready,
+    move = 1, button_down, button_up, wheel, key_down, key_up, reset, heartbeat, cursor_ready,
     set_video_settings, video_settings_reply, set_audio_settings
 };
 
@@ -17,9 +17,9 @@ enum class InputButton : std::uint16_t { left = 1, right, middle };
 enum class StreamQuality : std::uint16_t { p720 = 1, p1080, p1440 };
 enum class VideoBitratePreset : std::uint16_t { economy = 1, automatic, detail };
 
-constexpr int VideoBitrateLimit(VideoBitratePreset preset) noexcept {
+constexpr std::uint32_t VideoBitrateLimit(VideoBitratePreset preset) noexcept {
     switch (preset) {
-    case VideoBitratePreset::economy: return 4'000'000;
+    case VideoBitratePreset::economy: return 2'000'000;
     case VideoBitratePreset::detail: return 16'000'000;
     case VideoBitratePreset::automatic: return 8'000'000;
     }
@@ -47,8 +47,17 @@ struct InputPacket {
     std::uint64_t sent_ms{};
 };
 
-// Video settings use code for the resolution and x for the bitrate preset.
-// Replies echo the request sequence and settings, with y set to 1 on failure.
+// Video settings transmit the resolution in code and the exact limit in x/y.
+// A reply echoes the request sequence and uses a zero limit to reject the request.
+constexpr InputPacket VideoSettingsPacket(InputKind kind, StreamQuality resolution, std::uint32_t bitrate_bps,
+    std::uint32_t sequence, std::uint64_t sent_ms) noexcept {
+    return {kind, static_cast<std::uint16_t>(resolution), static_cast<std::uint16_t>(bitrate_bps),
+        static_cast<std::uint16_t>(bitrate_bps >> 16), sequence, sent_ms};
+}
+
+constexpr std::uint32_t VideoSettingsBitrate(const InputPacket& packet) noexcept {
+    return packet.x | (static_cast<std::uint32_t>(packet.y) << 16);
+}
 
 using InputBytes = std::array<std::uint8_t, 20>;
 

@@ -22,7 +22,7 @@ struct AppSettingsData {
 
     // Stream & Audio defaults
     int default_quality{1};        // 0=720p, 1=1080p, 2=1440p
-    int default_bitrate{1};        // 0=4M, 1=8M, 2=16M
+    int default_bitrate{1};        // 0=2M, 1=8M, 2=16M
     bool show_diagnostics{true};
     bool speaker_enabled{true};
     int speaker_volume{100};       // 25 | 50 | 75 | 100

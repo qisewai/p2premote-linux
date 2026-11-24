@@ -26,25 +26,31 @@ using namespace winrt::Windows::Data::Json;
 constexpr char video_name[] = "desktop";
 constexpr char desktop_audio_name[] = "desktop_audio";
 constexpr char mic_audio_name[] = "mic_audio";
-constexpr char controls_name[] = "control";
+constexpr char controls_name[] = "control-v3";
 constexpr char motion_name[] = "pointer";
 constexpr char cursor_name[] = "cursor";
 constexpr char plugin_name[] = "plugin";
 
-bool SupportsEncryptedPluginChannel(std::wstring_view sdp) noexcept {
-    bool data_srtp{}, fingerprint{}, plugin_track{};
+struct SdpChannels {
+    bool control{}, data_srtp{}, fingerprint{}, plugin{};
+};
+
+SdpChannels ReadSdpChannels(std::wstring_view sdp) noexcept {
+    SdpChannels channels;
     while (!sdp.empty()) {
         const auto end = sdp.find(L'\n');
         auto line = sdp.substr(0, end);
         if (line.ends_with(L'\r')) line.remove_suffix(1);
-        data_srtp |= line == L"a=x-minirtc-audio-data-srtp:1";
-        fingerprint |= line.starts_with(L"a=fingerprint:sha-256 ");
-        plugin_track |= line.starts_with(L"a=ssrc:") && line.ends_with(L" name:plugin");
+        channels.data_srtp |= line == L"a=x-minirtc-audio-data-srtp:1";
+        channels.fingerprint |= line.starts_with(L"a=fingerprint:sha-256 ");
+        if (line.starts_with(L"a=ssrc:")) {
+            channels.control |= line.ends_with(L" name:control-v3");
+            channels.plugin |= line.ends_with(L" name:plugin");
+        }
         if (end == std::wstring_view::npos) break;
         sdp.remove_prefix(end + 1);
     }
-    // MiniRTC validates the SDP and rejects data packets if SRTP is unavailable.
-    return data_srtp && fingerprint && plugin_track;
+    return channels;
 }
 
 std::optional<DecodedFrame> RetainNv12(const MiniRtcVideoFrame& frame, std::int64_t queued_qpc) {
@@ -188,7 +194,7 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
     bool allow_input, unsigned frame_rate, ID3D11Device* device, std::shared_ptr<PluginOverlays> overlays)
     : host_(host), allow_input_(allow_input), events_(std::move(events)), api_(NativeApi()), ice_(options.ice_servers) {
     device_.copy_from(device);
-    if (!api_) throw std::runtime_error("MiniRTC 模块不可用，请确认 p2premote_minirtc.dll 位于程序目录");
+    if (!api_) throw std::runtime_error("MiniRTC 模块缺失或版本不匹配，请更新程序目录中的 p2premote_minirtc.dll");
     if (!Available(options)) throw std::runtime_error("当前 MiniRTC 模块不支持 turns: 协议");
     Params params{};
     const auto dir = options.ice_trace_dir.empty() ?
@@ -297,10 +303,14 @@ bool MiniRtcCall::IsSessionSignal(const std::string& payload) {
 void MiniRtcCall::ReceiveSignal(const std::string& payload) {
     auto message = JsonObject::Parse(winrt::to_hstring(payload));
     const auto kind = message.GetNamedString(L"type");
-    if (plugins_ && (kind == L"offer" || kind == L"answer")) {
-        const bool supported = SupportsEncryptedPluginChannel(message.GetNamedString(L"sdp", L""));
-        plugin_transport_.store(supported);
-        if (!supported) SetPluginsConnected(false);
+    if (kind == L"offer" || kind == L"answer") {
+        const auto sdp = message.GetNamedString(L"sdp", L"");
+        const auto channels = ReadSdpChannels(sdp);
+        if (!channels.control || !channels.data_srtp || !channels.fingerprint) {
+            throw std::runtime_error("对端会话协议不匹配，请将主控端和被控端更新为同一版本");
+        }
+        plugin_transport_.store(channels.plugin);
+        if (!channels.plugin) SetPluginsConnected(false);
     }
     if (kind == L"offer" || kind == L"user_join_transmission") {
         message.SetNamedValue(L"ice", IceConfiguration(ice_));
@@ -367,21 +377,22 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
     const std::string_view label(source, source_size);
     if (label == controls_name || (self.host_ && label == motion_name)) {
         const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(data), size);
-        if (label == controls_name && self.host_ && self.allow_input_ && self.WorkspaceInputReady() && self.workspace_running_.load() &&
-                !bytes.empty() && bytes.front() != 1) {
-            try {
-                if (auto command = DecodeInputCommand(bytes)) {
-                    if (const auto& trace = self.events_->Trace()) {
-                        trace->Record("input_command_received", command->sent_ms,
-                            static_cast<std::uint64_t>(command->kind), command->units.size());
+        const auto input = DecodeInput(bytes);
+        if (!input) {
+            if (label == controls_name && self.host_ && self.allow_input_ && self.WorkspaceInputReady()
+                    && self.workspace_running_.load()) {
+                try {
+                    if (auto command = DecodeInputCommand(bytes)) {
+                        if (const auto& trace = self.events_->Trace()) {
+                            trace->Record("input_command_received", command->sent_ms,
+                                static_cast<std::uint64_t>(command->kind), command->units.size());
+                        }
+                        self.events_->PushInputCommand(std::move(*command));
                     }
-                    self.events_->PushInputCommand(std::move(*command));
-                }
-            } catch (...) {}
+                } catch (...) {}
+            }
             return;
         }
-        const auto input = DecodeInput(bytes);
-        if (!input) return;
         if (IsVideoSettingsMessage(input->kind)) {
             if (label == controls_name && input->kind == (self.host_ ? InputKind::set_video_settings : InputKind::video_settings_reply)) {
                 self.events_->Push({StreamEventType::video_settings, {}, {}, {}, *input});

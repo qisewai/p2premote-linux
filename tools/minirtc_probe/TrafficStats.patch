@@ -1,0 +1,285 @@
+diff --git a/src/transport/channel/audio_channel_receive.cpp b/src/transport/channel/audio_channel_receive.cpp
+index 8029260..f568a4a 100644
+--- a/src/transport/channel/audio_channel_receive.cpp
++++ b/src/transport/channel/audio_channel_receive.cpp
+@@ -47,7 +47,6 @@ void AudioChannelReceive::Initialize(rtp::PAYLOAD_TYPE payload_type) {
+       return -2;
+     }
+
+-    ice_io_statistics_->UpdateAudioOutboundBytes((uint32_t)size);
+     return ice_agent_->Send(data, size);
+   });
+ }
+@@ -55,10 +54,6 @@ void AudioChannelReceive::Initialize(rtp::PAYLOAD_TYPE payload_type) {
+ void AudioChannelReceive::Destroy() {}
+
+ int AudioChannelReceive::OnReceiveRtpPacket(const char* data, size_t size) {
+-  if (ice_io_statistics_) {
+-    ice_io_statistics_->UpdateAudioInboundBytes((uint32_t)size);
+-  }
+-
+   if (rtp_audio_receiver_) {
+     if (size < kFixedHeaderSize) {
+       LOG_ERROR("Received RTP packet is too small, size={}", size);
+diff --git a/src/transport/channel/data_channel_receive.cpp b/src/transport/channel/data_channel_receive.cpp
+index 06017ab..06f46c9 100644
+--- a/src/transport/channel/data_channel_receive.cpp
++++ b/src/transport/channel/data_channel_receive.cpp
+@@ -92,7 +92,6 @@ void DataChannelReceive::Initialize(rtp::PAYLOAD_TYPE payload_type) {
+       return -2;
+     }
+
+-    ice_io_statistics_->UpdateDataOutboundBytes((uint32_t)size);
+     return ice_agent_->Send(data, size);
+   });
+ }
+@@ -119,10 +118,6 @@ void DataChannelReceive::Destroy() {
+ }
+
+ int DataChannelReceive::OnReceiveRtpPacket(const char* data, size_t size) {
+-  if (ice_io_statistics_) {
+-    ice_io_statistics_->UpdateDataInboundBytes((uint32_t)size);
+-  }
+-
+   if (rtp_data_receiver_) {
+     RtpPacket rtp_packet;
+     rtp_packet.Build((uint8_t*)data, (uint32_t)size);
+diff --git a/src/transport/channel/rtp_audio_receiver.cpp b/src/transport/channel/rtp_audio_receiver.cpp
+index 30e67ca..6680d86 100644
+--- a/src/transport/channel/rtp_audio_receiver.cpp
++++ b/src/transport/channel/rtp_audio_receiver.cpp
+@@ -21,12 +21,10 @@ void RtpAudioReceiver::InsertRtpPacket(RtpPacket& rtp_packet) {
+         rtp_packet.Timestamp(), clock_->CurrentTimeUs()));
+   }
+
+-  last_recv_bytes_ = (uint32_t)rtp_packet.Size();
+   total_rtp_payload_recv_ += (uint32_t)rtp_packet.PayloadSize();
+   total_rtp_packets_recv_++;
+
+   if (io_statistics_) {
+-    io_statistics_->UpdateAudioInboundBytes(last_recv_bytes_);
+     io_statistics_->IncrementAudioInboundRtpPacketCount();
+     io_statistics_->UpdateAudioPacketLossCount(rtp_packet.SequenceNumber());
+   }
+diff --git a/src/transport/channel/rtp_audio_receiver.h b/src/transport/channel/rtp_audio_receiver.h
+index 62f89b4..866571d 100644
+--- a/src/transport/channel/rtp_audio_receiver.h
++++ b/src/transport/channel/rtp_audio_receiver.h
+@@ -55,7 +55,6 @@ class RtpAudioReceiver {
+   std::shared_ptr<SystemClock> clock_ = nullptr;
+   RtpTimestampMapper rtp_timestamp_mapper_{48'000};
+   std::atomic<int64_t> last_mapped_capture_time_us_{0};
+-  uint32_t last_recv_bytes_ = 0;
+   uint32_t total_rtp_payload_recv_ = 0;
+   uint32_t total_rtp_packets_recv_ = 0;
+   uint32_t last_send_rtcp_rr_packet_ts_ = 0;
+diff --git a/src/transport/channel/rtp_data_receiver.cpp b/src/transport/channel/rtp_data_receiver.cpp
+index 5d5c31a..8c4f196 100644
+--- a/src/transport/channel/rtp_data_receiver.cpp
++++ b/src/transport/channel/rtp_data_receiver.cpp
+@@ -12,12 +12,10 @@ RtpDataReceiver::RtpDataReceiver(std::shared_ptr<IOStatistics> io_statistics)
+ RtpDataReceiver::~RtpDataReceiver() {}
+
+ void RtpDataReceiver::InsertRtpPacket(RtpPacket& rtp_packet) {
+-  last_recv_bytes_ = (uint32_t)rtp_packet.Size();
+   total_rtp_payload_recv_ += (uint32_t)rtp_packet.PayloadSize();
+   total_rtp_packets_recv_++;
+
+   if (io_statistics_) {
+-    io_statistics_->UpdateDataInboundBytes(last_recv_bytes_);
+     io_statistics_->IncrementDataInboundRtpPacketCount();
+     io_statistics_->UpdateDataPacketLossCount(rtp_packet.SequenceNumber());
+   }
+diff --git a/src/transport/channel/rtp_data_receiver.h b/src/transport/channel/rtp_data_receiver.h
+index a2f21d6..68575fc 100644
+--- a/src/transport/channel/rtp_data_receiver.h
++++ b/src/transport/channel/rtp_data_receiver.h
+@@ -40,7 +40,6 @@ class RtpDataReceiver {
+
+  private:
+   std::shared_ptr<IOStatistics> io_statistics_ = nullptr;
+-  uint32_t last_recv_bytes_ = 0;
+   uint32_t total_rtp_payload_recv_ = 0;
+   uint32_t total_rtp_packets_recv_ = 0;
+
+diff --git a/src/transport/channel/rtp_video_receiver.cpp b/src/transport/channel/rtp_video_receiver.cpp
+index dedc291..5b62336 100644
+--- a/src/transport/channel/rtp_video_receiver.cpp
++++ b/src/transport/channel/rtp_video_receiver.cpp
+@@ -290,8 +290,6 @@ void RtpVideoReceiver::InsertRtpPacket(RtpPacket& packet) {
+       received.SetAbsoluteSendTimeExtensionId(abs_send_time_ext_id_);
+       receive_side_congestion_controller_.OnReceivedPacket(received,
+                                                            MediaType::VIDEO);
+-      if (repair && io_statistics_)
+-        io_statistics_->UpdateVideoInboundBytes(static_cast<uint32_t>(packet.Size()));
+     }
+   }
+   for (const auto& bytes : recovered) {
+@@ -369,11 +367,9 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+     // sequence tracker or create an unrepairable media NACK gap.
+     receive_side_congestion_controller_.OnReceivedPacket(
+         rtp_packet_received, MediaType::VIDEO);
+-    last_recv_bytes_ = static_cast<uint32_t>(rtp_packet.PayloadSize());
+-    total_rtp_payload_recv_ += last_recv_bytes_;
++    total_rtp_payload_recv_ += static_cast<uint32_t>(rtp_packet.PayloadSize());
+     ++total_rtp_packets_recv_;
+     if (io_statistics_) {
+-      io_statistics_->UpdateVideoInboundBytes(last_recv_bytes_);
+       io_statistics_->IncrementVideoInboundRtpPacketCount();
+     }
+     return;
+@@ -423,12 +419,10 @@ void RtpVideoReceiver::InsertMediaPacket(RtpPacket& rtp_packet,
+     has_received_media_packet_.store(true);
+   }
+
+-  last_recv_bytes_ = static_cast<uint32_t>(rtp_packet.PayloadSize());
+   total_rtp_payload_recv_ += static_cast<uint32_t>(rtp_packet.PayloadSize());
+   total_rtp_packets_recv_++;
+
+   if (io_statistics_) {
+-    io_statistics_->UpdateVideoInboundBytes(last_recv_bytes_);
+     io_statistics_->IncrementVideoInboundRtpPacketCount();
+     if (!is_recovered) {
+       io_statistics_->UpdateVideoPacketLossCount(
+diff --git a/src/transport/channel/rtp_video_receiver.h b/src/transport/channel/rtp_video_receiver.h
+index 46e57ac..8349488 100644
+--- a/src/transport/channel/rtp_video_receiver.h
++++ b/src/transport/channel/rtp_video_receiver.h
+@@ -188,7 +188,6 @@ class RtpVideoReceiver : public ThreadBase {
+
+  private:
+   std::shared_ptr<IOStatistics> io_statistics_ = nullptr;
+-  uint32_t last_recv_bytes_ = 0;
+   uint32_t total_rtp_packets_recv_ = 0;
+   uint32_t total_rtp_payload_recv_ = 0;
+
+diff --git a/src/transport/channel/video_channel_receive.cpp b/src/transport/channel/video_channel_receive.cpp
+index 89cb38c..a75517e 100644
+--- a/src/transport/channel/video_channel_receive.cpp
++++ b/src/transport/channel/video_channel_receive.cpp
+@@ -50,7 +50,6 @@ void VideoChannelReceive::Initialize(rtp::PAYLOAD_TYPE payload_type) {
+       return -2;
+     }
+
+-    ice_io_statistics_->UpdateVideoOutboundBytes((uint32_t)size);
+     return ice_agent_->Send(data, size);
+   });
+
+@@ -73,10 +72,6 @@ void VideoChannelReceive::Destroy() {
+ }
+
+ int VideoChannelReceive::OnReceiveRtpPacket(const char* data, size_t size) {
+-  if (ice_io_statistics_) {
+-    ice_io_statistics_->UpdateVideoInboundBytes((uint32_t)size);
+-  }
+-
+   if (rtp_video_receiver_) {
+     if (size < kFixedHeaderSize) {
+       LOG_ERROR("Received RTP packet is too small, size={}", size);
+diff --git a/src/transport/ice_transport.cpp b/src/transport/ice_transport.cpp
+index b9040ca..0298de9 100644
+--- a/src/transport/ice_transport.cpp
++++ b/src/transport/ice_transport.cpp
+@@ -631,11 +631,8 @@ void IceTransport::OnReceiveBuffer(NiceAgent* agent, guint stream_id,
+     return;
+   }
+
+-  // The negotiated mode is fixed for this transport. Legacy peers send
+-  // audio/data in plaintext even when their video uses SRTP.
+-  const bool is_audio_or_data =
+-      CheckIsAudioPacket(buffer, size) || CheckIsDataPacket(buffer, size);
+-  if (enable_srtp_ && (audio_data_srtp_enabled_ || !is_audio_or_data)) {
++  const auto rtp_wire_size = static_cast<uint32_t>(size);
++  if (enable_srtp_) {
+     const int result = ice_transport_controller_->DecryptIncomingPacket(
+         reinterpret_cast<uint8_t*>(buffer), &len, &ssrc);
+     if (result < 0) {
+@@ -656,11 +653,22 @@ void IceTransport::OnReceiveBuffer(NiceAgent* agent, guint stream_id,
+     ssrc = GetRtpSsrc(buffer, size);
+   }
+
++  // Count arrived RTP datagrams once, including SRTP overhead. Recovery and
++  // depacketization work on these bytes without generating new traffic.
+   if (CheckIsVideoPacket(buffer, size)) {
++    if (ice_io_statistics_) {
++      ice_io_statistics_->UpdateVideoInboundBytes(rtp_wire_size);
++    }
+     ice_transport_controller_->OnReceiveVideoRtpPacket(buffer, size, ssrc);
+   } else if (CheckIsAudioPacket(buffer, size)) {
++    if (ice_io_statistics_) {
++      ice_io_statistics_->UpdateAudioInboundBytes(rtp_wire_size);
++    }
+     ice_transport_controller_->OnReceiveAudioRtpPacket(buffer, size, ssrc);
+   } else if (CheckIsDataPacket(buffer, size)) {
++    if (ice_io_statistics_) {
++      ice_io_statistics_->UpdateDataInboundBytes(rtp_wire_size);
++    }
+     for (const auto& kv : data_senders_ssrc_) {
+       if (kv.second == ssrc) {
+         ice_transport_controller_->OnReceiveDataAckRtpPacket(buffer, size, ssrc,
+@@ -1387,30 +1395,16 @@ void IceTransport::AppendAudioDataSrtpCapability() {
+ bool IceTransport::NegotiateSrtp(const std::string& remote_sdp,
+                                 bool remote_has_fingerprint) {
+   const auto capability = ParseAudioDataSrtpCapability(remote_sdp);
+-  if (!capability.has_value()) {
+-    LOG_ERROR("Invalid audio/data SRTP capability");
++  if (!capability || (enable_srtp_ && (!remote_has_fingerprint || !*capability))) {
++    LOG_ERROR("Peer does not support the required SRTP media and data protection");
+     return false;
+   }
+-  const bool enable_srtp = enable_srtp_ && remote_has_fingerprint;
+-  const bool audio_data_srtp = enable_srtp && *capability;
+-  if (remote_capabilities_got_) {
+-    if (enable_srtp != enable_srtp_ ||
+-        audio_data_srtp != audio_data_srtp_enabled_) {
+-      LOG_ERROR("Changed SRTP protection mode requires a new ICE transport");
+-      return false;
+-    }
+-    return true;
+-  }
++  if (remote_capabilities_got_) return true;
+
+-  enable_srtp_ = enable_srtp;
+-  audio_data_srtp_enabled_ = audio_data_srtp;
++  audio_data_srtp_enabled_ = enable_srtp_;
+   if (ice_transport_controller_) {
+-    ice_transport_controller_->SetSrtpEnabled(enable_srtp_);
+     ice_transport_controller_->SetAudioDataSrtpEnabled(audio_data_srtp_enabled_);
+   }
+-  if (enable_srtp_ && !audio_data_srtp_enabled_) {
+-    LOG_INFO("Peer uses legacy SRTP: video encrypted, audio/data plaintext");
+-  }
+   return true;
+ }
+
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+index cb30be4..6678542 100644
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -266,6 +266,15 @@ void IceTransportController::Create(bool offer_peer, std::string remote_user_id,
+             return;
+           }
+
++          if (self->ice_io_statistics_ && packet->packet_type()) {
++            const auto wire_bytes = static_cast<uint32_t>(send_size);
++            if (*packet->packet_type() == webrtc::RtpPacketMediaType::kAudio) {
++              self->ice_io_statistics_->UpdateAudioOutboundBytes(wire_bytes);
++            } else {
++              self->ice_io_statistics_->UpdateVideoOutboundBytes(wire_bytes);
++              self->ice_io_statistics_->IncrementVideoOutboundRtpPacketCount();
++            }
++          }
+           self->OnSentPacket(*packet, feedback_registration);
+
+           if (packet->packet_type().has_value()) {
+@@ -2333,7 +2342,9 @@ IceTransportController::CreateUnpacedSendFunction(StreamType type) {
+     if (self->PrepareUnpacedPacket(data, size, protected_packet) < 0) return -1;
+
+     const int result = self->ice_agent_->Send(data, size);
+-    if (result >= 0 && self->ice_io_statistics_) {
++    const auto packet_type = static_cast<uint8_t>(data[1]);
++    const bool is_rtcp = packet_type >= 192 && packet_type <= 223;
++    if (result >= 0 && !is_rtcp && self->ice_io_statistics_) {
+       if (type == StreamType::kAudio) {
+         self->ice_io_statistics_->UpdateAudioOutboundBytes(
+             static_cast<uint32_t>(size));

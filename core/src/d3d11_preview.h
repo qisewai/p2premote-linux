@@ -59,6 +59,8 @@ private:
     bool nv12_unavailable_{};
     bool nv12_texture_unavailable_{};
     bool text_filter_unavailable_{};
+    bool allow_tearing_{};
+    UINT swap_flags_{};
     unsigned target_width_{};
     unsigned target_height_{};
     unsigned source_width_{};

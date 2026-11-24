@@ -6,8 +6,8 @@
 namespace p2premote {
 namespace {
 
-constexpr std::uint8_t version = 1;
-constexpr std::uint8_t command_version = 2;
+constexpr std::uint8_t version = 3;
+constexpr std::uint8_t command_version = 4;
 constexpr std::size_t command_header = 12;
 
 void WriteLittleEndian(std::span<std::uint8_t> bytes, std::uint64_t value) {
@@ -41,8 +41,6 @@ bool ValidCode(InputKind kind, std::uint16_t code) {
     case InputKind::key_down:
     case InputKind::key_up:
         return (code & 0xff) != 0 && code < 512;
-    case InputKind::text:
-        return code == '\b' || code == '\r' || (code >= 32 && code != 127);
     case InputKind::set_video_settings:
     case InputKind::video_settings_reply:
         return code >= static_cast<std::uint16_t>(StreamQuality::p720)
@@ -100,11 +98,15 @@ std::optional<InputPacket> DecodeInput(std::span<const std::uint8_t> bytes) {
     }
     const auto x = static_cast<std::uint16_t>(ReadLittleEndian(bytes.subspan<4, 2>()));
     const auto y = static_cast<std::uint16_t>(ReadLittleEndian(bytes.subspan<6, 2>()));
-    if (IsVideoSettingsMessage(kind) && (x < static_cast<std::uint16_t>(VideoBitratePreset::economy)
-            || x > static_cast<std::uint16_t>(VideoBitratePreset::detail)
-            || y > (kind == InputKind::video_settings_reply ? 1 : 0))) return std::nullopt;
+    const InputPacket packet{kind, code, x, y, sequence, ReadLittleEndian(bytes.subspan<12, 8>())};
+    if (IsVideoSettingsMessage(kind)) {
+        const auto bitrate = VideoSettingsBitrate(packet);
+        const bool rejected = kind == InputKind::video_settings_reply && bitrate == 0;
+        if (!rejected && (bitrate < VideoBitrateLimit(VideoBitratePreset::economy)
+                || bitrate > VideoBitrateLimit(VideoBitratePreset::detail))) return std::nullopt;
+    }
     if (IsAudioSettingsMessage(kind) && (x != 0 || y != 0)) return std::nullopt;
-    return InputPacket{kind, code, x, y, sequence, ReadLittleEndian(bytes.subspan<12, 8>())};
+    return packet;
 }
 
 std::vector<std::uint8_t> EncodeInputCommand(const InputCommand& command) {

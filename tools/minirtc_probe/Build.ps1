@@ -73,8 +73,6 @@ $ws=$ws.Replace('            return self->OnTlsVerify(preverified, ctx);',@'
 if (!$ws.Contains('cannot load the probe CA certificate') -or !$ws.Contains('websocketpp::uri(self->uri_)')) {
     throw 'The probe TLS adaptation did not match the pinned MiniRTC source.'
 }
-. (Join-Path $PSScriptRoot 'PatchManaged.ps1')
-
 # Restore each patched source once before applying our changes in order.
 $recoveryPatch=if ($ExperimentalRelayRecovery) {'RelayRecovery.patch'} else {'RecoveredPacketOrdering.patch'}
 $patches=@(
@@ -82,6 +80,8 @@ $patches=@(
     (Join-Path $PSScriptRoot 'DesktopVideoQuality.patch')
     (Join-Path $PSScriptRoot 'DesktopIdleResume.patch')
     (Join-Path $PSScriptRoot $recoveryPatch)
+    (Join-Path $PSScriptRoot 'TrafficStats.patch')
+    (Join-Path $PSScriptRoot 'DesktopLatestCapture.patch')
 )
 # A reused dependency checkout may contain the relay recovery experiment.
 $patchedFiles=@(
@@ -99,6 +99,7 @@ $patchedFiles+=foreach ($patch in $patches) {
 foreach ($file in ($patchedFiles | Sort-Object -Unique)) {
     [IO.File]::WriteAllText((Join-Path $source $file),(Get-UpstreamText $file))
 }
+. (Join-Path $PSScriptRoot 'PatchManaged.ps1')
 foreach ($patch in $patches) {
     git -C $source apply --ignore-whitespace $patch
     if ($LASTEXITCODE) {throw "MiniRTC patch did not match the pinned source: $patch"}
