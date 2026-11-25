@@ -18,12 +18,20 @@ struct LaunchOptions {
     bool compatible_http{};
 };
 
+struct LanConnectOptions {
+    std::wstring host;
+    std::uint16_t port{P2P_LAN_DEFAULT_PORT};
+    std::wstring access_code;
+};
+
 class StreamDriver final : public QObject {
     Q_OBJECT
 
 public:
     StreamDriver(p2p_account* account, bool host, const wchar_t* device, void* video_parent,
         const LaunchOptions& options, QObject* parent, bool diagnostics = false);
+    StreamDriver(const LanConnectOptions& lan, void* video_parent,
+        const LaunchOptions& options, QObject* parent);
     ~StreamDriver() override;
 
     p2p_stream* handle() const { return stream_.get(); }
@@ -36,6 +44,7 @@ signals:
     void failed(const QString& message);
 
 private:
+    void initTimersAndWaits();
     void dispatch(uint32_t kind);
     void syncWaits();
     void publish();

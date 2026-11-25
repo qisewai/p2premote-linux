@@ -25,6 +25,10 @@ struct ConnectionOptions {
     bool relay_only{};
     bool auto_control{};
     bool diagnostics{};
+    bool lan_direct{};
+    std::wstring lan_host;
+    std::uint16_t lan_port{27887};
+    std::wstring lan_access_code;
     bool fixed_cadence{};
     bool desktop_duplication{true};
     bool video_cursor{};

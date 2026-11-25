@@ -13,12 +13,19 @@ namespace p2premote {
 
 class StreamEvents;
 
-class SignalSocket {
+class ISignalTransport {
+public:
+    virtual ~ISignalTransport() = default;
+    virtual void Send(std::string kind, std::string payload = {}) = 0;
+    virtual void EndSession() noexcept = 0;
+};
+
+class SignalSocket final : public ISignalTransport {
 public:
     SignalSocket(std::shared_ptr<StreamEvents> events, std::wstring endpoint, std::string kind, std::string payload,
         std::wstring token = {});
-    void Send(std::string kind, std::string payload = {});
-    void EndSession() noexcept { end_session_.store(true); }
+    void Send(std::string kind, std::string payload = {}) override;
+    void EndSession() noexcept override { end_session_.store(true); }
 
 private:
     void Run(std::stop_token stop, const std::wstring& endpoint, const std::string& kind, const std::string& payload,

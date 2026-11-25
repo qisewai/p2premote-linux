@@ -32,6 +32,7 @@ public:
 
     void openSession(p2p_account* account, const QString& device, const QString& name,
         const LaunchOptions& options, bool diagnostics = false);
+    void openLanSession(const LanConnectOptions& lan, const QString& name, const LaunchOptions& options);
     void stopAgentSharing();
 
 protected:

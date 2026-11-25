@@ -84,7 +84,8 @@ public:
     RemoteSessionTab(p2p_account* account, const QString& device, const QString& name,
         const LaunchOptions& options, bool diagnostics, std::function<void()> on_fullscreen,
         std::function<void()> on_share,
-        std::function<void()> on_changed, QWidget* dialog_parent, QWidget* parent)
+        std::function<void()> on_changed, QWidget* dialog_parent, QWidget* parent,
+        const std::optional<LanConnectOptions>& lan = std::nullopt)
         : QWidget(parent), device_(device), name_(name), diagnostics_(diagnostics), on_changed_(std::move(on_changed)) {
         auto* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
@@ -102,9 +103,14 @@ public:
             layout->addWidget(video_, 1);
         }
 
-        const auto target = device.toStdWString();
-        driver_ = std::make_unique<StreamDriver>(account, false, target.c_str(),
-            video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr, options, this, diagnostics_);
+        if (lan) {
+            driver_ = std::make_unique<StreamDriver>(*lan,
+                video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr, options, this);
+        } else {
+            const auto target = device.toStdWString();
+            driver_ = std::make_unique<StreamDriver>(account, false, target.c_str(),
+                video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr, options, this, diagnostics_);
+        }
         if (!driver_->handle()) {
             status_text_ = QString::fromWCharArray(p2p_last_error());
             state_ = P2P_STOPPED;
@@ -514,6 +520,40 @@ void RemoteWindow::openSession(p2p_account* account, const QString& device, cons
     stack_->addWidget(session);
     const int idx = tabs_->addTab(session->tabIcon(), session->tabTitle());
     tabs_->setTabToolTip(idx, name);
+    tabs_->setCurrentIndex(idx);
+    refreshChrome();
+    show();
+    raise();
+    activateWindow();
+    session->start();
+}
+
+void RemoteWindow::openLanSession(const LanConnectOptions& lan, const QString& name, const LaunchOptions& options) {
+    const auto key = QStringLiteral("lan:%1:%2").arg(QString::fromStdWString(lan.host)).arg(lan.port);
+    if (const int existing = findSession(key, false); existing >= 0) {
+        tabs_->setCurrentIndex(existing);
+        if (auto* session = sessionAt(existing); session && !session->active()) {
+            session->start();
+        }
+        show();
+        raise();
+        activateWindow();
+        return;
+    }
+
+    const auto title = name.isEmpty()
+        ? QStringLiteral("%1:%2").arg(QString::fromStdWString(lan.host)).arg(lan.port)
+        : name;
+    auto* session = new RemoteSessionTab(
+        nullptr, key, title, options, false,
+        [this] { toggleFullscreen(); },
+        [this] { shareAgentDiagnostics(); },
+        [this] { refreshChrome(); },
+        this, stack_, lan);
+    sessions_.push_back(session);
+    stack_->addWidget(session);
+    const int idx = tabs_->addTab(session->tabIcon(), session->tabTitle());
+    tabs_->setTabToolTip(idx, QStringLiteral("%1 (%2:%3)").arg(title, QString::fromStdWString(lan.host)).arg(lan.port));
     tabs_->setCurrentIndex(idx);
     refreshChrome();
     show();

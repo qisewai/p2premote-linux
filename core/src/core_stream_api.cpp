@@ -1,4 +1,5 @@
 #include "core_api_internal.h"
+#include "direct_signal.h"
 #include "plugin_settings.h"
 #include "viewer_input.h"
 #include "qpc.h"
@@ -198,6 +199,76 @@ p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host,
         stream = new p2p_stream(host != 0, std::move(connection), static_cast<HWND>(video_parent));
     });
     return stream;
+}
+
+p2p_stream* p2p_stream_create_lan(int32_t host, void* video_parent, const p2p_lan_options_v1* options) {
+    p2p_stream* stream{};
+    Guard([&] {
+        const auto& opt = Required(options);
+        if (!opt.access_code || std::wcslen(opt.access_code) < 6 || std::wcslen(opt.access_code) > 32) {
+            throw std::invalid_argument("局域网被控码长度需为 6 至 32 位");
+        }
+        if (!host && (!opt.host_address || !*opt.host_address || !video_parent)) {
+            throw std::invalid_argument("请输入目标 IP 地址并创建视频窗口");
+        }
+        ConnectionOptions connection;
+        connection.lan_direct = true;
+        connection.lan_host = opt.host_address ? opt.host_address : L"";
+        connection.lan_port = opt.port ? opt.port : kLanDefaultPort;
+        connection.lan_access_code = opt.access_code;
+        connection.auto_control = host && (opt.auto_control != 0);
+        if (opt.ice_trace_directory && *opt.ice_trace_directory) {
+            connection.ice_trace_dir = std::filesystem::absolute(opt.ice_trace_directory);
+            std::filesystem::create_directories(connection.ice_trace_dir);
+        }
+        if (opt.latency_trace_directory && *opt.latency_trace_directory) {
+            connection.latency_trace_dir = std::filesystem::absolute(opt.latency_trace_directory);
+            std::filesystem::create_directories(connection.latency_trace_dir);
+        }
+        stream = new p2p_stream(host != 0, std::move(connection), static_cast<HWND>(video_parent));
+    });
+    return stream;
+}
+
+struct p2p_lan_scanner {
+    LanDiscoveryScanner scanner{kLanDiscoveryPort};
+    std::vector<LanPeer> peers;
+};
+
+p2p_lan_scanner* p2p_lan_scanner_create(void) {
+    p2p_lan_scanner* result{};
+    Guard([&] { result = new p2p_lan_scanner(); });
+    return result;
+}
+
+void p2p_lan_scanner_destroy(p2p_lan_scanner* scanner) { delete scanner; }
+
+int32_t p2p_lan_scanner_probe(p2p_lan_scanner* scanner) {
+    return Guard([&] { Required(scanner).scanner.Probe(); });
+}
+
+size_t p2p_lan_scanner_read(p2p_lan_scanner* scanner) {
+    size_t size{};
+    Guard([&] {
+        auto& state = Required(scanner);
+        state.peers = state.scanner.Snapshot();
+        size = state.peers.size();
+    });
+    return size;
+}
+
+int32_t p2p_lan_scanner_peer(const p2p_lan_scanner* scanner, size_t index, p2p_lan_peer_v1* peer) {
+    return Guard([&] {
+        const auto& entry = Required(scanner).peers.at(index);
+        Required(peer) = {entry.id.c_str(), entry.name.c_str(), entry.address.c_str(), entry.port, entry.busy ? 1 : 0};
+    });
+}
+
+const wchar_t* p2p_lan_local_addresses(void) {
+    thread_local std::wstring addresses;
+    addresses.clear();
+    Guard([&] { addresses = FormatLocalLanAddresses(); });
+    return addresses.c_str();
 }
 
 void p2p_stream_destroy(p2p_stream* stream) { delete stream; }

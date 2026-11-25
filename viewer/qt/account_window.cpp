@@ -6,6 +6,7 @@
 #include <QApplication>
 #include <QBuffer>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDateTime>
@@ -26,6 +27,7 @@
 #include <QSettings>
 #include <QShowEvent>
 #include <QSignalBlocker>
+#include <QSpinBox>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
 #include <QTableWidget>
@@ -49,6 +51,8 @@ namespace {
 constexpr int stop_hotkey = 1;
 constexpr int device_state_role = Qt::UserRole + 1;
 constexpr int device_name_role = Qt::UserRole + 2;
+constexpr int lan_port_role = Qt::UserRole + 3;
+constexpr int lan_busy_role = Qt::UserRole + 4;
 
 QString winText(const wchar_t* text) { return text ? QString::fromWCharArray(text) : QString{}; }
 
@@ -154,23 +158,12 @@ public:
     HostSession(p2p_account* account, void* monitor, LaunchOptions options, Callback on_update,
         AgentCallback on_agent, QString* error)
         : wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr)), on_update_(std::move(on_update)), on_agent_(std::move(on_agent)) {
-        if (!wake_) {
-            if (error) *error = QStringLiteral("无法创建接收线程唤醒事件。");
-            return;
-        }
-        std::promise<QString> started;
-        auto ready = started.get_future();
-        thread_ = std::jthread([this, account, monitor, options = std::move(options),
-            started = std::move(started)](std::stop_token stop) mutable {
-            run(stop, account, monitor, options, std::move(started));
-        });
-        const auto startup_error = ready.get();
-        if (!startup_error.isEmpty()) {
-            if (error) *error = startup_error;
-            stop();
-            return;
-        }
-        started_ = true;
+        init(account, std::nullopt, monitor, std::move(options), error);
+    }
+
+    HostSession(const LanConnectOptions& lan, void* monitor, LaunchOptions options, Callback on_update, QString* error)
+        : wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr)), on_update_(std::move(on_update)) {
+        init(nullptr, lan, monitor, std::move(options), error);
     }
 
     ~HostSession() {
@@ -206,6 +199,27 @@ private:
         QByteArray png;
     };
 
+    void init(p2p_account* account, std::optional<LanConnectOptions> lan, void* monitor, LaunchOptions options,
+        QString* error) {
+        if (!wake_) {
+            if (error) *error = QStringLiteral("无法创建接收线程唤醒事件。");
+            return;
+        }
+        std::promise<QString> started;
+        auto ready = started.get_future();
+        thread_ = std::jthread([this, account, lan = std::move(lan), monitor, options = std::move(options),
+            started = std::move(started)](std::stop_token stop) mutable {
+            run(stop, account, lan, monitor, options, std::move(started));
+        });
+        const auto startup_error = ready.get();
+        if (!startup_error.isEmpty()) {
+            if (error) *error = startup_error;
+            stop();
+            return;
+        }
+        started_ = true;
+    }
+
     void stop() {
         if (thread_.joinable()) {
             thread_.request_stop();
@@ -214,12 +228,19 @@ private:
         }
     }
 
-    void run(std::stop_token stop, p2p_account* account, void* monitor, const LaunchOptions& options,
-        std::promise<QString> started) {
-        const p2p_connection_options_v1 settings{
-            options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, 1, 1};
-        std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream(
-            p2p_stream_create(account, 1, nullptr, nullptr, &settings), p2p_stream_destroy);
+    void run(std::stop_token stop, p2p_account* account, const std::optional<LanConnectOptions>& lan,
+        void* monitor, const LaunchOptions& options, std::promise<QString> started) {
+        std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream(nullptr, p2p_stream_destroy);
+        if (lan) {
+            const p2p_lan_options_v1 lan_settings{
+                lan->host.empty() ? nullptr : lan->host.c_str(), lan->port, lan->access_code.c_str(), 1,
+                options.ice_trace.c_str(), options.latency_trace.c_str()};
+            stream.reset(p2p_stream_create_lan(1, nullptr, &lan_settings));
+        } else {
+            const p2p_connection_options_v1 settings{
+                options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, 1, 1};
+            stream.reset(p2p_stream_create(account, 1, nullptr, nullptr, &settings));
+        }
         if (!stream) {
             started.set_value(winText(p2p_last_error()));
             return;
@@ -416,6 +437,12 @@ AccountWindow::AccountWindow(LaunchOptions options)
     shell_layout->setSpacing(0);
 
     title_bar_ = new TitleBar(this, QStringLiteral("P2P Remote"), true, true, shell);
+    mode_button_ = new QPushButton(QStringLiteral("局域网直连"), title_bar_);
+    mode_button_->setObjectName(QStringLiteral("titleToolBtn"));
+    mode_button_->setFocusPolicy(Qt::NoFocus);
+    mode_button_->setToolTip(QStringLiteral("无需服务器，局域网通过 IP 和固定被控码直连"));
+    title_bar_->addToolWidget(mode_button_);
+    connect(mode_button_, &QPushButton::clicked, this, &AccountWindow::toggleLanMode);
     auto* settings_btn = new QPushButton(QStringLiteral("⚙ 设置"), title_bar_);
     settings_btn->setObjectName(QStringLiteral("titleToolBtn"));
     settings_btn->setFocusPolicy(Qt::NoFocus);
@@ -431,8 +458,10 @@ AccountWindow::AccountWindow(LaunchOptions options)
     pages_ = new QStackedWidget(body);
     login_page_ = makeLoginPage();
     devices_page_ = makeDevicesPage();
+    lan_page_ = makeLanPage();
     pages_->addWidget(login_page_);
     pages_->addWidget(devices_page_);
+    pages_->addWidget(lan_page_);
     root->addWidget(pages_, 1);
     status_ = new QLabel(body);
     status_->setObjectName(QStringLiteral("status"));
@@ -453,6 +482,8 @@ AccountWindow::AccountWindow(LaunchOptions options)
     connect(&account_event_, &QWinEventNotifier::activated, this, &AccountWindow::completeRequest);
     refresh_.setInterval(3000);
     connect(&refresh_, &QTimer::timeout, this, &AccountWindow::refresh);
+    lan_scan_timer_.setInterval(1500);
+    connect(&lan_scan_timer_, &QTimer::timeout, this, &AccountWindow::refreshLanPeers);
     makeTray();
     elevated_ = isProcessElevated();
     refreshServiceStatus();
@@ -628,6 +659,137 @@ QWidget* AccountWindow::makeDevicesPage() {
     return page;
 }
 
+QWidget* AccountWindow::makeLanPage() {
+    auto* page = new QWidget(pages_);
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(0, 6, 0, 0);
+    layout->setSpacing(10);
+
+    layout->addWidget(heading(QStringLiteral("局域网无人值守直连"), page));
+    auto* notice = new QLabel(
+        QStringLiteral("无需中心服务器与账号登录，局域网内可直接通过 IP 地址与固定被控码连接。"), page);
+    notice->setObjectName(QStringLiteral("muted"));
+    notice->setWordWrap(true);
+    layout->addWidget(notice);
+
+    // Card 1: Host unattended receiver
+    auto* host_card = new QFrame(page);
+    host_card->setObjectName(QStringLiteral("accountCard"));
+    auto* host_layout = new QVBoxLayout(host_card);
+    host_layout->setContentsMargins(14, 10, 14, 10);
+    host_layout->setSpacing(8);
+
+    auto* ip_row = new QHBoxLayout;
+    ip_row->setSpacing(8);
+    ip_row->addWidget(new QLabel(QStringLiteral("本机局域网被控"), host_card));
+    lan_local_ips_ = new QLabel(host_card);
+    lan_local_ips_->setObjectName(QStringLiteral("muted"));
+    lan_local_ips_->setTextFormat(Qt::PlainText);
+    lan_local_ips_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    ip_row->addWidget(lan_local_ips_, 1);
+    auto* copy_ip = new QPushButton(QStringLiteral("复制地址"), host_card);
+    connect(copy_ip, &QPushButton::clicked, this, &AccountWindow::copyLanAddress);
+    ip_row->addWidget(copy_ip);
+    host_layout->addLayout(ip_row);
+
+    auto* host_cfg = new QHBoxLayout;
+    host_cfg->setSpacing(8);
+    host_cfg->addWidget(new QLabel(QStringLiteral("端口"), host_card));
+    lan_host_port_ = new QSpinBox(host_card);
+    lan_host_port_->setRange(1024, 65535);
+    lan_host_port_->setValue(QSettings().value(QStringLiteral("lan/hostPort"), P2P_LAN_DEFAULT_PORT).toInt());
+    host_cfg->addWidget(lan_host_port_);
+
+    host_cfg->addWidget(new QLabel(QStringLiteral("固定被控码"), host_card));
+    lan_host_code_ = new QLineEdit(readLanSecret(QStringLiteral("HostAccessCode")), host_card);
+    lan_host_code_->setMaxLength(32);
+    lan_host_code_->setPlaceholderText(QStringLiteral("6–32 位固定被控码"));
+    lan_host_code_->setEchoMode(QLineEdit::Password);
+    host_cfg->addWidget(lan_host_code_, 1);
+
+    auto* show_code = new QCheckBox(QStringLiteral("显示"), host_card);
+    connect(show_code, &QCheckBox::toggled, this, [this](bool checked) {
+        lan_host_code_->setEchoMode(checked ? QLineEdit::Normal : QLineEdit::Password);
+    });
+    host_cfg->addWidget(show_code);
+    host_layout->addLayout(host_cfg);
+
+    auto* host_ctrl = new QHBoxLayout;
+    host_ctrl->setSpacing(8);
+    lan_screens_ = new QComboBox(host_card);
+    lan_screens_->setAccessibleName(QStringLiteral("局域网共享显示器"));
+    host_ctrl->addWidget(lan_screens_, 1);
+    lan_receive_ = new QPushButton(QStringLiteral("开启局域网接收"), host_card);
+    connect(lan_receive_, &QPushButton::clicked, this, &AccountWindow::toggleLanReceiving);
+    host_ctrl->addWidget(lan_receive_);
+    host_layout->addLayout(host_ctrl);
+
+    lan_host_status_ = new QLabel(QStringLiteral("本机局域网无人值守未开启。"), host_card);
+    lan_host_status_->setObjectName(QStringLiteral("muted"));
+    lan_host_status_->setTextFormat(Qt::PlainText);
+    lan_host_status_->setWordWrap(true);
+    host_layout->addWidget(lan_host_status_);
+    layout->addWidget(host_card);
+
+    // Card 2: Discovery + Viewer connect
+    auto* peer_header = new QHBoxLayout;
+    peer_header->addWidget(new QLabel(QStringLiteral("已发现的局域网设备（自动发现）"), page), 1);
+    lan_scan_button_ = new QPushButton(QStringLiteral("重新扫描"), page);
+    connect(lan_scan_button_, &QPushButton::clicked, this, [this] {
+        if (lan_scanner_) p2p_lan_scanner_probe(lan_scanner_.get());
+        refreshLanPeers();
+        setStatus(QStringLiteral("正在扫描局域网在线被控设备…"));
+    });
+    peer_header->addWidget(lan_scan_button_);
+    layout->addLayout(peer_header);
+
+    lan_peers_ = new QListWidget(page);
+    lan_peers_->setObjectName(QStringLiteral("deviceList"));
+    lan_peers_->setSpacing(4);
+    layout->addWidget(lan_peers_, 1);
+
+    auto* connect_row = new QHBoxLayout;
+    connect_row->setSpacing(8);
+    lan_target_host_ = new QLineEdit(QSettings().value(QStringLiteral("lan/lastTarget")).toString(), page);
+    lan_target_host_->setPlaceholderText(QStringLiteral("目标 IP 或 IP:端口（如 192.168.1.105）"));
+    lan_target_host_->setMaxLength(128);
+    connect_row->addWidget(lan_target_host_, 2);
+
+    lan_target_code_ = new QLineEdit(page);
+    lan_target_code_->setPlaceholderText(QStringLiteral("输入被控码"));
+    lan_target_code_->setMaxLength(32);
+    lan_target_code_->setEchoMode(QLineEdit::Password);
+    connect_row->addWidget(lan_target_code_, 1);
+
+    lan_connect_ = new QPushButton(QStringLiteral("直连"), page);
+    lan_connect_->setObjectName(QStringLiteral("primary"));
+    connect_row->addWidget(lan_connect_);
+    layout->addLayout(connect_row);
+
+    connect(lan_connect_, &QPushButton::clicked, this, &AccountWindow::connectLanDevice);
+    connect(lan_target_code_, &QLineEdit::returnPressed, this, &AccountWindow::connectLanDevice);
+    connect(lan_target_host_, &QLineEdit::returnPressed, lan_target_code_, qOverload<>(&QLineEdit::setFocus));
+    connect(lan_peers_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
+        if (!item) return;
+        const auto addr = item->data(Qt::UserRole).toString();
+        const auto port = item->data(lan_port_role).toInt();
+        lan_target_host_->setText(port == P2P_LAN_DEFAULT_PORT
+            ? addr : QStringLiteral("%1:%2").arg(addr).arg(port));
+        lan_target_code_->setFocus();
+    });
+    connect(lan_peers_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
+        if (!item) return;
+        const auto addr = item->data(Qt::UserRole).toString();
+        const auto port = item->data(lan_port_role).toInt();
+        lan_target_host_->setText(port == P2P_LAN_DEFAULT_PORT
+            ? addr : QStringLiteral("%1:%2").arg(addr).arg(port));
+        if (!lan_target_code_->text().isEmpty()) connectLanDevice();
+        else lan_target_code_->setFocus();
+    });
+
+    return page;
+}
+
 void AccountWindow::makeTray() {
     if (!QSystemTrayIcon::isSystemTrayAvailable()) return;
     QApplication::setQuitOnLastWindowClosed(false);
@@ -678,8 +840,9 @@ void AccountWindow::closeEvent(QCloseEvent* event) {
 bool AccountWindow::nativeEvent(const QByteArray& type, void* message, qintptr* result) {
     if (handleWin32FramelessChrome(this, message, result)) return true;
     const auto* msg = static_cast<MSG*>(message);
-    if (msg->message == WM_HOTKEY && msg->wParam == stop_hotkey && host_) {
-        stopReceiving();
+    if (msg->message == WM_HOTKEY && msg->wParam == stop_hotkey && (host_ || lan_host_)) {
+        if (host_) stopReceiving();
+        if (lan_host_) stopLanReceiving();
         setStatus(QStringLiteral("已用本机快捷键停止接收。"));
         *result = 0;
         return true;
@@ -687,6 +850,7 @@ bool AccountWindow::nativeEvent(const QByteArray& type, void* message, qintptr* 
     if (msg->message == WM_DISPLAYCHANGE) {
         QMetaObject::invokeMethod(this, [this] {
             if (host_) host_->displayChanged();
+            if (lan_host_) lan_host_->displayChanged();
             refreshScreens();
         }, Qt::QueuedConnection);
     }
@@ -723,7 +887,26 @@ void AccountWindow::updateControls() {
     const auto* local = p2p_account_device_id(account_.get());
     const bool signed_in = p2p_account_signed_in(account_.get()) != 0;
     const bool busy = request_ != Request::none;
-    pages_->setCurrentWidget(signed_in ? devices_page_ : login_page_);
+    pages_->setCurrentWidget(lan_mode_ ? lan_page_ : (signed_in ? devices_page_ : login_page_));
+    if (mode_button_) {
+        mode_button_->setText(lan_mode_
+            ? (signed_in ? QStringLiteral("我的设备") : QStringLiteral("账号登录"))
+            : QStringLiteral("局域网直连"));
+    }
+    if (lan_local_ips_) {
+        const auto ips = winText(p2p_lan_local_addresses());
+        lan_local_ips_->setText(ips.isEmpty() ? QStringLiteral("未检测到局域网 IPv4") : ips);
+    }
+    if (lan_host_port_) lan_host_port_->setEnabled(!lan_host_);
+    if (lan_host_code_) lan_host_code_->setEnabled(!lan_host_);
+    if (lan_screens_) lan_screens_->setEnabled(!lan_host_ && lan_screens_->count() > 0);
+    if (lan_receive_) {
+        lan_receive_->setEnabled(lan_host_ || (lan_screens_ && lan_screens_->count() > 0));
+        lan_receive_->setText(lan_host_ ? QStringLiteral("停止局域网接收") : QStringLiteral("开启局域网接收"));
+    }
+    if (lan_host_status_ && !lan_host_) {
+        lan_host_status_->setText(QStringLiteral("本机局域网无人值守未开启。"));
+    }
     login_page_->setEnabled(!busy);
     const auto* item = devices_->currentItem();
     const auto selected_id = item ? item->data(Qt::UserRole).toString() : QString{};
@@ -943,20 +1126,28 @@ void AccountWindow::fillDevices() {
 }
 
 void AccountWindow::refreshScreens() {
-    if (host_ && !host_->stopped()) return;
+    if ((host_ && !host_->stopped()) || (lan_host_ && !lan_host_->stopped())) return;
     const auto previous = screens_->currentData();
+    const auto lan_previous = lan_screens_ ? lan_screens_->currentData() : QVariant{};
     std::vector<Monitor> monitors;
     if (!EnumDisplayMonitors(nullptr, nullptr, enumMonitors, reinterpret_cast<LPARAM>(&monitors))) return;
     screens_->clear();
+    if (lan_screens_) lan_screens_->clear();
     int primary{};
     for (const auto& monitor : monitors) {
         if (monitor.primary) primary = screens_->count();
-        screens_->addItem(QStringLiteral("显示器 %1 · %2 × %3").arg(screens_->count() + 1)
-            .arg(monitor.size.width()).arg(monitor.size.height()),
-            QVariant::fromValue(static_cast<qulonglong>(reinterpret_cast<quintptr>(monitor.handle))));
+        const auto label = QStringLiteral("显示器 %1 · %2 × %3").arg(screens_->count() + 1)
+            .arg(monitor.size.width()).arg(monitor.size.height());
+        const auto screen_data = QVariant::fromValue(static_cast<qulonglong>(reinterpret_cast<quintptr>(monitor.handle)));
+        screens_->addItem(label, screen_data);
+        if (lan_screens_) lan_screens_->addItem(label, screen_data);
     }
     const auto match = screens_->findData(previous);
     screens_->setCurrentIndex(match >= 0 ? match : primary);
+    if (lan_screens_) {
+        const auto lan_match = lan_screens_->findData(lan_previous);
+        lan_screens_->setCurrentIndex(lan_match >= 0 ? lan_match : primary);
+    }
     updateControls();
 }
 
@@ -1005,11 +1196,181 @@ void AccountWindow::stopReceiving() {
     ++host_generation_;
     clearAgentApproval();
     host_.reset();
-    if (hotkey_) {
+    if (hotkey_ && !lan_host_) {
         UnregisterHotKey(reinterpret_cast<HWND>(winId()), stop_hotkey);
         hotkey_ = false;
     }
     updateControls();
+}
+
+void AccountWindow::toggleLanMode() {
+    lan_mode_ = !lan_mode_;
+    if (lan_mode_) {
+        if (!lan_scanner_) lan_scanner_.reset(p2p_lan_scanner_create());
+        if (lan_scanner_) p2p_lan_scanner_probe(lan_scanner_.get());
+        lan_scan_timer_.start();
+        refreshLanPeers();
+    } else {
+        lan_scan_timer_.stop();
+    }
+    updateControls();
+}
+
+void AccountWindow::startLanHostFromCli(const QString& code, std::uint16_t port) {
+    if (!lan_mode_) toggleLanMode();
+    if (port >= 1024) lan_host_port_->setValue(port);
+    if (!code.isEmpty()) lan_host_code_->setText(code);
+    startLanReceiving();
+}
+
+void AccountWindow::connectLanFromCli(const QString& target, const QString& code) {
+    if (!lan_mode_) toggleLanMode();
+    if (!target.isEmpty()) lan_target_host_->setText(target);
+    if (!code.isEmpty()) lan_target_code_->setText(code);
+    connectLanDevice();
+}
+
+void AccountWindow::refreshLanPeers() {
+    if (!lan_scanner_ || !lan_peers_) return;
+    const auto* current = lan_peers_->currentItem();
+    const auto selected_addr = current ? current->data(Qt::UserRole).toString() : QString{};
+    const auto selected_port = current ? current->data(lan_port_role).toInt() : 0;
+    const auto count = p2p_lan_scanner_read(lan_scanner_.get());
+    const QSignalBlocker block(lan_peers_);
+    for (size_t i = 0; i < count; ++i) {
+        p2p_lan_peer_v1 peer{};
+        if (p2p_lan_scanner_peer(lan_scanner_.get(), i, &peer) != P2P_OK) continue;
+        const auto name = winText(peer.name);
+        const auto addr = winText(peer.address);
+        const auto status = peer.busy ? QStringLiteral("控制中") : QStringLiteral("可连接");
+        const auto label = QStringLiteral("%1\n%2:%3  ·  %4").arg(name, addr).arg(peer.port).arg(status);
+        const auto row = static_cast<int>(i);
+        auto* item = row < lan_peers_->count() ? lan_peers_->item(row) : new QListWidgetItem(lan_peers_);
+        if (item->text() != label) item->setText(label);
+        item->setData(Qt::UserRole, addr);
+        item->setData(device_name_role, name);
+        item->setData(lan_port_role, static_cast<int>(peer.port));
+        item->setData(lan_busy_role, peer.busy != 0);
+        if (addr == selected_addr && peer.port == selected_port) lan_peers_->setCurrentItem(item);
+    }
+    while (lan_peers_->count() > static_cast<int>(count)) delete lan_peers_->takeItem(lan_peers_->count() - 1);
+}
+
+void AccountWindow::toggleLanReceiving() {
+    if (lan_host_) stopLanReceiving();
+    else startLanReceiving();
+}
+
+void AccountWindow::startLanReceiving() {
+    if (lan_host_ || !lan_screens_ || !lan_screens_->count()) return;
+    const auto code = lan_host_code_->text();
+    if (code.size() < 6 || code.size() > 32) {
+        setStatus(QStringLiteral("请先设置 6 至 32 位固定被控码。"));
+        lan_host_code_->setFocus();
+        return;
+    }
+    const auto port = static_cast<std::uint16_t>(lan_host_port_->value());
+    QSettings().setValue(QStringLiteral("lan/hostPort"), static_cast<int>(port));
+    saveLanSecret(QStringLiteral("HostAccessCode"), code);
+
+    const auto screen = reinterpret_cast<void*>(static_cast<quintptr>(lan_screens_->currentData().toULongLong()));
+    const auto generation = ++lan_host_generation_;
+    LanConnectOptions lan{{}, port, code.toStdWString()};
+    QString error;
+    auto session = std::make_unique<HostSession>(lan, screen, options_,
+        [this, generation](int state, const QString& status, bool desktop_control) {
+            QMetaObject::invokeMethod(this, [this, generation, state, status, desktop_control] {
+                if (generation != lan_host_generation_ || !lan_host_) return;
+                auto text = status;
+                if (desktop_control) {
+                    text += hotkey_ ? QStringLiteral("\nCtrl+Alt+F11 可停止接收。")
+                        : QStringLiteral("\n可在此处停止局域网接收。");
+                }
+                if (lan_host_status_->text() != text) lan_host_status_->setText(text);
+                if (state == P2P_STOPPED) {
+                    stopLanReceiving();
+                    setStatus(text);
+                }
+            }, Qt::QueuedConnection);
+        }, &error);
+    if (!session->valid()) {
+        setStatus(error);
+        return;
+    }
+    if (!hotkey_) {
+        hotkey_ = RegisterHotKey(reinterpret_cast<HWND>(winId()), stop_hotkey,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F11) != FALSE;
+    }
+    lan_host_ = std::move(session);
+    setStatus(QStringLiteral("已开启局域网无人值守接收（端口 %1）。").arg(port));
+    updateControls();
+}
+
+void AccountWindow::stopLanReceiving() {
+    ++lan_host_generation_;
+    lan_host_.reset();
+    if (hotkey_ && !host_) {
+        UnregisterHotKey(reinterpret_cast<HWND>(winId()), stop_hotkey);
+        hotkey_ = false;
+    }
+    updateControls();
+}
+
+void AccountWindow::copyLanAddress() {
+    const auto ips = winText(p2p_lan_local_addresses());
+    const auto first = ips.section(QStringLiteral(","), 0, 0).trimmed();
+    if (first.isEmpty()) {
+        setStatus(QStringLiteral("未检测到可用的局域网 IPv4 地址。"));
+        return;
+    }
+    const auto port = lan_host_port_->value();
+    const auto text = port == P2P_LAN_DEFAULT_PORT
+        ? first : QStringLiteral("%1:%2").arg(first).arg(port);
+    if (auto* cb = QApplication::clipboard()) cb->setText(text);
+    setStatus(QStringLiteral("已复制本机局域网地址：%1").arg(text));
+}
+
+void AccountWindow::connectLanDevice() {
+    const auto raw = lan_target_host_->text().trimmed();
+    const auto code = lan_target_code_->text();
+    if (raw.isEmpty()) {
+        setStatus(QStringLiteral("请输入目标设备的局域网 IP 地址，或在上方列表点选设备。"));
+        lan_target_host_->setFocus();
+        return;
+    }
+    if (code.size() < 6 || code.size() > 32) {
+        setStatus(QStringLiteral("请输入 6 至 32 位被控码。"));
+        lan_target_code_->setFocus();
+        return;
+    }
+    QString host = raw;
+    std::uint16_t port = P2P_LAN_DEFAULT_PORT;
+    const int colon = raw.lastIndexOf(QLatin1Char(':'));
+    if (colon > 0 && raw.indexOf(QLatin1Char(':')) == colon) {
+        bool ok = false;
+        const int parsed = raw.mid(colon + 1).toInt(&ok);
+        if (!ok || parsed <= 0 || parsed > 65535) {
+            setStatus(QStringLiteral("端口号无效，请填写 1–65535。"));
+            lan_target_host_->setFocus();
+            return;
+        }
+        host = raw.left(colon).trimmed();
+        port = static_cast<std::uint16_t>(parsed);
+    }
+    if (host.isEmpty()) {
+        setStatus(QStringLiteral("请输入有效的目标 IP 地址。"));
+        return;
+    }
+    QSettings().setValue(QStringLiteral("lan/lastTarget"), raw);
+
+    QString display_name;
+    if (const auto* item = lan_peers_->currentItem();
+        item && item->data(Qt::UserRole).toString() == host && item->data(lan_port_role).toInt() == port) {
+        display_name = item->data(device_name_role).toString();
+    }
+    LanConnectOptions lan{host.toStdWString(), port, code.toStdWString()};
+    if (!viewer_) viewer_ = new RemoteWindow(this);
+    viewer_->openLanSession(lan, display_name, options_);
 }
 
 std::uint32_t AccountWindow::clearAgentApproval() {
@@ -1203,6 +1564,9 @@ void AccountWindow::connectDevice(bool diagnostics) {
 
 void AccountWindow::closeSessions() {
     refresh_.stop();
+    lan_scan_timer_.stop();
+    lan_scanner_.reset();
     delete viewer_.data();
     stopReceiving();
+    stopLanReceiving();
 }

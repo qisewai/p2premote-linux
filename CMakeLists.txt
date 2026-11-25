@@ -48,6 +48,7 @@ add_library(core STATIC
     core/src/stream_session.cpp
     core/src/minirtc_call.cpp
     core/src/signal_socket.cpp
+    core/src/direct_signal.cpp
     core/src/desktop_input.cpp
     core/src/cursor_shape.cpp
     core/src/latency_trace.cpp
@@ -59,7 +60,7 @@ target_include_directories(core PUBLIC core/include PRIVATE "${P2PREMOTE_MINIRTC
 target_compile_features(core PUBLIC cxx_std_20)
 target_compile_definitions(core PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(core PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(core PUBLIC input_protocol PRIVATE plugin_host d3d11 dxgi d3dcompiler dxguid crypt32 ole32 avrt mmdevapi windowsapp)
+target_link_libraries(core PUBLIC input_protocol PRIVATE plugin_host d3d11 dxgi d3dcompiler dxguid crypt32 ole32 avrt mmdevapi ws2_32 iphlpapi bcrypt windowsapp)
 
 add_library(stream_window STATIC viewer/stream_window.cpp viewer/connection_overlay.cpp)
 target_include_directories(stream_window PRIVATE core/src)
@@ -144,6 +145,13 @@ target_compile_options(core_api_test PRIVATE /W4 /utf-8)
 add_test(NAME core_api_test COMMAND core_api_test)
 set_tests_properties(core_api_test PROPERTIES TIMEOUT 12)
 
+add_executable(direct_signal_test core/src/direct_signal_test.cpp)
+target_include_directories(direct_signal_test PRIVATE core/src)
+target_link_libraries(direct_signal_test PRIVATE core ws2_32 bcrypt windowsapp)
+target_compile_options(direct_signal_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+add_test(NAME direct_signal_test COMMAND direct_signal_test)
+set_tests_properties(direct_signal_test PROPERTIES TIMEOUT 15)
+
 add_executable(idle_scroll_test tools/minirtc_probe/idle_scroll_test.cpp)
 target_include_directories(idle_scroll_test PRIVATE core/src tools/minirtc_probe "${P2PREMOTE_MINIRTC_DIR}")
 target_link_libraries(idle_scroll_test PRIVATE core windowsapp)
@@ -153,6 +161,8 @@ add_test(NAME idle_scroll_test COMMAND idle_scroll_test)
 add_test(NAME continuous_scroll_test COMMAND idle_scroll_test --continuous)
 add_test(NAME encoder_backlog_test COMMAND idle_scroll_test --encoder-backlog)
 add_test(NAME diagnostics_transport_test COMMAND idle_scroll_test --diagnostics-only)
+add_test(NAME lan_video_test COMMAND idle_scroll_test --lan-video)
+set_tests_properties(lan_video_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 18)
 set_tests_properties(diagnostics_transport_test PROPERTIES LABELS "loopback" TIMEOUT 12)
 set_tests_properties(idle_scroll_test continuous_scroll_test encoder_backlog_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 60
     SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)

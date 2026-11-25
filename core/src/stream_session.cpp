@@ -6,6 +6,7 @@
 #include "d3d11_video.h"
 #include "desktop_input.h"
 #include "desktop_switch.h"
+#include "direct_signal.h"
 #include "dxgi_capturer.h"
 #include "minirtc_call.h"
 #include "plugin_host.h"
@@ -251,7 +252,7 @@ struct ActiveStream {
     }
 
     std::shared_ptr<StreamEvents> events;
-    std::unique_ptr<SignalSocket> signal;
+    std::unique_ptr<ISignalTransport> signal;
     std::unique_ptr<MiniRtcCall> rtc;
     std::unique_ptr<PluginHost> overlay_plugin;
     std::shared_ptr<PluginOverlays> overlays;
@@ -589,16 +590,32 @@ void StreamSession::Open(HMONITOR monitor, HWND surface, StreamFrameRate frame_r
     const auto target_fps = static_cast<unsigned>(frame_rate);
     active->capture_interval = impl_->host && NeedsCaptureRateLimit(monitor, target_fps) ? QpcFrequency() / target_fps : 0;
     const auto target = !impl_->host ? winrt::to_string(connection.remote_device) : std::string{};
-    active->signal = std::make_unique<SignalSocket>(active->events, connection.signal_url,
-        impl_->host ? "listen_internet" : active->diagnostics ? "join_diagnostics" : "join_internet",
-        target, connection.access_token);
+    if (connection.lan_direct) {
+        if (impl_->host) {
+            active->signal = std::make_unique<DirectSignalServer>(active->events, connection.lan_host,
+                connection.lan_port, connection.lan_access_code);
+        } else {
+            active->signal = std::make_unique<DirectSignalClient>(active->events, connection.lan_host,
+                connection.lan_port, connection.lan_access_code);
+        }
+    } else {
+        active->signal = std::make_unique<SignalSocket>(active->events, connection.signal_url,
+            impl_->host ? "listen_internet" : active->diagnostics ? "join_diagnostics" : "join_internet",
+            target, connection.access_token);
+    }
     impl_->samples.clear();
     impl_->stats = {};
     impl_->stats.target_fps = impl_->host ? target_fps : 0;
     impl_->capture_to_submit_total = impl_->draw_to_present_total = 0;
     impl_->decoded_frame_wait_ticks = 0;
     impl_->active = std::move(active);
-    impl_->detail = L"正在连接信令服务 · " + connection.signal_url;
+    if (connection.lan_direct) {
+        impl_->detail = impl_->host
+            ? (L"正在启动局域网直连监听 · 端口 " + std::to_wstring(connection.lan_port))
+            : (L"正在直连 " + connection.lan_host + L":" + std::to_wstring(connection.lan_port));
+    } else {
+        impl_->detail = L"正在连接信令服务 · " + connection.signal_url;
+    }
     impl_->state = StreamState::waiting;
 }
 
@@ -845,7 +862,11 @@ void StreamSession::ProcessEvents() {
             if (impl_->host && impl_->state == StreamState::waiting && event.name == "ready") {
                 active.host_registered = true;
                 impl_->reconnect.reset();
-                impl_->detail = L"等待同账号设备连接";
+                if (impl_->connection.lan_direct) {
+                    impl_->detail = L"局域网无人值守等待连接 · 端口 " + std::to_wstring(impl_->connection.lan_port);
+                } else {
+                    impl_->detail = L"等待同账号设备连接";
+                }
                 if (impl_->connection.auto_control) impl_->detail += L" · 自动允许整桌面控制";
             } else if (impl_->host && impl_->state == StreamState::waiting &&
                 (event.name == "request" || event.name == "request_diagnostics")) {

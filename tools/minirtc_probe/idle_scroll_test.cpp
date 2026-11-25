@@ -1,4 +1,5 @@
 #include "d3d11_preview.h"
+#include "direct_signal.h"
 #include "minirtc_call.h"
 #include "qpc.h"
 
@@ -305,15 +306,85 @@ int CheckDiagnosticsConnection() {
     return 0;
 }
 
+int CheckLanVideo() {
+    const auto host_events = std::make_shared<StreamEvents>();
+    const auto viewer_events = std::make_shared<StreamEvents>();
+    ConnectionOptions options;
+    options.lan_direct = true;
+    options.ice_trace_dir = std::filesystem::temp_directory_path() / L"P2PRemote" / L"lan-video-test";
+    const auto device = CreateD3d11Device(true);
+    constexpr std::uint16_t port = 39889;
+    constexpr wchar_t code[] = L"VideoLoopback2026";
+    DirectSignalServer server(host_events, L"127.0.0.1", port, code, 0);
+    std::unique_ptr<DirectSignalClient> client;
+    std::unique_ptr<MiniRtcCall> host, viewer;
+    bool host_connected{}, viewer_connected{};
+    const auto first_frame = MakeFrame(device.get(), 118);
+    auto next_frame = Clock::now();
+    const auto deadline = next_frame + 12s;
+    const auto relay = [](StreamEvent& event, MiniRtcCall& rtc, ISignalTransport& signal, bool& connected) {
+        if (event.type == StreamEventType::minirtc_signal && MiniRtcCall::IsSessionSignal(event.payload)) {
+            signal.Send("minirtc", std::move(event.payload));
+        } else if (event.type == StreamEventType::signal && event.name == "minirtc") {
+            rtc.ReceiveSignal(event.payload);
+        } else if (event.type == StreamEventType::connected) {
+            connected = true;
+        }
+    };
+    const auto check = [](const StreamEvent& event) {
+        if (event.type == StreamEventType::error || event.type == StreamEventType::signal_lost ||
+            event.type == StreamEventType::media_lost || event.name == "ended") {
+            throw std::runtime_error("LAN video test: " + event.payload);
+        }
+    };
+    while (Clock::now() < deadline) {
+        for (auto& event : host_events->Drain()) {
+            check(event);
+            if (event.name == "ready") {
+                client = std::make_unique<DirectSignalClient>(viewer_events, L"127.0.0.1", port, code);
+            } else if (event.name == "request") {
+                host = std::make_unique<MiniRtcCall>(true, host_events, options, true, 60, device.get());
+                server.Send("accept", "control");
+            } else if (host) {
+                relay(event, *host, server, host_connected);
+            }
+        }
+        for (auto& event : viewer_events->Drain()) {
+            check(event);
+            if (event.name == "accepted") {
+                viewer = std::make_unique<MiniRtcCall>(false, viewer_events, options, true, 60, device.get());
+            } else if (viewer) {
+                relay(event, *viewer, *client, viewer_connected);
+            }
+        }
+        if (host_connected && viewer_connected) {
+            const auto now = Clock::now();
+            if (now >= next_frame) {
+                host->Submit(first_frame);
+                next_frame = now + 40ms;
+            }
+            if (const auto frame = viewer->TakeFrame(); frame && Matches(*frame, 118)) {
+                std::puts("LAN viewer decoded the synthetic video frame after direct TCP signaling");
+                return 0;
+            }
+        }
+        std::this_thread::sleep_for(2ms);
+    }
+    throw std::runtime_error(host_connected && viewer_connected
+        ? "LAN media connected but no video frame was decoded" : "LAN signaling did not establish the media connection");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const std::string_view mode = argc == 2 ? argv[1] : "";
-        if (argc != 1 && mode != "--continuous" && mode != "--encoder-backlog" && mode != "--diagnostics-only") {
-            throw std::runtime_error("Usage: idle_scroll_test [--continuous | --encoder-backlog | --diagnostics-only]");
+        if (argc != 1 && mode != "--continuous" && mode != "--encoder-backlog" && mode != "--diagnostics-only" &&
+                mode != "--lan-video") {
+            throw std::runtime_error("Usage: idle_scroll_test [--continuous | --encoder-backlog | --diagnostics-only | --lan-video]");
         }
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        if (mode == "--lan-video") return CheckLanVideo();
         return mode == "--diagnostics-only" ? CheckDiagnosticsConnection() : Run(mode);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "Idle scroll test failed: %s\n", error.what());

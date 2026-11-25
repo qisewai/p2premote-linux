@@ -18,6 +18,7 @@ class QLineEdit;
 class QListWidget;
 class QMessageBox;
 class QPushButton;
+class QSpinBox;
 class QStackedWidget;
 class QSystemTrayIcon;
 class HostSession;
@@ -29,6 +30,8 @@ public:
     explicit AccountWindow(LaunchOptions options);
     ~AccountWindow() override;
     bool valid() const { return account_ != nullptr; }
+    void startLanHostFromCli(const QString& code, std::uint16_t port = P2P_LAN_DEFAULT_PORT);
+    void connectLanFromCli(const QString& target, const QString& code);
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -41,6 +44,14 @@ private:
 
     QWidget* makeLoginPage();
     QWidget* makeDevicesPage();
+    QWidget* makeLanPage();
+    void toggleLanMode();
+    void refreshLanPeers();
+    void toggleLanReceiving();
+    void startLanReceiving();
+    void stopLanReceiving();
+    void connectLanDevice();
+    void copyLanAddress();
     void makeTray();
     void restore();
     void quit();
@@ -73,6 +84,11 @@ private:
     std::unique_ptr<p2p_account, decltype(&p2p_account_destroy)> account_{nullptr, p2p_account_destroy};
     std::unique_ptr<HostSession> host_;
     uint64_t host_generation_{};
+    std::unique_ptr<HostSession> lan_host_;
+    uint64_t lan_host_generation_{};
+    std::unique_ptr<p2p_lan_scanner, decltype(&p2p_lan_scanner_destroy)> lan_scanner_{nullptr, p2p_lan_scanner_destroy};
+    QTimer lan_scan_timer_;
+    bool lan_mode_{};
     QPointer<RemoteWindow> viewer_;
     QPointer<SettingsDialog> settings_dialog_;
     TitleBar* title_bar_{};
@@ -94,7 +110,14 @@ private:
     bool hotkey_{};
     bool quitting_{};
     QStackedWidget* pages_{};
-    QWidget *login_page_{}, *devices_page_{};
+    QWidget *login_page_{}, *devices_page_{}, *lan_page_{};
+    QPushButton* mode_button_{};
+    QLabel *lan_local_ips_{}, *lan_host_status_{};
+    QSpinBox* lan_host_port_{};
+    QComboBox* lan_screens_{};
+    QLineEdit *lan_host_code_{}, *lan_target_host_{}, *lan_target_code_{};
+    QPushButton *lan_receive_{}, *lan_connect_{}, *lan_scan_button_{};
+    QListWidget* lan_peers_{};
     QLineEdit *server_{}, *user_{}, *password_{};
     QCheckBox* remember_{};
     QLabel *status_{}, *account_heading_{}, *host_status_{}, *privilege_status_{};

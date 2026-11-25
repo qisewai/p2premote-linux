@@ -28,6 +28,19 @@ StreamDriver::StreamDriver(p2p_account* account, bool host, const wchar_t* devic
     const p2p_connection_options_v1 settings{
         options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, host, diagnostics};
     stream_.reset(p2p_stream_create(account, host, device, video_parent, &settings));
+    initTimersAndWaits();
+}
+
+StreamDriver::StreamDriver(const LanConnectOptions& lan, void* video_parent,
+    const LaunchOptions& options, QObject* parent) : QObject(parent) {
+    const p2p_lan_options_v1 settings{
+        lan.host.c_str(), lan.port, lan.access_code.c_str(), 0,
+        options.ice_trace.c_str(), options.latency_trace.c_str()};
+    stream_.reset(p2p_stream_create_lan(0, video_parent, &settings));
+    initTimersAndWaits();
+}
+
+void StreamDriver::initTimersAndWaits() {
     if (!stream_) return;
 
     for (uint32_t kind = 0; kind < waits_.size(); ++kind) {

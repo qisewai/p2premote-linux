@@ -42,6 +42,15 @@ int main(void) {
             && check(p2p_stream_send_ui_event(NULL, 1, "btn", "click", "{}") == P2P_ERROR, "Null stream UI event accepted")
             && check(p2p_stream_set_audio(NULL, &audio) == P2P_ERROR, "Null stream audio options accepted");
     }
+    {
+        p2p_lan_options_v1 bad_lan = {L"127.0.0.1", P2P_LAN_DEFAULT_PORT, L"123", 1, NULL, NULL};
+        p2p_lan_scanner* scanner = p2p_lan_scanner_create();
+        passed &= check(p2p_stream_create_lan(1, NULL, NULL) == NULL, "Null LAN options accepted")
+            && check(p2p_stream_create_lan(1, NULL, &bad_lan) == NULL, "Short LAN access code accepted")
+            && check(p2p_lan_local_addresses() != NULL, "Local LAN addresses returned NULL")
+            && check(scanner != NULL, "LAN scanner creation failed");
+        p2p_lan_scanner_destroy(scanner);
+    }
     p2p_account_destroy(account);
     return passed ? 0 : 1;
 }

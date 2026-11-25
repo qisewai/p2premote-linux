@@ -31,7 +31,11 @@ int main(int argc, char* argv[]) {
     const QCommandLineOption stun(QStringLiteral("stun"), QStringLiteral("覆盖 STUN 地址"), QStringLiteral("stun:主机:端口"));
     const QCommandLineOption stun_only(QStringLiteral("stun-only"), QStringLiteral("仅使用直连"));
     const QCommandLineOption relay_only(QStringLiteral("relay-only"), QStringLiteral("仅使用 TURN 中继"));
-    parser.addOptions({compatibility, ice, latency, stun, stun_only, relay_only});
+    const QCommandLineOption lan_host(QStringLiteral("lan-host"), QStringLiteral("启动局域网无人值守被控模式"));
+    const QCommandLineOption lan_connect(QStringLiteral("lan-connect"), QStringLiteral("局域网直连目标 IP[:端口]"), QStringLiteral("地址"));
+    const QCommandLineOption lan_port(QStringLiteral("lan-port"), QStringLiteral("局域网监听端口"), QStringLiteral("端口"));
+    const QCommandLineOption lan_code(QStringLiteral("lan-code"), QStringLiteral("局域网固定被控码"), QStringLiteral("被控码"));
+    parser.addOptions({compatibility, ice, latency, stun, stun_only, relay_only, lan_host, lan_connect, lan_port, lan_code});
     parser.process(app);
 
     const auto ice_server = parser.value(stun);
@@ -51,5 +55,11 @@ int main(int argc, char* argv[]) {
         ice_server.toStdString(), parser.isSet(stun_only), parser.isSet(relay_only), parser.isSet(compatibility)});
     window.setObjectName(QStringLiteral("accountWindow"));
     window.show();
+    if (parser.isSet(lan_host)) {
+        const auto port = static_cast<std::uint16_t>(parser.isSet(lan_port) ? parser.value(lan_port).toUShort() : P2P_LAN_DEFAULT_PORT);
+        window.startLanHostFromCli(parser.value(lan_code), port);
+    } else if (parser.isSet(lan_connect)) {
+        window.connectLanFromCli(parser.value(lan_connect), parser.value(lan_code));
+    }
     return app.exec();
 }

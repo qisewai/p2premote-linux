@@ -14,12 +14,15 @@
 extern "C" {
 #endif
 
-#define P2P_CORE_ABI_VERSION 7u
+#define P2P_CORE_ABI_VERSION 8u
+#define P2P_LAN_DEFAULT_PORT 27887u
+#define P2P_LAN_DISCOVERY_PORT 27888u
 /* The viewer posts this message to video_parent for a local F11 fullscreen toggle. */
 #define P2P_VIDEO_FULLSCREEN_MESSAGE 0x8042u
 
 typedef struct p2p_account p2p_account;
 typedef struct p2p_stream p2p_stream;
+typedef struct p2p_lan_scanner p2p_lan_scanner;
 
 enum p2p_result {
     P2P_OK = 0,
@@ -54,6 +57,27 @@ typedef struct p2p_connection_options_v1 {
     /* Viewer opens a diagnostics-only session. Interactive host accepts such requests. */
     int32_t diagnostics;
 } p2p_connection_options_v1;
+
+typedef struct p2p_lan_options_v1 {
+    /* Viewer: target IP/host. Host: optional bind address (NULL or "" binds 0.0.0.0). */
+    const wchar_t* host_address;
+    /* 0 selects P2P_LAN_DEFAULT_PORT. */
+    uint16_t port;
+    /* Fixed unattended access code (6-32 characters). */
+    const wchar_t* access_code;
+    /* Host: auto-approve full desktop control when non-zero. */
+    int32_t auto_control;
+    const wchar_t* ice_trace_directory;
+    const wchar_t* latency_trace_directory;
+} p2p_lan_options_v1;
+
+typedef struct p2p_lan_peer_v1 {
+    const wchar_t* id;
+    const wchar_t* name;
+    const wchar_t* address;
+    uint16_t port;
+    int32_t busy;
+} p2p_lan_peer_v1;
 
 typedef struct p2p_stream_snapshot_v1 {
     const wchar_t* status;
@@ -139,6 +163,15 @@ P2P_CORE_API int32_t p2p_account_device(const p2p_account* account, size_t index
  */
 P2P_CORE_API p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host,
     const wchar_t* remote_device, void* video_parent, const p2p_connection_options_v1* options);
+P2P_CORE_API p2p_stream* p2p_stream_create_lan(int32_t host, void* video_parent,
+    const p2p_lan_options_v1* options);
+P2P_CORE_API p2p_lan_scanner* p2p_lan_scanner_create(void);
+P2P_CORE_API void p2p_lan_scanner_destroy(p2p_lan_scanner* scanner);
+P2P_CORE_API int32_t p2p_lan_scanner_probe(p2p_lan_scanner* scanner);
+P2P_CORE_API size_t p2p_lan_scanner_read(p2p_lan_scanner* scanner);
+P2P_CORE_API int32_t p2p_lan_scanner_peer(const p2p_lan_scanner* scanner, size_t index, p2p_lan_peer_v1* peer);
+/* Thread-local borrowed string listing comma-separated local IPv4 LAN addresses. */
+P2P_CORE_API const wchar_t* p2p_lan_local_addresses(void);
 P2P_CORE_API void p2p_stream_destroy(p2p_stream* stream);
 P2P_CORE_API int32_t p2p_stream_start(p2p_stream* stream, void* monitor, uint32_t fps);
 P2P_CORE_API int32_t p2p_stream_stop(p2p_stream* stream, const wchar_t* reason);
