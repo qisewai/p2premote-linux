@@ -455,6 +455,7 @@ RemoteWindow::RemoteWindow(QWidget* parent)
     status_text_ = new QLabel(statusbar_);
     status_text_->setObjectName(QStringLiteral("remoteStatusText"));
     status_text_->setTextFormat(Qt::PlainText);
+    status_text_->setWordWrap(true);
     bottom->addWidget(status_text_, 1);
     layout_->addWidget(statusbar_);
 
@@ -724,8 +725,8 @@ void RemoteWindow::refreshChrome() {
     if (agent_shared) left += QStringLiteral("  ·  正在共享 Agent 只读诊断");
     if (status_text_->text() != left) status_text_->setText(left);
 
-    const bool need_statusbar = !fullscreen_mode_
-        && (!current->playing() || current->diagnostics() || !current->noticeText().isEmpty() || agent_shared);
+    const bool need_statusbar = !current->noticeText().isEmpty()
+        || (!fullscreen_mode_ && (!current->playing() || current->diagnostics() || agent_shared));
     statusbar_->setVisible(need_statusbar);
 }
 

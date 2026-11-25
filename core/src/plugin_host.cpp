@@ -1003,12 +1003,13 @@ public:
         if (manifest_.clipboard) Call(callbacks_.clipboard, 1, text);
     }
 
-    void ClipboardFilesChanged(const std::vector<LocalClipboardFile>& files) {
+    void ClipboardFilesChanged(const std::vector<LocalClipboardFile>& files, std::string_view issue) {
         if (!healthy_ || callbacks_.clipboard_files == LUA_NOREF) return;
         struct Change {
             int ref;
             const std::vector<LocalClipboardFile>& files;
-        } change{callbacks_.clipboard_files, files};
+            std::string_view issue;
+        } change{callbacks_.clipboard_files, files, issue};
         Run([](lua_State* state) {
             const auto& args = *static_cast<const Change*>(lua_touserdata(state, 1));
             lua_rawgeti(state, LUA_REGISTRYINDEX, args.ref);
@@ -1021,9 +1022,15 @@ public:
                 lua_setfield(state, -2, "name");
                 lua_rawseti(state, -2, static_cast<lua_Integer>(i + 1));
             }
-            lua_call(state, 1, 0);
+            if (args.issue.empty()) lua_pushnil(state);
+            else PushString(state, args.issue);
+            lua_call(state, 2, 0);
             return 0;
         }, &change);
+    }
+
+    void ClipboardError(std::string_view error) {
+        Call(callbacks_.clipboard_error, 1, error);
     }
 
     void ClipboardRead(ClipboardReadRequest request) {
@@ -2730,6 +2737,7 @@ private:
             }},
             {"on_change", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.clipboard_files); return 0; }},
             {"on_read", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.clipboard_read); return 0; }},
+            {"on_error", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.clipboard_error); return 0; }},
             {"publish", PublishFiles}, {"clear", ClearPublishedFiles}, {"reply", ReplyToClipboardRead},
             {nullptr, nullptr}
         };
@@ -2851,6 +2859,7 @@ private:
         int clipboard{LUA_NOREF};
         int clipboard_files{LUA_NOREF};
         int clipboard_read{LUA_NOREF};
+        int clipboard_error{LUA_NOREF};
         int lock_state{LUA_NOREF};
     } callbacks_;
     std::array<Timer, 32> timers_{};
@@ -3015,9 +3024,14 @@ struct PluginHost::Impl {
                 auto now = GetTickCount64();
                 if (runtime.clipboard && connected.load() && runtime.clipboard->Poll(now)) {
                     for (const auto& plugin : plugins) plugin->ClipboardChanged(runtime.clipboard->Text());
-                    for (const auto& plugin : plugins) plugin->ClipboardFilesChanged(runtime.clipboard->Files());
+                    for (const auto& plugin : plugins) {
+                        plugin->ClipboardFilesChanged(runtime.clipboard->Files(), runtime.clipboard->FileIssue());
+                    }
                 }
                 if (runtime.file_clipboard && connected.load()) {
+                    if (const auto error = runtime.file_clipboard->TakeError(); !error.empty() && runtime.file_clipboard_owner) {
+                        runtime.file_clipboard_owner->ClipboardError(error);
+                    }
                     if (auto request = runtime.file_clipboard->TakeRequest()) {
                         if (runtime.file_clipboard_owner) runtime.file_clipboard_owner->ClipboardRead(*request);
                         else runtime.file_clipboard->Reply(request->id, std::nullopt);

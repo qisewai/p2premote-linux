@@ -10,11 +10,42 @@ local WINDOW = 24 * CHUNK
 local ID = "<I4"
 local READ = "<I4I4I4i8I4"
 local DATA = "<I4I4"
-local ready, hello_timer = false, nil
+local ready, hello_timer, negotiation_expired = false, nil, false
 local peer_chunk = LEGACY_CHUNK
 local selection, offer_serial, advertised, advertise_timer = nil, 0, 0, nil
 local remote_offer = 0
 local incoming, outgoing, last_request = nil, nil, 0
+
+local problems = {
+    external_files = "剪贴板只有虚拟文件。请先保存到本地，或暂停其他远控软件的剪贴板同步后重新复制。",
+    file_list_unreadable = "无法读取复制的文件清单。请检查文件是否可访问，或减少文件数量后重试。",
+    clipboard_busy = "写入剪贴板超时。请关闭正在占用剪贴板的应用，再重新复制。",
+    clipboard_changed = "剪贴板内容在同步时已变更，请重新复制文件。",
+    publish_failed = "无法写入文件剪贴板，请重新复制文件。",
+    manifest_invalid = "无法识别收到的文件清单，请重新复制文件。",
+    peer_unavailable = "对端文件剪贴板未就绪。请确认两端已启用文件剪贴板后重试。",
+    selection_expired = "复制的文件已失效，请重新复制后再粘贴。",
+    source_unavailable = "源文件已变更或无法读取，请重新复制后再粘贴。",
+    transfer_timeout = "读取文件超时。请检查远程连接，再重新粘贴。",
+    transfer_invalid = "文件传输数据不完整，请重新复制后再粘贴。"
+}
+local last_problem = {}
+
+local function report(code, peer)
+    local message = problems[code]
+    if not message then return end
+    local key = (peer and "peer:" or "local:") .. code
+    local now = timer.now_ms()
+    if last_problem[key] and now - last_problem[key] < 8000 then return end
+    local delivered
+    if viewer then
+        local prefix = peer and "被控端文件剪贴板：" or "本机文件剪贴板："
+        delivered = p2p.ui.notify(prefix .. message)
+    elseif ready then
+        delivered = channel.send("problem", code)
+    end
+    if delivered then last_problem[key] = now end
+end
 
 -- Source paths and write timestamps stay here. The peer sees names, sizes and
 -- indices into the one selection the user explicitly copied.
@@ -63,7 +94,10 @@ end
 
 local function advertise()
     advertise_timer = nil
-    if not ready then return end
+    if not ready then
+        if selection and negotiation_expired then report("peer_unavailable", true) end
+        return
+    end
     if selection then
         if advertised == selection.id then return end
         if channel.send("offer", selection.payload) then
@@ -81,7 +115,7 @@ local function advertise()
     advertise_timer = timer.after(50, advertise)
 end
 
-clipboard.on_change(function(paths)
+clipboard.on_change(function(paths, issue)
     stop_outgoing()
     if advertise_timer then timer.cancel(advertise_timer) end
     selection = nil
@@ -93,8 +127,18 @@ clipboard.on_change(function(paths)
             selection = { id = offer_serial, payload = payload, sources = sources }
         end
     end
-    if #paths > 0 and not selection then p2p.log.warn("Could not describe the clipboard file selection") end
+    if issue then
+        report(issue)
+    elseif #paths > 0 and not selection then
+        p2p.log.warn("Could not describe the clipboard file selection")
+        report("file_list_unreadable")
+    end
     advertise()
+end)
+
+clipboard.on_error(function(code)
+    report(code)
+    if code == "transfer_timeout" then stop_incoming(true) end
 end)
 
 local function send_read()
@@ -103,6 +147,7 @@ local function send_read()
     if timer.now_ms() >= job.deadline then
         clipboard.reply(job.id, nil)
         stop_incoming(false)
+        report("transfer_timeout")
     elseif not channel.send("read", job.payload) then
         job.retry = timer.after(30, send_read)
     end
@@ -112,6 +157,7 @@ clipboard.on_read(function(id, offer, index, offset, size)
     stop_incoming(true)
     if not ready or offer ~= remote_offer then
         clipboard.reply(id, nil)
+        report("selection_expired")
         return
     end
     incoming = {
@@ -187,6 +233,7 @@ local function receive_data(payload)
     if offset ~= job.received or #data > job.size - job.received then
         clipboard.reply(id, nil)
         stop_incoming(true)
+        report("transfer_invalid")
     elseif not clipboard.reply(id, data) then
         stop_incoming(true)
     else
@@ -207,6 +254,8 @@ p2p.session.on("connected", function()
             channel.send("hello", "1")
         else
             timer.cancel(hello_timer)
+            negotiation_expired = true
+            if selection then report("peer_unavailable", true) end
         end
     end)
 end)
@@ -237,13 +286,21 @@ channel.on_message(function(kind, payload)
         return
     end
     if not ready then return end
-    if kind == "offer" and #payload <= MAX_MANIFEST then
-        local manifest = p2p.json.decode(payload)
+    if kind == "problem" and viewer then
+        report(payload, true)
+    elseif kind == "offer" then
+        local manifest = #payload <= MAX_MANIFEST and p2p.json.decode(payload)
         if type(manifest) ~= "table" or math.type(manifest.id) ~= "integer" or
-            manifest.id <= remote_offer or manifest.id > 0xffffffff or type(manifest.files) ~= "table" then return end
+            manifest.id <= 0 or manifest.id > 0xffffffff or type(manifest.files) ~= "table" then
+            report("manifest_invalid")
+            return
+        end
+        if manifest.id <= remote_offer then return end
         if clipboard.publish(manifest.id, manifest.files) then
             stop_incoming(true)
             remote_offer = manifest.id
+        else
+            report("manifest_invalid")
         end
     elseif kind == "read" then
         serve(payload)
@@ -257,6 +314,7 @@ channel.on_message(function(kind, payload)
         elseif kind == "cancel" and outgoing and outgoing.id == id then
             stop_outgoing()
         elseif kind == "error" and incoming and incoming.id == id then
+            report("source_unavailable")
             clipboard.reply(id, nil)
             stop_incoming(false)
         end

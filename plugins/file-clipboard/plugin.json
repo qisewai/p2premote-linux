@@ -6,5 +6,5 @@
   "entry": "main.lua",
   "roles": ["host", "viewer"],
   "enabled": true,
-  "permissions": ["channel", "file_clipboard", "fs", "log"]
+  "permissions": ["channel", "file_clipboard", "fs", "log", "ui"]
 }

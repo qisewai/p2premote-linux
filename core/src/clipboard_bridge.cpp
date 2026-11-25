@@ -2,6 +2,7 @@
 #include "file_clipboard.h"
 
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <atomic>
@@ -174,9 +175,17 @@ bool ClipboardBridge::Read() {
     const auto marker = watch_files_ ? VirtualFileClipboardMarker() : 0;
     const bool virtual_files = marker && IsClipboardFormatAvailable(marker);
     const bool dropped_files = watch_files_ && IsClipboardFormatAvailable(CF_HDROP);
+    const bool external_files = watch_files_ && !virtual_files && !dropped_files && [] {
+        static const auto descriptor = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+        static const auto ansi_descriptor = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORA);
+        return IsClipboardFormatAvailable(descriptor) || IsClipboardFormatAvailable(ansi_descriptor);
+    }();
     text_ = !virtual_files && !dropped_files && IsClipboardFormatAvailable(CF_UNICODETEXT) ?
         UnicodeClipboardText() : std::string{};
     files_ = !virtual_files && dropped_files ? DroppedFiles() : std::vector<LocalClipboardFile>{};
+    file_issue_ = {};
+    if (external_files) file_issue_ = "external_files";
+    else if (!virtual_files && dropped_files && files_.empty()) file_issue_ = "file_list_unreadable";
     sequence_ = GetClipboardSequenceNumber();
     dirty_ = false;
     if (!std::exchange(initialized_, true)) return false;

@@ -40,6 +40,7 @@ public:
     bool Available() const noexcept;
     bool Publish(std::uint32_t offer, std::span<const ClipboardFile> files);
     void Clear(std::uint32_t offer = 0);
+    std::string_view TakeError();
     std::optional<ClipboardReadRequest> TakeRequest();
     bool Reply(std::uint32_t id, std::optional<std::string_view> data);
 

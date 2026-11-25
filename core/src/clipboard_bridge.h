@@ -24,6 +24,7 @@ public:
     bool Available() const noexcept { return window_ != nullptr; }
     std::string_view Text() const noexcept { return text_; }
     const std::vector<LocalClipboardFile>& Files() const noexcept { return files_; }
+    std::string_view FileIssue() const noexcept { return file_issue_; }
     void WatchFiles() noexcept { watch_files_ = true; }
     bool SetText(std::string_view text);
     bool Poll(ULONGLONG now);
@@ -50,6 +51,7 @@ private:
     std::string pending_utf8_;
     std::string text_;
     std::vector<LocalClipboardFile> files_;
+    std::string_view file_issue_;
 };
 
 } // namespace p2premote

@@ -130,7 +130,10 @@ struct FileClipboard::State {
                 deadline = now + read_timeout_ms;
                 received = range->data.size();
             }
-            if (now >= deadline) break;
+            if (now >= deadline) {
+                ReportError("transfer_timeout");
+                break;
+            }
             lock.unlock();
             // EmptyClipboard can send WM_DESTROYCLIPBOARD synchronously to
             // OLE's window, including from our text clipboard worker.
@@ -151,6 +154,12 @@ struct FileClipboard::State {
         return result;
     }
 
+    // Called with mutex held. Only fixed error codes cross the worker boundary.
+    void ReportError(std::string_view code) {
+        error = code;
+        SetEvent(plugin_wake);
+    }
+
     const HANDLE plugin_wake;
     winrt::handle changed{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
     winrt::handle response{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
@@ -162,6 +171,7 @@ struct FileClipboard::State {
     std::uint32_t next_read{};
     std::shared_ptr<const Offer> pending;
     std::optional<Range> range;
+    std::string_view error;
 };
 
 namespace {
@@ -426,6 +436,7 @@ bool FileClipboard::Publish(std::uint32_t offer, std::span<const ClipboardFile> 
     const std::lock_guard lock(state_->mutex);
     if (!state_->available) return false;
     state_->active = offer;
+    state_->error = {};
     state_->pending = command;
     SetEvent(state_->response.get());
     SetEvent(state_->changed.get());
@@ -439,6 +450,11 @@ void FileClipboard::Clear(std::uint32_t offer) {
     state_->pending.reset();
     SetEvent(state_->response.get());
     SetEvent(state_->changed.get());
+}
+
+std::string_view FileClipboard::TakeError() {
+    const std::lock_guard lock(state_->mutex);
+    return std::exchange(state_->error, std::string_view{});
 }
 
 std::optional<ClipboardReadRequest> FileClipboard::TakeRequest() {
@@ -490,8 +506,11 @@ void FileClipboard::Run(std::stop_token stop) noexcept {
         auto wait = INFINITE;
         if (pending) {
             HRESULT result = E_ABORT;
-            if (GetTickCount64() < pending->until && GetClipboardSequenceNumber() == pending->sequence &&
+            const auto now = GetTickCount64();
+            auto error = now >= pending->until ? "clipboard_busy" : "clipboard_changed";
+            if (now < pending->until && GetClipboardSequenceNumber() == pending->sequence &&
                 GetClipboardOwner() == pending->owner) {
+                error = "publish_failed";
                 try {
                     auto object = winrt::make<FileDataObject>(state_, pending);
                     result = OleSetClipboard(object.get());
@@ -507,7 +526,10 @@ void FileClipboard::Run(std::stop_token stop) noexcept {
                 const std::lock_guard lock(state_->mutex);
                 if (state_->pending == pending) {
                     state_->pending.reset();
-                    if (FAILED(result)) state_->active = 0;
+                    if (FAILED(result)) {
+                        state_->active = 0;
+                        state_->ReportError(error);
+                    }
                 }
                 continue;
             }

@@ -1,5 +1,6 @@
 #include "plugin_host.h"
 #include "agent_audit.h"
+#include "file_clipboard.h"
 #include "pty_session.h"
 
 #include <p2premote/plugin_protocol.h>
@@ -279,6 +280,22 @@ public:
         return false;
     }
 
+    bool PutVirtualFile() {
+        const auto block = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(FILEGROUPDESCRIPTORW));
+        if (!block) return false;
+        auto* group = static_cast<FILEGROUPDESCRIPTORW*>(GlobalLock(block));
+        if (group) {
+            group->cItems = 1;
+            constexpr wchar_t name[] = L"external.txt";
+            std::memcpy(group->fgd[0].cFileName, name, sizeof(name));
+            GlobalUnlock(block);
+        }
+        const auto format = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+        if (group && format && PutBlock(format, block)) return true;
+        GlobalFree(block);
+        return false;
+    }
+
     bool Contains(const std::wstring& expected) {
         bool same{};
         if (OpenClipboard(window)) {
@@ -517,6 +534,8 @@ int TestFileClipboard(const std::filesystem::path& root) {
     source.SetConnected(true);
     Deliver(source, {plugin, "hello", "1"});
     Check(source_log.Wait({plugin, "ready", "1"}), "Source file clipboard did not negotiate");
+    Check(clipboard.PutVirtualFile(), "Could not copy an external virtual file");
+    Check(source_log.Wait({plugin, "problem", "external_files"}), "External files were silently ignored");
     Check(clipboard.PutFiles({folder, empty}), "Could not copy paths to the clipboard");
     const auto manifest = source_log.WaitForType(plugin, "offer");
     Check(manifest && manifest->find("文件.bin") != std::string::npos &&
@@ -543,6 +562,9 @@ int TestFileClipboard(const std::filesystem::path& root) {
     receiver.SetConnected(true);
     Check(source_log.Wait({plugin, "ready", "1"}, 2), "Destination file clipboard did not negotiate");
 
+    Deliver(receiver, {plugin, "problem", "external_files"});
+    Deliver(receiver, {plugin, "problem", "external_files"});
+    Deliver(receiver, {plugin, "problem", "unrecognized_error"});
     Deliver(receiver, {plugin, "offer", R"({"id":2,"files":[["..\\\\outside",1,false]]})"});
     Deliver(receiver, {plugin, "offer", *manifest});
     const auto format = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW));
@@ -553,6 +575,11 @@ int TestFileClipboard(const std::filesystem::path& root) {
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
     }
     Check(IsClipboardFormatAvailable(format), "The OLE file clipboard was not published");
+    const auto notices = receiver.TakeActions();
+    Check(notices.size() == 2 && notices[0].kind == PluginAction::Kind::notice && notices[1].kind == PluginAction::Kind::notice &&
+        notices[0].notice.starts_with(L"被控端文件剪贴板：剪贴板只有虚拟文件") &&
+        notices[1].notice.starts_with(L"本机文件剪贴板：无法识别收到的文件清单"),
+        "File clipboard notices did not identify the side and reason or were repeated");
     winrt::com_ptr<IDataObject> object;
     Check(SUCCEEDED(OleGetClipboard(object.put())) && object, "Could not obtain the OLE clipboard");
     struct Medium {
@@ -599,6 +626,10 @@ int TestFileClipboard(const std::filesystem::path& root) {
     Medium changed;
     Check(SUCCEEDED(object->GetData(&content_request, &changed.value)), "Could not reopen the virtual file stream");
     Check(FAILED(changed.value.pstm->Read(&byte, 1, &count)), "An altered source file was accepted");
+    const auto paste_notices = receiver.TakeActions();
+    Check(paste_notices.size() == 1 &&
+        paste_notices.front().notice.starts_with(L"本机文件剪贴板：源文件已变更或无法读取"),
+        "An altered source file did not explain the paste failure");
     Medium pending;
     Check(SUCCEEDED(object->GetData(&content_request, &pending.value)), "Could not open a stream for the disconnect test");
     hold_reads = true;
@@ -610,6 +641,19 @@ int TestFileClipboard(const std::filesystem::path& root) {
         GetTickCount64() - start < 3000, "Disconnect did not cancel a pending file read");
     disconnect.join();
     Check(FAILED(data.value.pstm->Read(&byte, 1, &count)), "A stream remained readable after disconnect");
+    source.Stop();
+
+    const winrt::handle publish_wake{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    FileClipboard publish_test(publish_wake.get());
+    Check(publish_test.Available(), "Could not start the file clipboard writer");
+    {
+        Check(OpenClipboard(nullptr), "Could not lock the clipboard for the publication test");
+        struct UnlockClipboard { ~UnlockClipboard() { CloseClipboard(); } } unlock;
+        const ClipboardFile descriptor{L"sample.txt", 0, false};
+        Check(publish_test.Publish(1, std::span(&descriptor, 1)), "Could not queue the clipboard write");
+        Check(WaitForSingleObject(publish_wake.get(), 3000) == WAIT_OBJECT_0 &&
+            publish_test.TakeError() == "clipboard_busy", "A blocked clipboard write did not report a timeout");
+    }
     return 0;
 }
 
