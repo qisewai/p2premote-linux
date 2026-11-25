@@ -25,3 +25,7 @@ inline constexpr unsigned abi_version = 5;
 using GetApi = const Api* (*)(unsigned);
 
 } // namespace p2premote::native_minirtc
+
+#ifndef _WIN32
+extern "C" const p2premote::native_minirtc::Api* P2PRemoteMiniRtcApi(unsigned version);
+#endif

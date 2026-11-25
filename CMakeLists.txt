@@ -5,11 +5,17 @@ if(P2PREMOTE_BUILD_QT)
 endif()
 project(p2premote VERSION 0.1.0 LANGUAGES C CXX)
 
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(cmake/linux-viewer.cmake)
+    return()
+endif()
+
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "p2premote requires a 64-bit Windows build with MSVC")
 endif()
 
-set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
 
 set(P2PREMOTE_MINIRTC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out/minirtc" CACHE PATH "Directory containing minirtc.h and p2premote_minirtc.dll")

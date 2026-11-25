@@ -3,7 +3,9 @@
 #include <p2premote/core_api.h>
 
 #include <QTimer>
+#if defined(Q_OS_WIN)
 #include <QWinEventNotifier>
+#endif
 
 #include <array>
 #include <memory>
@@ -50,7 +52,9 @@ private:
     void publish();
 
     std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream_{nullptr, p2p_stream_destroy};
+#if defined(Q_OS_WIN)
     std::array<QWinEventNotifier, 4> waits_;
+#endif
     QTimer tick_, cursor_, heartbeat_;
     int state_{P2P_IDLE};
     bool input_ready_{};

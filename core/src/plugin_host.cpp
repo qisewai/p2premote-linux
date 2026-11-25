@@ -1,27 +1,32 @@
 #include "plugin_host.h"
+#if defined(_WIN32)
 #include "agent_audit.h"
-
 #include "clipboard_bridge.h"
 #include "file_clipboard.h"
 #include "plugin_settings.h"
 #include "pty_session.h"
-
-#include <charconv>
+#else
+#include "plugin_platform.h"
+#endif
 
 #include <p2premote/plugin_protocol.h>
 
+#include <lua.hpp>
+
+#if defined(_WIN32)
 #include <bcrypt.h>
 #include <imm.h>
-#include <lua.hpp>
 #include <shlobj.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -72,11 +77,26 @@ void PluginOverlays::Read(PluginOverlaySnapshot& snapshot) const {
 
 namespace {
 
+#if defined(_WIN32)
 using winrt::Windows::Data::Json::JsonObject;
 using winrt::Windows::Data::Json::IJsonObjectStatics;
 using winrt::Windows::Data::Json::IJsonValueStatics;
 using winrt::Windows::Data::Json::JsonValue;
 using winrt::Windows::Data::Json::JsonValueType;
+#endif
+
+using Tick = std::uint64_t;
+using WaitTime = unsigned long;
+constexpr auto no_timeout = static_cast<WaitTime>(-1);
+
+Tick TickMilliseconds() {
+#if defined(_WIN32)
+    return GetTickCount64();
+#else
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+#endif
+}
 constexpr std::size_t max_plugins = 16;
 constexpr std::size_t max_pending_frames = 512;
 constexpr std::size_t lua_memory_limit = 2 * 1024 * 1024;
@@ -110,10 +130,15 @@ void Log(std::string_view id, std::string_view level, std::string_view message) 
         std::ranges::replace(line, '\r', ' ');
         std::ranges::replace(line, '\n', ' ');
         line += '\n';
+#if defined(_WIN32)
         OutputDebugStringA(line.c_str());
+#else
+        std::fputs(line.c_str(), stderr);
+#endif
     } catch (...) {}
 }
 
+#if defined(_WIN32)
 std::filesystem::path PluginDirectory() {
     std::wstring path(32'768, L'\0');
     const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -128,6 +153,18 @@ bool IsPlainPath(const std::filesystem::path& path, bool directory) noexcept {
         ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) == directory;
 }
 
+#else
+std::filesystem::path PluginDirectory() {
+    return (QCoreApplication::applicationDirPath() + QStringLiteral("/plugins")).toStdString();
+}
+
+bool IsPlainPath(const std::filesystem::path& path, bool directory) noexcept {
+    std::error_code error;
+    const auto info = std::filesystem::symlink_status(path, error);
+    return directory ? std::filesystem::is_directory(info) : std::filesystem::is_regular_file(info);
+}
+
+#endif
 std::string ReadFile(const std::filesystem::path& path, std::size_t limit) {
     if (!IsPlainPath(path, false)) throw std::runtime_error("Invalid plugin file");
     std::ifstream file(path, std::ios::binary);
@@ -139,40 +176,65 @@ std::string ReadFile(const std::filesystem::path& path, std::size_t limit) {
     return content;
 }
 
-std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, const std::filesystem::path& directory, bool host,
-    std::filesystem::path& entry) {
+std::optional<Manifest> ReadManifest(
+#if defined(_WIN32)
+    const IJsonObjectStatics& json_factory,
+#endif
+    const std::filesystem::path& directory, bool host, std::filesystem::path& entry) {
+#if defined(_WIN32)
     const auto json = json_factory.Parse(winrt::to_hstring(ReadFile(directory / "plugin.json", 16 * 1024)));
     if (!json.GetNamedBoolean(L"enabled", false)) return std::nullopt;
     Manifest manifest{winrt::to_string(json.GetNamedString(L"id"))};
+#else
+    const auto raw = ReadFile(directory / "plugin.json", 16 * 1024);
+    const auto json = QJsonDocument::fromJson(QByteArray::fromStdString(raw)).object();
+    if (!json.value("enabled").toBool()) return std::nullopt;
+    Manifest manifest{};
+    manifest.id = json.value("id").toString().toStdString();
+#endif
     if (!IsPluginIdentifier(manifest.id) || manifest.id == workspace_protocol_id || directory.filename() != std::filesystem::path(manifest.id)) {
         throw std::runtime_error("Plugin ID must match its directory");
     }
     bool selected{};
+#if defined(_WIN32)
     for (const auto& role : json.GetNamedArray(L"roles")) {
         const auto name = role.GetString();
         if (name != L"host" && name != L"viewer") throw std::runtime_error("Unknown plugin role");
         selected |= name == (host ? L"host" : L"viewer");
     }
+#else
+    for (const auto& role : json.value("roles").toArray()) {
+        const auto name = role.toString();
+        if (name != "host" && name != "viewer") throw std::runtime_error("Unknown plugin role");
+        selected |= name == (host ? "host" : "viewer");
+    }
+#endif
     if (!selected) return std::nullopt;
+#if defined(_WIN32)
     for (const auto& permission : json.GetNamedArray(L"permissions")) {
-        const auto name = permission.GetString();
-        if (name == L"channel") manifest.channel = true;
-        else if (name == L"clipboard") manifest.clipboard = true;
-        else if (name == L"file_clipboard") manifest.file_clipboard = true;
-        else if (name == L"log") manifest.log = true;
-        else if (name == L"ui") manifest.ui = true;
-        else if (name == L"input") manifest.input = true;
-        else if (name == L"config") manifest.config = true;
-        else if (name == L"video") manifest.video = true;
-        else if (name == L"fs") manifest.fs = true;
-        else if (name == L"pty") manifest.pty = true;
-        else if (name == L"overlay") manifest.overlay = true;
-        else if (name == L"sys") manifest.sys = true;
+        const auto name = winrt::to_string(permission.GetString());
+#else
+    for (const auto& permission : json.value("permissions").toArray()) {
+        const auto name = permission.toString().toStdString();
+#endif
+        if (name == "channel") manifest.channel = true;
+        else if (name == "clipboard") manifest.clipboard = true;
+        else if (name == "file_clipboard") manifest.file_clipboard = true;
+        else if (name == "log") manifest.log = true;
+        else if (name == "ui") manifest.ui = true;
+        else if (name == "input") manifest.input = true;
+        else if (name == "config") manifest.config = true;
+        else if (name == "video") manifest.video = true;
+        else if (name == "fs") manifest.fs = true;
+        else if (name == "pty") manifest.pty = true;
+        else if (name == "overlay") manifest.overlay = true;
+        else if (name == "sys") manifest.sys = true;
         else throw std::runtime_error("Unknown plugin permission");
     }
     if (manifest.overlay) {
         auto& item = manifest.overlay_defaults;
         item.plugin_id.assign(manifest.id.begin(), manifest.id.end());
+#if defined(_WIN32)
         item.title = json.GetNamedString(L"name", winrt::to_hstring(manifest.id));
         if (const auto settings = json.GetNamedObject(L"overlay", nullptr)) {
             item.anchor = ParseOverlayAnchor(winrt::to_string(settings.GetNamedString(L"anchor", L"bottom-right")))
@@ -182,6 +244,16 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
         }
     }
     const auto filename = winrt::to_string(json.GetNamedString(L"entry"));
+#else
+        item.title = json.value("name").toString(QString::fromStdString(manifest.id)).toStdWString();
+        const auto settings = json.value("overlay").toObject();
+        item.anchor = ParseOverlayAnchor(settings.value("anchor").toString().toStdString())
+            .value_or(OverlayAnchor::bottom_right);
+        item.priority = std::clamp(settings.value("priority").toInt(100), -1000, 1000);
+        item.default_visible = settings.value("default_visible").toBool(true);
+    }
+    const auto filename = json.value("entry").toString().toStdString();
+#endif
     if (!filename.ends_with(".lua") || !IsPluginIdentifier(std::string_view(filename).substr(0, filename.size() - 4))) {
         throw std::runtime_error("Plugin entry must be a Lua file in its own directory");
     }
@@ -189,12 +261,12 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
     return manifest;
 }
 
-constexpr ULONGLONG agent_approval_timeout_ms = 15'000;
+constexpr Tick agent_approval_timeout_ms = 15'000;
 
 struct AgentRequest {
     enum class Decision { waiting, approved, denied, revoked, cancelled };
     std::uint32_t id{};
-    ULONGLONG started{};
+    Tick started{};
     AgentTool tool{};
     Decision decision{Decision::waiting};
     std::string image;
@@ -330,6 +402,7 @@ private:
     PluginHost::Notify signal_;
 };
 
+#if defined(_WIN32)
 std::optional<std::wstring> Utf8ToWide(std::string_view text) {
     if (text.find('\0') != std::string_view::npos) return std::nullopt;
     if (text.empty()) return std::wstring{};
@@ -356,6 +429,17 @@ std::string WideToUtf8(std::wstring_view wide) {
     return out;
 }
 
+#else
+std::optional<std::wstring> Utf8ToWide(std::string_view text) {
+    if (text.find('\0') != std::string_view::npos || text.size() > 32768) return std::nullopt;
+    QStringDecoder decoder(QStringDecoder::Utf8);
+    const QString output = decoder(QByteArrayView(text.data(), text.size()));
+    if (decoder.hasError()) return std::nullopt;
+    return output.toStdWString();
+}
+
+#endif
+#if defined(_WIN32)
 std::string Win32ErrorUtf8(DWORD code) {
     switch (code) {
     case ERROR_FILE_NOT_FOUND: return "文件不存在";
@@ -380,6 +464,14 @@ std::optional<std::filesystem::path> SafeFsPath(std::string_view utf8) {
     return path;
 }
 
+#else
+std::optional<std::filesystem::path> SafeFsPath(std::string_view utf8) {
+    std::filesystem::path path(utf8);
+    if (!path.is_absolute() || !Utf8ToWide(utf8) || utf8.starts_with("//")) return std::nullopt;
+    return path.lexically_normal();
+}
+
+#endif
 bool ValidLeafName(std::string_view name) noexcept {
     if (name.empty() || name.size() > 240 || name == "." || name == "..") return false;
     for (unsigned char c : name) {
@@ -390,6 +482,7 @@ bool ValidLeafName(std::string_view name) noexcept {
     return name.back() != ' ' && name.back() != '.';
 }
 
+#if defined(_WIN32)
 std::string ParentPathUtf8(const std::filesystem::path& normalized) {
     auto p = normalized;
     if (p.has_relative_path() && p.filename().empty()) p = p.parent_path();
@@ -432,6 +525,7 @@ std::string FileTimeToLocalText(const FILETIME& ft) {
     return buf;
 }
 
+#endif
 void AppendJsonString(std::string& out, std::string_view text) {
     constexpr char hex[] = "0123456789abcdef";
     out.push_back('"');
@@ -805,11 +899,20 @@ private:
 
 std::optional<std::wstring> UiText(std::string_view text, std::size_t limit) {
     if (text.empty() || text.size() > 4 * limit || text.find('\0') != std::string_view::npos) return std::nullopt;
+#if defined(_WIN32)
     auto converted = winrt::to_hstring(text);
     if (converted.size() > limit) return std::nullopt;
     return std::wstring(converted);
+#else
+    QStringDecoder decoder(QStringDecoder::Utf8);
+    const QString utf16 = decoder(QByteArrayView(text.data(), text.size()));
+    if (decoder.hasError() || utf16.size() > static_cast<qsizetype>(limit)) return std::nullopt;
+    return std::wstring(utf16.utf16(), utf16.utf16() + utf16.size());
+#endif
+
 }
 
+#if defined(_WIN32)
 // Windows IMM uses these WM_IME_CONTROL commands for the foreground input context.
 constexpr WPARAM ime_get_open = 0x0005;
 constexpr WPARAM ime_set_open = 0x0006;
@@ -856,6 +959,24 @@ UINT NamedVirtualKey(std::string_view name) noexcept {
     return 0;
 }
 
+#else
+std::optional<bool> ForegroundIme(std::optional<bool> = {}) noexcept { return std::nullopt; }
+std::uint16_t NamedVirtualKey(std::string_view name) noexcept {
+    if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9'))) {
+        return static_cast<std::uint16_t>(name.front());
+    }
+    // InputCommand::shortcut uses the Windows virtual-key encoding on the wire.
+    constexpr std::pair<std::string_view, std::uint16_t> keys[] = {{"Ctrl", 0xa2}, {"Alt", 0xa4}, {"Shift", 0xa0},
+        {"Win", 0x5b}, {"Esc", 0x1b}, {"Enter", 0x0d}, {"Tab", 0x09}, {"Delete", 0x2e}, {"Space", 0x20},
+        {"Backspace", 0x08}, {"Left", 0x25}, {"Right", 0x27}, {"Up", 0x26}, {"Down", 0x28},
+        {"Home", 0x24}, {"End", 0x23}, {"F1", 0x70}, {"F2", 0x71}, {"F3", 0x72}, {"F4", 0x73},
+        {"F5", 0x74}, {"F6", 0x75}, {"F7", 0x76}, {"F8", 0x77}, {"F9", 0x78}, {"F10", 0x79},
+        {"F11", 0x7a}, {"F12", 0x7b}};
+    for (const auto& [label, key] : keys) if (name == label) return key;
+    return 0;
+}
+
+#endif
 std::string Base64Encode(std::string_view input) {
     static constexpr char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
@@ -915,10 +1036,48 @@ std::optional<std::string> Base64Decode(std::string_view input) {
 
 class LuaPlugin;
 
+class PluginWake {
+public:
+#if defined(_WIN32)
+    PluginWake() { winrt::check_pointer(event_.get()); }
+    void Signal() { SetEvent(event_.get()); }
+    void WaitUntilConnected() { WaitForSingleObject(event_.get(), INFINITE); }
+    bool Wait(WaitTime delay) {
+        const HANDLE event = event_.get();
+        return MsgWaitForMultipleObjectsEx(1, &event, delay, QS_ALLINPUT, MWMO_INPUTAVAILABLE) != WAIT_FAILED;
+    }
+    HANDLE Native() const { return event_.get(); }
+
+private:
+    winrt::handle event_{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+#else
+    void Signal() {
+        {
+            const std::lock_guard lock(mutex_);
+            ready_ = true;
+        }
+        changed_.notify_one();
+    }
+    void WaitUntilConnected() { Wait(no_timeout); }
+    bool Wait(WaitTime delay) {
+        std::unique_lock lock(mutex_);
+        if (delay == no_timeout) changed_.wait(lock, [this] { return ready_; });
+        else changed_.wait_for(lock, std::chrono::milliseconds(delay), [this] { return ready_; });
+        ready_ = false;
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool ready_{};
+#endif
+};
+
 class PluginRuntime {
 public:
     PluginRuntime(bool host, const PluginHost::SendFrame& send, const std::atomic_bool& connected,
-        Workspace& workspace, std::filesystem::path config_root, HANDLE wake, bool local_overlay,
+        Workspace& workspace, std::filesystem::path config_root, PluginWake& wake, bool local_overlay,
         PluginOverlays& overlays, bool diagnostics_only)
         : host(host), local_overlay(local_overlay), diagnostics_only(diagnostics_only),
           workspace(workspace), config_root(std::move(config_root)),
@@ -928,7 +1087,7 @@ public:
 
     bool Send(PluginPacket packet) noexcept {
         if (!Connected()) return false;
-        const auto now = GetTickCount64();
+        const auto now = TickMilliseconds();
         if (now >= send_period_end_) {
             send_period_end_ = now + 100;
             send_bytes_left_ = 16 * 1024 * 1024;
@@ -949,7 +1108,7 @@ public:
     const bool diagnostics_only;
     Workspace& workspace;
     const std::filesystem::path config_root;
-    const HANDLE wake;
+    PluginWake& wake;
     PluginOverlays& overlays;
     std::optional<ClipboardBridge> clipboard;
     std::optional<FileClipboard> file_clipboard;
@@ -958,7 +1117,7 @@ public:
 private:
     const PluginHost::SendFrame& send_;
     const std::atomic_bool& connected_;
-    ULONGLONG send_period_end_{};
+    Tick send_period_end_{};
     std::size_t send_bytes_left_{};
     unsigned send_frames_left_{};
 };
@@ -1093,7 +1252,7 @@ public:
         return true;
     }
 
-    void RunTimer(ULONGLONG now) {
+    void RunTimer(Tick now) {
         if (!healthy_) return;
         const auto next = std::ranges::find_if(timers_, [now](const auto& timer) {
             return timer.ref != LUA_NOREF && timer.due <= now;
@@ -1106,11 +1265,11 @@ public:
         if (!timer.interval) luaL_unref(state_, LUA_REGISTRYINDEX, timer.ref);
     }
 
-    DWORD Wait(ULONGLONG now) const noexcept {
-        DWORD delay = INFINITE;
+    WaitTime Wait(Tick now) const noexcept {
+        auto delay = no_timeout;
         if (!healthy_) return delay;
         for (const auto& timer : timers_) {
-            if (timer.ref != LUA_NOREF) delay = std::min(delay, timer.due <= now ? 0UL : static_cast<DWORD>(timer.due - now));
+            if (timer.ref != LUA_NOREF) delay = std::min(delay, timer.due <= now ? 0UL : static_cast<WaitTime>(timer.due - now));
         }
         return delay;
     }
@@ -1126,6 +1285,7 @@ private:
         int ref{LUA_NOREF};
     };
 
+#if defined(_WIN32)
     struct FileSlot {
         lua_Integer id{};
         HANDLE handle{INVALID_HANDLE_VALUE};
@@ -1141,6 +1301,10 @@ private:
         std::unique_ptr<PtySession> session;
     };
 
+#else
+    using FileSlot = LinuxPluginFile;
+
+#endif
     void ClearMenu() noexcept {
         for (auto& item : menu_) {
             if (item.id) {
@@ -1160,6 +1324,7 @@ private:
         }
     }
 
+#if defined(_WIN32)
     void CloseFileSlot(FileSlot& slot) noexcept {
         if (slot.hash) {
             BCryptDestroyHash(slot.hash);
@@ -1175,12 +1340,17 @@ private:
         slot = {};
     }
 
+#else
+    void CloseFileSlot(FileSlot& slot) noexcept { slot.clear(); }
+
+#endif
     void ClearFiles() noexcept {
         for (auto& slot : files_) {
             if (slot.id) CloseFileSlot(slot);
         }
     }
 
+#if defined(_WIN32)
     void ClearPtys() noexcept {
         for (auto& slot : ptys_) {
             if (slot.session) {
@@ -1190,6 +1360,10 @@ private:
         }
     }
 
+#else
+    void ClearPtys() noexcept {}
+
+#endif
     void CaptureLockKeys(bool capture) noexcept {
         if (capture == captures_lock_keys_) return;
         captures_lock_keys_ = capture;
@@ -1199,8 +1373,8 @@ private:
 
     struct Timer {
         lua_Integer id{};
-        ULONGLONG due{};
-        ULONGLONG interval{};
+        Tick due{};
+        Tick interval{};
         int ref{LUA_NOREF};
     };
 
@@ -1316,6 +1490,7 @@ private:
         return 1;
     }
 
+#if defined(_WIN32)
     static std::uint32_t ClipboardId(lua_State* state) {
         const auto id = luaL_checkinteger(state, 1);
         if (id <= 0 || id > UINT32_MAX) luaL_argerror(state, 1, "invalid clipboard ID");
@@ -1382,6 +1557,12 @@ private:
         return 1;
     }
 
+#else
+    static int PublishFiles(lua_State* state) { lua_pushboolean(state, false); return 1; }
+    static int ClearPublishedFiles(lua_State*) { return 0; }
+    static int ReplyToClipboardRead(lua_State* state) { lua_pushboolean(state, false); return 1; }
+
+#endif
     static int AddMenu(lua_State* state) {
         auto& self = Self(state);
         luaL_checktype(state, 1, LUA_TTABLE);
@@ -1651,6 +1832,7 @@ private:
         return 2;
     }
 
+#if defined(_WIN32)
     static int FsRoots(lua_State* state) {
         if (!Self(state).runtime_.Connected()) return FsError(state, "未连接");
         wchar_t buffer[512]{};
@@ -2071,6 +2253,11 @@ private:
         return 1;
     }
 
+#else
+#include "plugin_file_api.inc"
+
+
+#endif
     static int SendKeys(lua_State* state) {
         auto& runtime = Self(state).runtime_;
         luaL_checktype(state, 1, LUA_TTABLE);
@@ -2114,12 +2301,21 @@ private:
     }
 
     static int InputState(lua_State* state) {
-        const auto locks = Self(state).runtime_.workspace.ReadLockState().value_or(
-            std::pair{(GetKeyState(VK_CAPITAL) & 1) != 0, (GetKeyState(VK_NUMLOCK) & 1) != 0});
+        const auto locks = Self(state).runtime_.workspace.ReadLockState();
+#if defined(_WIN32)
+        const auto state_value = locks.value_or(std::pair{
+            (GetKeyState(VK_CAPITAL) & 1) != 0, (GetKeyState(VK_NUMLOCK) & 1) != 0});
+#else
+        if (!locks) {
+            lua_createtable(state, 0, 0);
+            return 1;
+        }
+        const auto state_value = *locks;
+#endif
         lua_createtable(state, 0, 3);
-        lua_pushboolean(state, locks.first);
+        lua_pushboolean(state, state_value.first);
         lua_setfield(state, -2, "caps_lock");
-        lua_pushboolean(state, locks.second);
+        lua_pushboolean(state, state_value.second);
         lua_setfield(state, -2, "num_lock");
         if (const auto ime = ForegroundIme()) {
             lua_pushboolean(state, *ime);
@@ -2128,6 +2324,7 @@ private:
         return 1;
     }
 
+#if defined(_WIN32)
     static int SetLocalLock(lua_State* state) {
         const auto key = CheckString(state, 1);
         luaL_checktype(state, 2, LUA_TBOOLEAN);
@@ -2137,6 +2334,10 @@ private:
         return 1;
     }
 
+#else
+    static int SetLocalLock(lua_State* state) { lua_pushboolean(state, false); return 1; }
+
+#endif
     static int SetIme(lua_State* state) {
         luaL_checktype(state, 1, LUA_TBOOLEAN);
         const auto& runtime = Self(state).runtime_;
@@ -2299,6 +2500,7 @@ private:
         return *settings_;
     }
 
+#if defined(_WIN32)
     bool AllowsAgentDiagnostics(AgentTool tool) {
         if (tool == AgentTool::screen_snapshot && !runtime_.diagnostics_only) return false;
         try {
@@ -2322,7 +2524,7 @@ private:
         if (!id) return AgentStatus(state, "unavailable");
         const auto tool = lua_toboolean(state, 1) ? AgentTool::screen_snapshot : AgentTool::system_info;
         const auto allowed = self.AllowsAgentDiagnostics(tool);
-        const auto now = GetTickCount64();
+        const auto now = TickMilliseconds();
         auto& workspace = runtime.workspace;
         bool paused{};
         bool busy{};
@@ -2354,7 +2556,7 @@ private:
         const auto id = luaL_checkinteger(state, 1);
         const auto tool = lua_toboolean(state, 2) ? AgentTool::screen_snapshot : AgentTool::system_info;
         const auto allowed = self.AllowsAgentDiagnostics(tool);
-        const auto now = GetTickCount64();
+        const auto now = TickMilliseconds();
         std::optional<AgentRequest> finished;
         {
             const std::lock_guard lock(workspace.mutex);
@@ -2455,7 +2657,7 @@ private:
         integer("logical_processors", GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
         integer("memory_total_mib", static_cast<lua_Integer>(memory.ullTotalPhys / mib));
         integer("memory_available_mib", static_cast<lua_Integer>(memory.ullAvailPhys / mib));
-        integer("uptime_seconds", static_cast<lua_Integer>(GetTickCount64() / 1000));
+        integer("uptime_seconds", static_cast<lua_Integer>(TickMilliseconds() / 1000));
         wchar_t windows_directory[MAX_PATH]{};
         const auto windows_length = GetWindowsDirectoryW(windows_directory, MAX_PATH);
         wchar_t volume[MAX_PATH]{};
@@ -2483,6 +2685,13 @@ private:
         return true;
     }
 
+#else
+    static int BeginSystemInfo(lua_State* state) { return FsError(state, "unavailable"); }
+    static int PollSystemInfo(lua_State* state) { return FsError(state, "unavailable"); }
+    static int CancelSystemInfo(lua_State*) { return 0; }
+
+#endif
+#if defined(_WIN32)
     static int ConfigGet(lua_State* state) {
         auto& self = Self(state);
         const auto key = CheckString(state, 1);
@@ -2534,9 +2743,43 @@ private:
         return 1;
     }
 
+#else
+    static int ConfigGet(lua_State* state) {
+        auto& self = Self(state);
+        const auto key = CheckString(state, 1);
+        QJsonValue value;
+        if (IsPluginIdentifier(key)) value = self.Settings().value(key);
+        if (value.isString()) {
+            self.config_result_ = value.toString().toStdString();
+            PushString(state, self.config_result_);
+        } else if (value.isBool()) lua_pushboolean(state, value.toBool());
+        else if (value.isDouble()) lua_pushnumber(state, value.toDouble());
+        else if (lua_gettop(state) >= 2) lua_pushvalue(state, 2);
+        else lua_pushnil(state);
+        return 1;
+    }
+
+    static int ConfigSet(lua_State* state) {
+        auto& self = Self(state);
+        const auto key = CheckString(state, 1);
+        const auto type = lua_type(state, 2);
+        QJsonValue value = QJsonValue::Undefined;
+        if (type == LUA_TNIL) value = QJsonValue::Null;
+        else if (type == LUA_TBOOLEAN) value = lua_toboolean(state, 2) != 0;
+        else if (type == LUA_TNUMBER && std::isfinite(lua_tonumber(state, 2))) value = lua_tonumber(state, 2);
+        else if (type == LUA_TSTRING) {
+            const auto text = CheckString(state, 2);
+            if (text.size() <= 2048) value = QString::fromUtf8(text.data(), text.size());
+        }
+        lua_pushboolean(state, IsPluginIdentifier(key) && !value.isUndefined() && self.Settings().set(key, value));
+        return 1;
+    }
+
+#endif
     static int Sha256(lua_State* state) {
         const auto input = CheckString(state, 1);
         if (input.size() > plugin_frame_limit) return luaL_argerror(state, 1, "data exceeds 64 KiB");
+#if defined(_WIN32)
         std::array<UCHAR, 32> hash{};
         auto* bytes = reinterpret_cast<PUCHAR>(const_cast<char*>(input.data()));
         if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, bytes, static_cast<ULONG>(input.size()),
@@ -2550,6 +2793,10 @@ private:
             output[i * 2 + 1] = hex[hash[i] & 0xf];
         }
         lua_pushlstring(state, output.data(), output.size());
+#else
+        const auto hash = QCryptographicHash::hash(QByteArrayView(input.data(), input.size()), QCryptographicHash::Sha256).toHex();
+        lua_pushlstring(state, hash.constData(), hash.size());
+#endif
         return 1;
     }
 
@@ -2573,6 +2820,7 @@ private:
         return 1;
     }
 
+#if defined(_WIN32)
     static int PtyOpen(lua_State* state) {
         auto& self = Self(state);
         if (!self.runtime_.host || !self.runtime_.Connected()) {
@@ -2662,6 +2910,7 @@ private:
         return 1;
     }
 
+#endif
     static int AddTimer(lua_State* state, bool repeating) {
         auto& self = Self(state);
         const auto ms = luaL_checkinteger(state, 1);
@@ -2673,8 +2922,8 @@ private:
         }
         int ref{LUA_NOREF};
         Subscribe(state, 2, ref);
-        const auto delay = static_cast<ULONGLONG>(ms);
-        *slot = {++self.next_timer_, GetTickCount64() + delay, repeating ? delay : 0, ref};
+        const auto delay = static_cast<Tick>(ms);
+        *slot = {++self.next_timer_, TickMilliseconds() + delay, repeating ? delay : 0, ref};
         lua_pushinteger(state, slot->id);
         return 1;
     }
@@ -2746,7 +2995,7 @@ private:
             {"after", [](lua_State* l) { return AddTimer(l, false); }},
             {"every", [](lua_State* l) { return AddTimer(l, true); }},
             {"cancel", CancelTimer},
-            {"now_ms", [](lua_State* l) { lua_pushinteger(l, static_cast<lua_Integer>(GetTickCount64())); return 1; }},
+            {"now_ms", [](lua_State* l) { lua_pushinteger(l, static_cast<lua_Integer>(TickMilliseconds())); return 1; }},
             {nullptr, nullptr}
         };
         static const luaL_Reg json[] = {
@@ -2755,10 +3004,12 @@ private:
         static const luaL_Reg base64[] = {
             {"encode", Base64EncodeLua}, {"decode", Base64DecodeLua}, {nullptr, nullptr}
         };
+#if defined(_WIN32)
         static const luaL_Reg pty[] = {
             {"open", PtyOpen}, {"read", PtyRead}, {"write", PtyWrite}, {"resize", PtyResize}, {"close", PtyClose},
             {nullptr, nullptr}
         };
+#endif
         static const luaL_Reg log[] = {
             {"info", [](lua_State* l) { Log(Self(l).manifest_.id, "info", CheckString(l, 1)); return 0; }},
             {"warn", [](lua_State* l) { Log(Self(l).manifest_.id, "warn", CheckString(l, 1)); return 0; }},
@@ -2803,7 +3054,9 @@ private:
         if (manifest_.sys && runtime_.host && manifest_.id == "ai-agent") Namespace(state, "sys", sys);
         if (manifest_.video) Namespace(state, "video", video);
         if (manifest_.fs) Namespace(state, "fs", fs);
+#if defined(_WIN32)
         if (manifest_.pty) Namespace(state, "pty", pty);
+#endif
         if (manifest_.overlay && !runtime_.host) Namespace(state, "overlay", overlay);
         ReadOnly(state);
         lua_setglobal(state, "p2p");
@@ -2866,7 +3119,9 @@ private:
     std::array<MenuCallback, 8> menu_{};
     std::array<DialogCallback, 4> dialogs_{};
     std::array<FileSlot, 4> files_{};
+#if defined(_WIN32)
     std::array<PtySlot, 2> ptys_{};
+#endif
     std::optional<PluginSettings> settings_;
     std::string config_result_;
     lua_Integer next_timer_{};
@@ -2877,6 +3132,7 @@ private:
 void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
     std::vector<std::unique_ptr<LuaPlugin>>& plugins, bool diagnostics_only) {
     if (!IsPlainPath(root, true)) return;
+#if defined(_WIN32)
     const bool restricted_host = runtime.host && [] {
         HANDLE opened{};
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &opened)) return true;
@@ -2889,12 +3145,17 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
     // Keep the activation factory scoped to this worker's COM apartment.
     const auto json_factory = winrt::try_get_activation_factory<JsonObject, IJsonObjectStatics>();
     if (!json_factory) throw std::runtime_error("Could not activate plugin manifest parser");
+#endif
     for (const auto& directory : std::filesystem::directory_iterator(root)) {
         if (!runtime.Connected() || plugins.size() == max_plugins) break;
         if (!IsPlainPath(directory.path(), true)) continue;
         try {
             std::filesystem::path entry;
-            auto manifest = ReadManifest(json_factory, directory.path(), runtime.host, entry);
+            auto manifest = ReadManifest(
+#if defined(_WIN32)
+                json_factory,
+#endif
+                directory.path(), runtime.host, entry);
             if (!manifest) continue;
             if (diagnostics_only && (manifest->id != "ai-agent" || manifest->input || manifest->video ||
                 manifest->fs || manifest->pty || manifest->clipboard || manifest->file_clipboard)) continue;
@@ -2902,20 +3163,28 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
             if (local_overlay != runtime.local_overlay) continue;
             if (local_overlay && (runtime.host || manifest->clipboard || manifest->file_clipboard
                     || manifest->ui || manifest->input || manifest->video || manifest->fs || manifest->pty)) continue;
+#if defined(_WIN32)
             if (restricted_host && (manifest->pty || manifest->fs || manifest->file_clipboard)) continue;
+#else
+            if (manifest->file_clipboard) continue;
+#endif
             const auto script = ReadFile(entry, 128 * 1024);
             if (manifest->clipboard || manifest->file_clipboard) {
                 if (!runtime.clipboard) runtime.clipboard.emplace();
+#if defined(_WIN32)
                 if (manifest->file_clipboard && !runtime.file_clipboard) {
                     runtime.clipboard->WatchFiles();
-                    if (runtime.clipboard->Available()) runtime.file_clipboard.emplace(runtime.wake);
+                    if (runtime.clipboard->Available()) runtime.file_clipboard.emplace(runtime.wake.Native());
                 }
-                runtime.clipboard->Poll(GetTickCount64());
+#endif
+                runtime.clipboard->Poll(TickMilliseconds());
             }
             auto plugin = std::make_unique<LuaPlugin>(std::move(*manifest), runtime);
             if (plugin->Load(script)) plugins.push_back(std::move(plugin));
+#if defined(_WIN32)
         } catch (const winrt::hresult_error&) {
             Log("loader", "error", "Invalid plugin manifest");
+#endif
         } catch (const std::exception& error) {
             Log("loader", "error", error.what());
         }
@@ -2930,14 +3199,13 @@ struct PluginHost::Impl {
         : host(host), local_overlay(local_overlay), diagnostics_only(diagnostics_only), send(std::move(send)), root(std::move(root)),
           config_root(std::move(config_root)), overlays(overlays ? std::move(overlays) : std::make_shared<PluginOverlays>()),
           workspace(std::move(notify)) {
-        winrt::check_pointer(wake.get());
         worker = std::jthread([this](std::stop_token stop) { Run(stop); });
     }
 
     void Stop() {
         connected = false;
         worker.request_stop();
-        SetEvent(wake.get());
+        wake.Signal();
         if (worker.joinable()) worker.join();
     }
 
@@ -3006,12 +3274,14 @@ struct PluginHost::Impl {
 
     void Run(std::stop_token stop) noexcept {
         try {
-            while (!stop.stop_requested() && !connected.load()) WaitForSingleObject(wake.get(), INFINITE);
+            while (!stop.stop_requested() && !connected.load()) wake.WaitUntilConnected();
             if (stop.stop_requested()) return;
+#if defined(_WIN32)
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
+#endif
             PluginRuntime runtime(host, send, connected, workspace, config_root.empty() ? DefaultPluginSettingsDirectory()
-                : config_root, wake.get(), local_overlay, *overlays, diagnostics_only);
+                : config_root, wake, local_overlay, *overlays, diagnostics_only);
             std::vector<std::unique_ptr<LuaPlugin>> plugins;
             LoadPlugins(root.empty() ? PluginDirectory() : root, runtime, plugins, diagnostics_only);
             if (local_overlay && plugins.empty()) return;
@@ -3019,9 +3289,11 @@ struct PluginHost::Impl {
                 if (connected.load()) plugin->ConnectionChanged(true);
             }
             while (!stop.stop_requested() && connected.load()) {
+#if defined(_WIN32)
                 MSG message{};
                 while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
-                auto now = GetTickCount64();
+#endif
+                auto now = TickMilliseconds();
                 if (runtime.clipboard && connected.load() && runtime.clipboard->Poll(now)) {
                     for (const auto& plugin : plugins) plugin->ClipboardChanged(runtime.clipboard->Text());
                     for (const auto& plugin : plugins) {
@@ -3083,11 +3355,10 @@ struct PluginHost::Impl {
                     if (connected.load()) plugin->RunTimer(now);
                 }
                 if (!frame.empty() || click || ui_event || lock_changed) continue;
-                now = GetTickCount64();
-                DWORD wait = runtime.clipboard ? runtime.clipboard->Wait(now) : INFINITE;
+                now = TickMilliseconds();
+                WaitTime wait = runtime.clipboard ? runtime.clipboard->Wait(now) : no_timeout;
                 for (const auto& plugin : plugins) wait = std::min(wait, plugin->Wait(now));
-                const HANDLE event = wake.get();
-                if (MsgWaitForMultipleObjectsEx(1, &event, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE) == WAIT_FAILED) break;
+                if (!wake.Wait(wait)) break;
             }
             connected = false;
             std::optional<AgentRequest> interrupted;
@@ -3095,10 +3366,12 @@ struct PluginHost::Impl {
                 const std::lock_guard lock(workspace.mutex);
                 interrupted = std::exchange(workspace.agent_request, std::nullopt);
             }
+#if defined(_WIN32)
             if (interrupted) {
                 RecordAgentAudit(runtime.config_root, interrupted->id, AgentAuditResult::disconnected,
-                    GetTickCount64() - interrupted->started, interrupted->tool);
+                    TickMilliseconds() - interrupted->started, interrupted->tool);
             }
+#endif
             if (runtime.clipboard) runtime.clipboard->CancelWrite();
             if (runtime.file_clipboard) runtime.file_clipboard->Clear();
             for (const auto& plugin : plugins) plugin->ConnectionChanged(false);
@@ -3118,7 +3391,7 @@ struct PluginHost::Impl {
     const std::filesystem::path config_root;
     std::shared_ptr<PluginOverlays> overlays;
     Workspace workspace;
-    winrt::handle wake{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    PluginWake wake;
     std::atomic_bool connected{};
     std::mutex mutex;
     std::deque<std::string> frames;
@@ -3133,7 +3406,7 @@ PluginHost::~PluginHost() { Stop(); }
 
 void PluginHost::SetConnected(bool connected) noexcept {
     impl_->connected = connected;
-    SetEvent(impl_->wake.get());
+    impl_->wake.Signal();
 }
 
 void PluginHost::Receive(std::string_view frame) noexcept {
@@ -3142,7 +3415,7 @@ void PluginHost::Receive(std::string_view frame) noexcept {
         const std::lock_guard lock(impl_->mutex);
         if (!impl_->connected.load() || impl_->frames.size() >= max_pending_frames) return;
         impl_->frames.emplace_back(frame);
-        SetEvent(impl_->wake.get());
+        impl_->wake.Signal();
     } catch (...) {}
 }
 
@@ -3168,7 +3441,7 @@ void PluginHost::UpdateLockState(bool caps, bool num) {
             if (notify) impl_->workspace.lock_state_dirty = true;
         }
     }
-    if (notify) SetEvent(impl_->wake.get());
+    if (notify) impl_->wake.Signal();
 }
 
 bool PluginHost::CapturesLockKeys() const noexcept {
@@ -3194,7 +3467,7 @@ void PluginHost::Invoke(unsigned id) {
             std::ranges::find(workspace.menu, id, &PluginMenuItem::id) == workspace.menu.end()) return;
         workspace.clicks.push_back(id);
     }
-    SetEvent(impl_->wake.get());
+    impl_->wake.Signal();
 }
 
 std::uint32_t PluginHost::PendingAgentApproval(AgentTool* tool) const {
@@ -3202,7 +3475,7 @@ std::uint32_t PluginHost::PendingAgentApproval(AgentTool* tool) const {
     const std::lock_guard lock(workspace.mutex);
     const auto& request = workspace.agent_request;
     if (!impl_->host || !impl_->connected.load() || !request || request->decision != AgentRequest::Decision::waiting ||
-        GetTickCount64() - request->started >= agent_approval_timeout_ms) return 0;
+        TickMilliseconds() - request->started >= agent_approval_timeout_ms) return 0;
     if (tool) *tool = request->tool;
     return request->id;
 }
@@ -3213,7 +3486,7 @@ void PluginHost::DecideAgentApproval(std::uint32_t id, bool approved, std::strin
     auto& request = workspace.agent_request;
     if (impl_->host && impl_->connected.load() && request && request->id == id &&
         request->decision == AgentRequest::Decision::waiting &&
-        GetTickCount64() - request->started < agent_approval_timeout_ms) {
+        TickMilliseconds() - request->started < agent_approval_timeout_ms) {
         if (approved && request->tool == AgentTool::screen_snapshot && ValidAgentImage(image)) {
             request->image = image;
         }
@@ -3240,7 +3513,7 @@ std::uint32_t PluginHost::RequestAgentSummary(AgentTool tool) {
         id = next_id.fetch_add(1, std::memory_order_relaxed) | local_agent_id_bit;
         workspace.local_agent_query = LocalAgentQuery{id, false, tool, 0, {}};
     }
-    SetEvent(impl_->wake.get());
+    impl_->wake.Signal();
     return id;
 }
 
@@ -3264,7 +3537,7 @@ void PluginHost::CancelAgentSummary(std::uint32_t id) {
         if (query->sent && query->result.status.empty()) workspace.cancel_agent_query = id;
         query.reset();
     }
-    SetEvent(impl_->wake.get());
+    impl_->wake.Signal();
 }
 
 std::vector<PluginAction> PluginHost::TakeActions() {
@@ -3301,7 +3574,7 @@ void PluginHost::SendUiEvent(PluginUiEvent event) {
         }
         workspace.ui_events.push_back(std::move(event));
     }
-    SetEvent(impl_->wake.get());
+    impl_->wake.Signal();
 }
 
 void PluginHost::Stop() { impl_->Stop(); }

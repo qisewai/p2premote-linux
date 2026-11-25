@@ -3,6 +3,7 @@
 #include <p2premote/core_api.h>
 
 #include <QLocalServer>
+#include <QDeadlineTimer>
 #include <QMap>
 #include <QPointer>
 #include <QSet>
@@ -45,5 +46,5 @@ private:
     QStringList pending_fields_;
     std::uint32_t pending_{};
     bool screenshots_{};
-    qint64 deadline_{};
+    QDeadlineTimer deadline_;
 };

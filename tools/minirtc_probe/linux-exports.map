@@ -1,0 +1,8 @@
+{
+    global:
+        P2PRemoteMiniRtcApi;
+        AddAudioStream;
+        SendAudioFrame;
+        SetAudioSendPaused;
+    local: *;
+};

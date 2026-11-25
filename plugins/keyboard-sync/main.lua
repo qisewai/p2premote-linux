@@ -28,6 +28,7 @@ local function sync()
         return
     end
     local state = input.get_state()
+    if state.caps_lock == nil or state.num_lock == nil then return end
     local caps = state.caps_lock and "1" or "0"
     local num = state.num_lock and "1" or "0"
     local ime = state.ime_open == nil and "-" or (state.ime_open and "1" or "0")

@@ -374,6 +374,26 @@ ctest --preset windows-x64-qt-release
 
 便携目录的 `licenses/` 包含 vcpkg 提供的 Qt 与其依赖许可。Qt Base 的对应源码归档可在 [Qt 下载站](https://download.qt.io/archive/qt/6.11/6.11.3/submodules/) 获取，构建补丁来自 [vcpkg qtbase port](https://github.com/microsoft/vcpkg/tree/277978ad2eddc3b05ecf288dcd33071968cd2f79/ports/qtbase)。
 
+### Linux 主控端
+
+Linux x86-64 主控端与 Windows 共享 Qt 主窗口、设置、会话标签和控制中心。可在「局域网直连」中选择发现的被控端，或输入地址、端口与验证码。登录账号后可在「我的设备」中连接在线设备。点击远程画面接管键鼠，F11 切换全屏，F12 释放键鼠。支持播放远端声音和从当前会话发送麦克风声音。
+
+两端使用相同的 Lua 脚本和插件协议。Linux 支持文本剪贴板、文件传输窗口、远程终端、快捷宏、键盘锁定状态、自动码率、连接状态、会话秒表和只读诊断。文件剪贴板的文件管理器直接粘贴尚未移植，可在「控制中心 → 文件传输」里传文件。账号和局域网凭据使用桌面的 Secret Service 密钥环。
+
+构建需要 GCC、CMake、Ninja、Xmake、Qt 6.8 或更新版本（Widgets、Network、WebSockets）、OpenSSL、libyuv、Lua 5.4、libsecret 和 PulseAudio 的开发包，以及 [libghostty-vt 1.0.1](https://lib.ghostty.org/vt/installing.html#build-from-source)。Linux 上从源码构建 libghostty-vt，可安装到 `~/.local/share/p2premote/ghostty-vt`，也可在配置时用 `CMAKE_PREFIX_PATH` 指定其前缀。MiniRTC 还需要归档解压工具、Meson 1.4 或更新版本、Autotools 和 NASM。
+
+```bash
+bash tools/minirtc_probe/Build-Linux.sh
+cmake --preset linux-x64-viewer -DCMAKE_PREFIX_PATH="$HOME/.local/share/p2premote/qt/6.8.3/gcc_64"
+cmake --build --preset linux-x64-viewer
+ctest --preset linux-x64-viewer
+./out/build/linux-x64-viewer/p2premote_linux_viewer
+```
+
+MiniRTC 默认安装到 `~/.local/share/p2premote/minirtc`。自定义路径时给脚本设置 `P2PREMOTE_LINUX_MINIRTC_DIR`，并把同一路径作为 CMake 的 `-DP2PREMOTE_LINUX_MINIRTC_DIR`。Xmake 可通过 `XMAKE_BIN` 指定。
+
+WSL 2 的 NAT 网络可能收不到局域网广播。可以手动填写被控端地址，或用 `ip -4 route show default` 查询本机 Windows 网关地址。Ubuntu 的构建产物按 Linux 主控端部署，接收远控依旧在 Windows 被控端开启。
+
 ## 计时口径
 
 - `source_qpc` 保留 WGC 给出的合成帧时间。`capture_qpc` 记录应用从帧池取到帧的时间，用作应用内计时起点。`capture_ready_qpc` 标记应用拿到帧纹理。`draw_begin_qpc` 到 `submit_qpc` 包含交换链调整、GPU 纹理复制和绘制指令提交的调用耗时。[WGC 帧时间戳文档](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframe.systemrelativetime)

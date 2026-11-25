@@ -1,10 +1,13 @@
 #include "stream_driver.h"
 
 #include <QString>
+#if defined(Q_OS_WIN)
 #include <windows.h>
+#endif
 
 namespace {
 
+#if defined(Q_OS_WIN)
 void setWait(QWinEventNotifier& notifier, HANDLE source) {
     const auto old = notifier.handle();
     if ((!old && !source) || (old && source && CompareObjectHandles(old, source))) return;
@@ -15,6 +18,7 @@ void setWait(QWinEventNotifier& notifier, HANDLE source) {
     if (old) CloseHandle(old);
     if (copy) notifier.setEnabled(true);
 }
+#endif
 
 void runWhile(QTimer& timer, bool running) {
     if (running && !timer.isActive()) timer.start();
@@ -43,20 +47,36 @@ StreamDriver::StreamDriver(const LanConnectOptions& lan, void* video_parent,
 void StreamDriver::initTimersAndWaits() {
     if (!stream_) return;
 
+#if defined(Q_OS_WIN)
     for (uint32_t kind = 0; kind < waits_.size(); ++kind) {
         connect(&waits_[kind], &QWinEventNotifier::activated, this, [this, kind] { dispatch(kind); });
     }
+#else
+    cursor_.setInterval(50);
+    connect(&cursor_, &QTimer::timeout, this, [this] {
+        if (p2p_stream_state(handle()) != state_ || (p2p_stream_input_ready(handle()) != 0) != input_ready_) publish();
+        emit uiCommandsReady();
+    });
+#endif
     tick_.setInterval(1000);
+#if defined(Q_OS_WIN)
     cursor_.setInterval(33);
     heartbeat_.setInterval(150);
     connect(&tick_, &QTimer::timeout, this, [this] { update(p2p_stream_tick(handle())); });
     connect(&cursor_, &QTimer::timeout, this, [this] { p2p_stream_poll_cursor(handle()); });
     connect(&heartbeat_, &QTimer::timeout, this, [this] { p2p_stream_heartbeat(handle()); });
+#else
+    connect(&tick_, &QTimer::timeout, this, [this] {
+        if (state_ != P2P_IDLE && state_ != P2P_STOPPED) update(p2p_stream_tick(handle()));
+    });
+#endif
     tick_.start();
 }
 
 StreamDriver::~StreamDriver() {
+#if defined(Q_OS_WIN)
     for (auto& notifier : waits_) setWait(notifier, nullptr);
+#endif
 }
 
 void StreamDriver::update(int result) {
@@ -79,6 +99,7 @@ void StreamDriver::resize(bool drawable) {
     }
 }
 
+#if defined(Q_OS_WIN)
 void StreamDriver::dispatch(uint32_t kind) {
     const auto source = p2p_stream_wait_handle(handle(), kind);
     const auto watched = waits_[kind].handle();
@@ -98,11 +119,14 @@ void StreamDriver::dispatch(uint32_t kind) {
     }
     syncWaits();
 }
+#endif
 
 void StreamDriver::syncWaits() {
+#if defined(Q_OS_WIN)
     for (uint32_t kind = 0; kind < waits_.size(); ++kind) {
         setWait(waits_[kind], p2p_stream_wait_handle(handle(), kind));
     }
+#endif
 }
 
 void StreamDriver::publish() {
@@ -113,7 +137,11 @@ void StreamDriver::publish() {
     }
     state_ = snapshot.state;
     input_ready_ = snapshot.input_ready != 0;
+#if defined(Q_OS_WIN)
     runWhile(cursor_, input_ready_);
     runWhile(heartbeat_, input_ready_);
+#else
+    runWhile(cursor_, state_ != P2P_IDLE && state_ != P2P_STOPPED);
+#endif
     emit changed(snapshot);
 }

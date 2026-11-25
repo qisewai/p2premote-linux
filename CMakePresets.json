@@ -2,6 +2,15 @@
   "version": 3,
   "configurePresets": [
     {
+      "name": "linux-x64-viewer",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/linux-x64-viewer",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "windows-x64",
       "generator": "Visual Studio 17 2022",
       "architecture": "x64",
@@ -33,6 +42,10 @@
   ],
   "buildPresets": [
     {
+      "name": "linux-x64-viewer",
+      "configurePreset": "linux-x64-viewer"
+    },
+    {
       "name": "windows-x64-release",
       "configurePreset": "windows-x64",
       "configuration": "Release"
@@ -50,6 +63,11 @@
     }
   ],
   "testPresets": [
+    {
+      "name": "linux-x64-viewer",
+      "configurePreset": "linux-x64-viewer",
+      "output": { "outputOnFailure": true }
+    },
     {
       "name": "windows-x64-webrtc-release",
       "configurePreset": "windows-x64-webrtc",

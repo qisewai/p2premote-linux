@@ -20,7 +20,13 @@ int ReceiveExternal(PeerPtr* peer, const char* data, size_t size) {
 
 } // namespace
 
-extern "C" __declspec(dllexport) const p2premote::native_minirtc::Api* P2PRemoteMiniRtcApi(unsigned version) {
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+const p2premote::native_minirtc::Api* P2PRemoteMiniRtcApi(unsigned version) {
     using namespace p2premote::native_minirtc;
     static const Api api{abi_version, &CreatePeer, &DestroyPeer, &AddVideoStream, &AddDataStream,
         &InitExternal, &ReceiveExternal, &JoinConnection, &SendVideoFrame, &SendDataFrame,

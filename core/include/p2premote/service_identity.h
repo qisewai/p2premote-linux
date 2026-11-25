@@ -1,7 +1,9 @@
 #pragma once
 
+#if defined(_WIN32)
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Security.Cryptography.Certificates.h>
+#endif
 
 namespace p2premote {
 
@@ -21,7 +23,9 @@ mAvduqw=
 -----END CERTIFICATE-----
 )pem";
 
+#if defined(_WIN32)
 bool IsWuhanService(const winrt::Windows::Foundation::Uri& endpoint);
 bool MatchesWuhanServerKey(const winrt::Windows::Security::Cryptography::Certificates::Certificate& certificate) noexcept;
+#endif
 
 } // namespace p2premote

@@ -4,7 +4,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#if defined(P2PREMOTE_CORE_EXPORTS)
+#if !defined(_WIN32)
+#define P2P_CORE_API
+#elif defined(P2PREMOTE_CORE_EXPORTS)
 #define P2P_CORE_API __declspec(dllexport)
 #else
 #define P2P_CORE_API __declspec(dllimport)

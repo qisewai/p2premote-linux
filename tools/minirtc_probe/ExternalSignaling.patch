@@ -1,0 +1,143 @@
+diff --git a/src/pc/peer_connection.cpp b/src/pc/peer_connection.cpp
+--- a/src/pc/peer_connection.cpp
++++ b/src/pc/peer_connection.cpp
+@@ -180,7 +180,8 @@
+ 
+ PeerConnection::~PeerConnection() { user_data_ = nullptr; }
+ 
+-int PeerConnection::Init(PeerConnectionParams params) {
++int PeerConnection::Init(PeerConnectionParams params,
++                         std::function<void(const std::string&)> external_send) {
+   if (inited_) {
+     LOG_INFO("Peer already inited");
+     return 0;
+@@ -258,17 +259,20 @@
+     cfg_signal_server_port_ = std::to_string(signal_server_port_);
+   }
+ 
+-  const auto address = ParseSignalServerAddress(cfg_signal_server_ip_);
+-  if (!address) {
+-    LOG_ERROR("Invalid signaling server address");
+-    return -1;
+-  }
+-  signal_server_port_ = address->port.value_or(signal_server_port_);
+-  if (signal_server_port_ < 1 || signal_server_port_ > 65535) {
+-    LOG_ERROR("Invalid signaling server port");
+-    return -1;
+-  }
+-  uri_ = address->Url(signal_server_port_);
++  external_signaling_ = static_cast<bool>(external_send);
++  if (!external_signaling_) {
++    const auto address = ParseSignalServerAddress(cfg_signal_server_ip_);
++    if (!address) {
++      LOG_ERROR("Invalid signaling server address");
++      return -1;
++    }
++    signal_server_port_ = address->port.value_or(signal_server_port_);
++    if (signal_server_port_ < 1 || signal_server_port_ > 65535) {
++      LOG_ERROR("Invalid signaling server port");
++      return -1;
++    }
++    uri_ = address->Url(signal_server_port_);
++  }
+ 
+   legacy_turn_config_.reset();
+   per_connection_ice_config_ = false;
+@@ -389,7 +393,10 @@
+ 
+   clock_ = std::make_shared<SystemClock>();
+   ws_transport_ = std::make_shared<WsClient>(on_receive_ws_msg_, on_ws_status_);
+-  if (ws_transport_) {
++  if (external_signaling_) {
++    ws_transport_->OpenExternal(std::move(external_send));
++    ws_status_ = WsStatus::WsOpened;
++  } else {
+     ws_transport_->Connect(uri_);
+   }
+ 
+@@ -401,7 +408,23 @@
+   LOG_INFO("[{}] Init finish", user_id_);
+ 
+   inited_ = true;
+-  return 0;
++  if (external_signaling_) {
++    // The application has already authenticated and authorized this room.
++    ProcessSignal(json{{"type", "login"}, {"status", "success"},
++                       {"user_id", user_id_}, {"ice_config_version", 1}}.dump());
++  }
++  return 0;
++}
++
++int PeerConnection::ReceiveExternalSignal(const std::string& signal) {
++  if (!inited_ || !external_signaling_) return -1;
++  try {
++    ProcessSignal(signal);
++    return 0;
++  } catch (const nlohmann::json::exception&) {
++    LOG_WARN("Invalid external connection signaling message");
++    return -1;
++  }
+ }
+ 
+ int PeerConnection::UpdateConnectionSettings(bool hardware_acceleration,
+diff --git a/src/pc/peer_connection.h b/src/pc/peer_connection.h
+--- a/src/pc/peer_connection.h
++++ b/src/pc/peer_connection.h
+@@ -86,7 +86,9 @@
+   ~PeerConnection();
+ 
+  public:
+-  int Init(PeerConnectionParams params);
++  int Init(PeerConnectionParams params,
++           std::function<void(const std::string&)> external_send = {});
++  int ReceiveExternalSignal(const std::string& signal);
+   int UpdateConnectionSettings(bool hardware_acceleration, bool av1_encoding,
+                                 TurnMode turn_mode);
+ 
+@@ -219,6 +221,7 @@
+   std::function<void(WsStatus)> on_ws_status_ = nullptr;
+   unsigned int ws_connection_id_ = 0;
+   bool offer_peer_ = false;
++  bool external_signaling_ = false;
+   std::string user_id_ = "";
+   std::string user_id_with_pwd_ = "";
+   ReconnectLogin reconnect_login_;
+diff --git a/src/ws/ws_client.cpp b/src/ws/ws_client.cpp
+--- a/src/ws/ws_client.cpp
++++ b/src/ws/ws_client.cpp
+@@ -362,7 +362,16 @@
+   Shutdown();
+ }
+ 
++void WsClient::OpenExternal(std::function<void(const std::string&)> send) {
++  external_send_ = std::move(send);
++  ws_status_ = WsStatus::WsOpened;
++}
++
+ void WsClient::Send(const std::string& message) {
++  if (external_send_) {
++    if (!shutdown_) external_send_(message);
++    return;
++  }
+   websocketpp::lib::error_code ec;
+   if (!m_endpoint_) {
+     LOG_WARN("Send failed: WebSocket endpoint is unavailable");
+diff --git a/src/ws/ws_client.h b/src/ws/ws_client.h
+--- a/src/ws/ws_client.h
++++ b/src/ws/ws_client.h
+@@ -48,6 +48,7 @@
+   void Shutdown();
+ 
+   int Connect(const std::string& uri);
++  void OpenExternal(std::function<void(const std::string&)> send);
+ 
+   int ReConnect();
+ 
+@@ -143,6 +144,7 @@
+ 
+   std::function<void(const std::string&)> on_receive_msg_ = nullptr;
+   std::function<void(WsStatus)> on_ws_status_ = nullptr;
++  std::function<void(const std::string&)> external_send_;
+ };
+ 
+ }  // namespace minirtc

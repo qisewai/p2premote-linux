@@ -34,7 +34,9 @@ public:
     explicit AccountWindow(LaunchOptions options);
     ~AccountWindow() override;
     bool valid() const { return account_ != nullptr; }
+#if defined(Q_OS_WIN)
     void startLanHostFromCli(const QString& code, std::uint16_t port = P2P_LAN_DEFAULT_PORT);
+#endif
     void connectLanFromCli(const QString& target, const QString& code);
 
 protected:
@@ -114,7 +116,11 @@ private:
     QPointer<SettingsDialog> settings_dialog_;
     TitleBar* title_bar_{};
     QPushButton* account_btn_{};
+#if defined(Q_OS_WIN)
     QWinEventNotifier account_event_;
+#else
+    QTimer account_event_;
+#endif
     QTimer refresh_;
     QTimer status_clear_timer_;
     Request request_{Request::none};

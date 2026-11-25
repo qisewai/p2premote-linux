@@ -1,8 +1,13 @@
 #include "agent_broker.h"
 
+#if defined(Q_OS_WIN)
 #include <windows.h>
-
 #include "../../agent/snapshot.h"
+#else
+#include <QStandardPaths>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -11,6 +16,8 @@
 #include <QUuid>
 
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <utility>
 
 namespace {
@@ -23,12 +30,60 @@ QString text(const wchar_t* value) { return value ? QString::fromWCharArray(valu
 QJsonObject failure(const QString& status) { return {{QStringLiteral("status"), status}}; }
 
 bool localClient(QLocalSocket* socket) {
+#if defined(Q_OS_WIN)
     // QLocalServer creates Windows pipes with PIPE_REJECT_REMOTE_CLIENTS.
     const auto pipe = reinterpret_cast<HANDLE>(socket->socketDescriptor());
     DWORD own_session{}, client_session{};
     return ProcessIdToSessionId(GetCurrentProcessId(), &own_session) &&
         GetNamedPipeClientSessionId(pipe, &client_session) && client_session == own_session;
+#else
+    ucred peer{};
+    socklen_t length = sizeof(peer);
+    return ::getsockopt(socket->socketDescriptor(), SOL_SOCKET, SO_PEERCRED, &peer, &length) == 0 &&
+        length == sizeof(peer) && peer.uid == ::geteuid();
+#endif
 }
+
+#if !defined(Q_OS_WIN)
+QJsonObject filterSnapshot(const char* bytes) {
+    const QByteArray data(bytes);
+    const auto source = QJsonDocument::fromJson(data).object();
+    const auto arch = source.value("architecture").toString();
+    if (data.isEmpty() || data.size() > 4096 || source.value("schema").toInt() != 1 ||
+        (arch != "x64" && arch != "arm64" && arch != "x86" && arch != "unknown")) {
+        throw std::runtime_error("Invalid diagnostic snapshot");
+    }
+    const auto validMeasurement = [](const QJsonValue& value) {
+        const auto n = value.toDouble(-1);
+        return n >= 0 && n <= 9007199254740991.0 && std::trunc(n) == n;
+    };
+    QJsonObject result{{"schema", 1}, {"architecture", arch}};
+    for (const auto* key : {"windows_major", "windows_minor", "windows_build", "logical_processors",
+            "memory_total_mib", "memory_available_mib", "uptime_seconds"}) {
+        const auto value = source.value(key);
+        if (!validMeasurement(value)) throw std::runtime_error("Invalid diagnostic measurement");
+        result.insert(key, value);
+    }
+    if (!result.value("windows_major").toDouble() || !result.value("logical_processors").toDouble() ||
+        result.value("memory_available_mib").toDouble() > result.value("memory_total_mib").toDouble()) {
+        throw std::runtime_error("Inconsistent diagnostic measurements");
+    }
+    const auto free = source.value("system_disk_free_mib");
+    const auto total = source.value("system_disk_total_mib");
+    if (validMeasurement(free) && validMeasurement(total) && free.toDouble() <= total.toDouble()) {
+        result.insert("system_disk_free_mib", free);
+        result.insert("system_disk_total_mib", total);
+    }
+    for (const auto* key : {"host_name", "host_user"}) {
+        const auto value = source.value(key).toString();
+        if (!value.isEmpty() && value.toUtf8().size() <= 768 && std::ranges::none_of(value, [](QChar c) {
+            return c.unicode() < 32 || c.unicode() == 127;
+        })) result.insert(key, value);
+    }
+    if (const auto elevated = source.value("host_elevated"); elevated.isBool()) result.insert("host_elevated", elevated);
+    return result;
+}
+#endif
 
 } // namespace
 
@@ -47,7 +102,13 @@ bool AgentBroker::start(p2p_account* account, QString device, Session session, b
     stop();
     if (!account || !p2p_account_signed_in(account) || device.isEmpty() || !session()) return false;
     token_ = QUuid::createUuid().toString(QUuid::Id128);
-    if (!server_.listen(QStringLiteral("p2premote-diagnostics-") + token_)) {
+    auto name = QStringLiteral("p2premote-diagnostics-") + token_;
+#if !defined(Q_OS_WIN)
+    const auto runtime = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (runtime.isEmpty()) return false;
+    name.prepend(runtime + u'/');
+#endif
+    if (!server_.listen(name)) {
         token_.clear();
         return false;
     }
@@ -181,7 +242,7 @@ void AgentBroker::readRequest(QLocalSocket* socket) {
         }
         waiting_ = socket;
         pending_fields_ = report == reports_.cend() ? QStringList{} : report.value();
-        deadline_ = static_cast<qint64>(GetTickCount64()) + 21'000;
+        deadline_.setRemainingTime(21'000);
     } else {
         reply(socket, failure(QStringLiteral("not_shared")));
     }
@@ -195,7 +256,7 @@ void AgentBroker::poll() {
     }
     if (!pending_ || !waiting_) return;
     auto* socket = waiting_.data();
-    if (static_cast<qint64>(GetTickCount64()) >= deadline_) {
+    if (deadline_.hasExpired()) {
         cancel();
         reply(socket, failure(QStringLiteral("expired")));
         return;
@@ -225,8 +286,12 @@ void AgentBroker::poll() {
         return;
     }
     try {
+#if defined(Q_OS_WIN)
         const auto filtered = p2premote::agent::ParseDiagnosticSnapshot(summary.snapshot_json);
         auto object = QJsonDocument::fromJson(QByteArray::fromStdString(winrt::to_string(filtered.Stringify()))).object();
+#else
+        auto object = filterSnapshot(summary.snapshot_json);
+#endif
         if (!fields.isEmpty()) {
             QJsonObject report;
             for (const auto& field : fields) {

@@ -3,6 +3,9 @@
 #include "app_theme.h"
 #include "single_instance.h"
 
+#if defined(__linux__)
+#include "../linux/plugin_platform.h"
+#endif
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QMessageBox>
@@ -18,20 +21,22 @@ int main(int argc, char* argv[]) {
     parser.setApplicationDescription(QStringLiteral("P2P Remote Qt 客户端"));
     parser.addHelpOption();
     parser.addVersionOption();
-    const QCommandLineOption compatibility(QStringLiteral("compat-account"), QStringLiteral("使用兼容账号请求"));
-    const QCommandLineOption ice(QStringLiteral("ice-trace"), QStringLiteral("记录 ICE 诊断"), QStringLiteral("目录"));
-    const QCommandLineOption latency(QStringLiteral("latency-trace"), QStringLiteral("记录延迟诊断"), QStringLiteral("目录"));
     const QCommandLineOption stun(QStringLiteral("stun"), QStringLiteral("覆盖 STUN 地址"), QStringLiteral("stun:主机:端口"));
     const QCommandLineOption stun_only(QStringLiteral("stun-only"), QStringLiteral("仅使用直连"));
     const QCommandLineOption relay_only(QStringLiteral("relay-only"), QStringLiteral("仅使用 TURN 中继"));
-    const QCommandLineOption lan_host(QStringLiteral("lan-host"), QStringLiteral("启动局域网无人值守被控模式"));
     const QCommandLineOption lan_connect(QStringLiteral("lan-connect"), QStringLiteral("局域网直连目标 IP[:端口]"), QStringLiteral("地址"));
-    const QCommandLineOption lan_port(QStringLiteral("lan-port"), QStringLiteral("局域网监听端口"), QStringLiteral("端口"));
     const QCommandLineOption lan_code(QStringLiteral("lan-code"), QStringLiteral("局域网固定被控码"), QStringLiteral("被控码"));
+    parser.addOptions({stun, stun_only, relay_only, lan_connect, lan_code});
+#if defined(Q_OS_WIN)
+    const QCommandLineOption compatibility(QStringLiteral("compat-account"), QStringLiteral("使用兼容账号请求"));
+    const QCommandLineOption ice(QStringLiteral("ice-trace"), QStringLiteral("记录 ICE 诊断"), QStringLiteral("目录"));
+    const QCommandLineOption latency(QStringLiteral("latency-trace"), QStringLiteral("记录延迟诊断"), QStringLiteral("目录"));
+    const QCommandLineOption lan_host(QStringLiteral("lan-host"), QStringLiteral("启动局域网无人值守被控模式"));
+    const QCommandLineOption lan_port(QStringLiteral("lan-port"), QStringLiteral("局域网监听端口"), QStringLiteral("端口"));
     QCommandLineOption elevated_restart(QStringLiteral("elevated-restart"));
     elevated_restart.setFlags(QCommandLineOption::HiddenFromHelp);
-    parser.addOptions({compatibility, ice, latency, stun, stun_only, relay_only,
-        lan_host, lan_connect, lan_port, lan_code, elevated_restart});
+    parser.addOptions({compatibility, ice, latency, lan_host, lan_port, elevated_restart});
+#endif
     parser.process(app);
 
     const auto ice_server = parser.value(stun);
@@ -43,7 +48,11 @@ int main(int argc, char* argv[]) {
     }
 
     SingleInstance instance;
+#if defined(Q_OS_WIN)
     const auto launch = instance.start(parser.isSet(elevated_restart) && isProcessElevated());
+#else
+    const auto launch = instance.start(false);
+#endif
     if (launch == SingleInstance::Result::activated) return 0;
     if (launch == SingleInstance::Result::failed) {
         QMessageBox::warning(nullptr, QStringLiteral("P2P Remote"),
@@ -52,10 +61,13 @@ int main(int argc, char* argv[]) {
     }
     if (p2p_core_abi_version() != P2P_CORE_ABI_VERSION) {
         QMessageBox::critical(nullptr, QStringLiteral("P2P Remote"),
-            QStringLiteral("核心 DLL 版本不匹配，请重新解压完整客户端。"));
+            QStringLiteral("核心版本不匹配，请重新安装完整客户端。"));
         return 1;
     }
 
+#if defined(__linux__)
+    p2premote::initializePluginClipboard();
+#endif
     QApplication::setWindowIcon(app.style()->standardIcon(QStyle::SP_ComputerIcon));
     auto& settings = AppSettings::instance();
     AppTheme::apply(settings.data());
@@ -63,18 +75,29 @@ int main(int argc, char* argv[]) {
         AppTheme::apply(next);
     });
 
-    AccountWindow window({parser.value(ice).toStdWString(), parser.value(latency).toStdWString(),
-        ice_server.toStdString(), parser.isSet(stun_only), parser.isSet(relay_only), parser.isSet(compatibility)});
+    LaunchOptions options;
+    options.stun = ice_server.toStdString();
+    options.stun_only = parser.isSet(stun_only);
+    options.relay_only = parser.isSet(relay_only);
+#if defined(Q_OS_WIN)
+    options.ice_trace = parser.value(ice).toStdWString();
+    options.latency_trace = parser.value(latency).toStdWString();
+    options.compatible_http = parser.isSet(compatibility);
+#endif
+    AccountWindow window(std::move(options));
     window.setObjectName(QStringLiteral("accountWindow"));
     if (!instance.registerWindow(window)) {
         QMessageBox::critical(nullptr, QStringLiteral("P2P Remote"), QStringLiteral("无法注册客户端窗口。"));
         return 1;
     }
     window.show();
+#if defined(Q_OS_WIN)
     if (parser.isSet(lan_host)) {
         const auto port = static_cast<std::uint16_t>(parser.isSet(lan_port) ? parser.value(lan_port).toUShort() : P2P_LAN_DEFAULT_PORT);
         window.startLanHostFromCli(parser.value(lan_code), port);
-    } else if (parser.isSet(lan_connect)) {
+    } else
+#endif
+    if (parser.isSet(lan_connect)) {
         window.connectLanFromCli(parser.value(lan_connect), parser.value(lan_code));
     }
     const int result = app.exec();

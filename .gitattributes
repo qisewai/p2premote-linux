@@ -1,0 +1,2 @@
+*.sh text eol=lf
+tools/minirtc_probe/ExternalSignaling.patch text eol=lf whitespace=-blank-at-eol

@@ -1,0 +1,10 @@
+target("p2premote_minirtc")
+    set_kind("shared")
+    set_default(false)
+    set_targetdir(os.getenv("P2PREMOTE_LINUX_MINIRTC_OUTPUT"))
+    add_deps("minirtc")
+    -- Hide bundled OpenSSL and codec symbols from Qt and other system libraries.
+    add_shflags("-Wl,--version-script=" .. path.join(os.scriptdir(), "linux-exports.map"), {force = true})
+    add_files(path.join(os.scriptdir(), "managed_dll.cpp"))
+    add_includedirs(path.join(os.projectdir(), "src/rtc"), path.join(os.projectdir(), "src/api"))
+target_end()

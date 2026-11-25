@@ -237,15 +237,19 @@ QScrollArea* SettingsDialog::buildGeneralPage() {
     layout->setSpacing(14);
 
     layout->addWidget(makeSectionTitle(QStringLiteral("常规与使用"), container));
+#if defined(Q_OS_WIN)
     layout->addWidget(makeMuted(QStringLiteral("配置主窗口关闭行为、登录后本机接收策略以及默认账号服务地址。"), container));
+#endif
 
     QVBoxLayout* card_layout{};
     auto* card = makeCard(container, &card_layout);
 
-    close_to_tray_ = new QCheckBox(QStringLiteral("关闭主窗口时最小化到系统托盘（不退出后台接收）"), card);
-    auto_receive_ = new QCheckBox(QStringLiteral("登录后自动开启远程接收（本机已添加时）"), card);
+    close_to_tray_ = new QCheckBox(QStringLiteral("关闭主窗口时最小化到系统托盘"), card);
     card_layout->addWidget(close_to_tray_);
+#if defined(Q_OS_WIN)
+    auto_receive_ = new QCheckBox(QStringLiteral("登录后自动开启远程接收（本机已添加时）"), card);
     card_layout->addWidget(auto_receive_);
+#endif
 
     auto* divider = new QFrame(card);
     divider->setObjectName(QStringLiteral("divider"));
@@ -486,7 +490,7 @@ void SettingsDialog::loadAppControls(const AppSettingsData& d) {
     setComboData(font_combo_, d.font_size);
 
     close_to_tray_->setChecked(d.close_to_tray);
-    auto_receive_->setChecked(d.auto_receive_on_login);
+    if (auto_receive_) auto_receive_->setChecked(d.auto_receive_on_login);
     default_server_->setText(d.default_server);
 
     setComboData(quality_combo_, d.default_quality);
@@ -504,7 +508,7 @@ AppSettingsData SettingsDialog::collectAppSettings() const {
     d.accent = accent_combo_->currentData().toString();
     d.font_size = font_combo_->currentData().toInt();
     d.close_to_tray = close_to_tray_->isChecked();
-    d.auto_receive_on_login = auto_receive_->isChecked();
+    if (auto_receive_) d.auto_receive_on_login = auto_receive_->isChecked();
     d.default_server = default_server_->text().trimmed();
     d.default_quality = quality_combo_->currentData().toInt();
     d.default_bitrate = bitrate_combo_->currentData().toInt();

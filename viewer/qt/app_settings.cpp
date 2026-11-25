@@ -179,6 +179,10 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
         spec.extension_page = group == QStringLiteral("插件与扩展");
         const auto role = ui.value(QStringLiteral("role")).toString(QStringLiteral("viewer"));
         spec.host_config = role == QStringLiteral("host");
+#if !defined(Q_OS_WIN)
+        if (!spec.roles.contains(QStringLiteral("viewer")) || spec.permissions.contains(QStringLiteral("file_clipboard"))) continue;
+        if (spec.host_config) spec.placement = PluginSettingSpec::Placement::none;
+#endif
 
         const auto settings = spec.placement == PluginSettingSpec::Placement::none ||
             (role != QStringLiteral("viewer") && !spec.host_config) || !spec.roles.contains(role)

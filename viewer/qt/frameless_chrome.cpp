@@ -11,6 +11,7 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
+#if defined(Q_OS_WIN)
 #include <dwmapi.h>
 #include <windows.h>
 #include <windowsx.h>
@@ -95,6 +96,55 @@ void toggleFramelessMaximize(QWidget* window) {
     const auto hwnd = reinterpret_cast<HWND>(window->winId());
     SendMessageW(hwnd, WM_SYSCOMMAND, IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE, 0);
 }
+#else
+#include <QApplication>
+
+namespace {
+
+class ResizeEdges final : public QObject {
+public:
+    explicit ResizeEdges(QWidget* window) : QObject(window), window_(window) {
+        setObjectName(QStringLiteral("framelessResizeEdges"));
+        qApp->installEventFilter(this);
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event->type() != QEvent::MouseButtonPress || window_->isMaximized() || window_->isFullScreen()) return false;
+        const auto* target = qobject_cast<QWidget*>(watched);
+        if (!target || target->window() != window_) return false;
+        const auto* mouse = static_cast<QMouseEvent*>(event);
+        if (mouse->button() != Qt::LeftButton) return false;
+        const auto position = window_->mapFromGlobal(mouse->globalPosition()).toPoint();
+        constexpr int margin = 5;
+        Qt::Edges edges;
+        if (position.x() < margin) edges |= Qt::LeftEdge;
+        else if (position.x() >= window_->width() - margin) edges |= Qt::RightEdge;
+        if (position.y() < margin) edges |= Qt::TopEdge;
+        else if (position.y() >= window_->height() - margin) edges |= Qt::BottomEdge;
+        return edges && window_->windowHandle() && window_->windowHandle()->startSystemResize(edges);
+    }
+
+private:
+    QWidget* window_;
+};
+
+} // namespace
+
+void applyWin32FramelessChrome(QWidget* window, bool) {
+    if (!window->findChild<QObject*>(QStringLiteral("framelessResizeEdges"), Qt::FindDirectChildrenOnly)) {
+        new ResizeEdges(window);
+    }
+}
+
+bool handleWin32FramelessChrome(QWidget*, void*, qintptr*) { return false; }
+
+void minimizeFramelessWindow(QWidget* window) { window->showMinimized(); }
+
+void toggleFramelessMaximize(QWidget* window) {
+    if (window->isMaximized()) window->showNormal();
+    else window->showMaximized();
+}
+#endif
 
 WindowCaptionButton::WindowCaptionButton(CaptionButtonKind kind, QWidget* parent)
     : QAbstractButton(parent), kind_(kind) {

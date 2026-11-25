@@ -5,7 +5,11 @@
 #include "frameless_chrome.h"
 #include "plugin_dialog.h"
 #include "settings_dialog.h"
+#if defined(Q_OS_WIN)
 #include "../connection_overlay.h"
+#else
+#include "../linux/video_surface.h"
+#endif
 
 #include <QAbstractButton>
 #include <QActionGroup>
@@ -34,7 +38,11 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
+#if defined(Q_OS_WIN)
 #include <windows.h>
+#endif
+
+#include <map>
 
 #include <algorithm>
 #include <cmath>
@@ -44,6 +52,7 @@
 
 namespace {
 
+#if defined(Q_OS_WIN)
 class VideoContainer final : public QWidget {
 public:
     explicit VideoContainer(std::function<void()> toggle, QWidget* parent)
@@ -68,6 +77,7 @@ protected:
 private:
     std::function<void()> toggle_;
 };
+#endif
 
 constexpr int kTabStripHeight = 40;
 constexpr int kBridgeHeight = 4;
@@ -438,18 +448,25 @@ public:
             layout->addWidget(share_, 0, Qt::AlignHCenter);
             layout->addStretch();
         } else {
+#if defined(Q_OS_WIN)
             video_ = new VideoContainer(std::move(on_fullscreen), this);
+#else
+            video_ = createVideoSurface(std::move(on_fullscreen), this);
+#endif
             video_->installEventFilter(this);
             layout->addWidget(video_, 1);
         }
 
+#if defined(Q_OS_WIN)
+        const auto parent_handle = video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr;
+#else
+        const auto parent_handle = static_cast<void*>(video_);
+#endif
         if (lan) {
-            driver_ = std::make_unique<StreamDriver>(*lan,
-                video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr, options, this);
+            driver_ = std::make_unique<StreamDriver>(*lan, parent_handle, options, this);
         } else {
             const auto target = device.toStdWString();
-            driver_ = std::make_unique<StreamDriver>(account, false, target.c_str(),
-                video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr, options, this, diagnostics_);
+            driver_ = std::make_unique<StreamDriver>(account, false, target.c_str(), parent_handle, options, this, diagnostics_);
         }
         if (!driver_->handle()) {
             status_text_ = QString::fromWCharArray(p2p_last_error());
@@ -629,7 +646,14 @@ private:
         if (!video_ || !AppSettings::instance().data().show_diagnostics || !playing() || !video_->isVisible() ||
             window()->isMinimized()) {
             overlay_timer_.stop();
+#if defined(Q_OS_WIN)
             overlays_.Hide();
+#else
+            if (video_ && overlays_visible_) {
+                setVideoOverlays(video_, {});
+                overlays_visible_ = false;
+            }
+#endif
             return;
         }
         if (!overlay_timer_.isActive()) overlay_timer_.start(100);
@@ -650,7 +674,12 @@ private:
             item.font_size = std::clamp(settings.value(QStringLiteral("font_size")).toInt(item.font_size), 9, 20);
             item.opacity = static_cast<std::uint8_t>(std::clamp(settings.value(QStringLiteral("opacity")).toInt(item.opacity), 0, 255));
         }
+#if defined(Q_OS_WIN)
         overlays_.Render(reinterpret_cast<HWND>(video_->winId()), width_, height_, items);
+#else
+        setVideoOverlays(video_, std::move(items));
+        overlays_visible_ = true;
+#endif
         overlay_dirty_ = false;
     }
 
@@ -699,7 +728,11 @@ private:
     QString status_text_{QStringLiteral("正在连接设备…")};
     QString notice_text_;
     QTimer overlay_timer_;
+#if defined(Q_OS_WIN)
     p2premote::viewer::OverlayManager overlays_;
+#else
+    bool overlays_visible_{};
+#endif
     std::uint64_t overlay_revision_{};
     bool overlay_dirty_{};
     std::vector<p2premote::PluginOverlayItem> overlay_items_;
