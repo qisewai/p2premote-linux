@@ -1,4 +1,5 @@
 #include "remote_window.h"
+#include "agent_broker.h"
 #include "app_settings.h"
 #include "frameless_chrome.h"
 #include "plugin_dialog.h"
@@ -15,6 +16,7 @@
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -80,19 +82,29 @@ QIcon statusDotIcon(const QColor& color) {
 class RemoteSessionTab final : public QWidget {
 public:
     RemoteSessionTab(p2p_account* account, const QString& device, const QString& name,
-        const LaunchOptions& options, std::function<void()> on_fullscreen,
+        const LaunchOptions& options, bool diagnostics, std::function<void()> on_fullscreen,
+        std::function<void()> on_share,
         std::function<void()> on_changed, QWidget* dialog_parent, QWidget* parent)
-        : QWidget(parent), device_(device), name_(name), on_changed_(std::move(on_changed)) {
+        : QWidget(parent), device_(device), name_(name), diagnostics_(diagnostics), on_changed_(std::move(on_changed)) {
         auto* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
         layout->setSpacing(0);
-        video_ = new VideoContainer(std::move(on_fullscreen), this);
-        video_->installEventFilter(this);
-        layout->addWidget(video_, 1);
+        if (diagnostics_) {
+            layout->addStretch();
+            share_ = new QPushButton(QStringLiteral("共享诊断给本机 Agent…"), this);
+            share_->setEnabled(false);
+            connect(share_, &QPushButton::clicked, this, std::move(on_share));
+            layout->addWidget(share_, 0, Qt::AlignHCenter);
+            layout->addStretch();
+        } else {
+            video_ = new VideoContainer(std::move(on_fullscreen), this);
+            video_->installEventFilter(this);
+            layout->addWidget(video_, 1);
+        }
 
         const auto target = device.toStdWString();
         driver_ = std::make_unique<StreamDriver>(account, false, target.c_str(),
-            reinterpret_cast<void*>(video_->winId()), options, this);
+            video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr, options, this, diagnostics_);
         if (!driver_->handle()) {
             status_text_ = QString::fromWCharArray(p2p_last_error());
             state_ = P2P_STOPPED;
@@ -129,13 +141,14 @@ public:
 
     const QString& device() const { return device_; }
     const QString& name() const { return name_; }
+    bool diagnostics() const { return diagnostics_; }
     p2p_stream* handle() const { return driver_ ? driver_->handle() : nullptr; }
     StreamDriver* driver() const { return driver_.get(); }
     int state() const { return state_; }
     bool active() const { return state_ != P2P_IDLE && state_ != P2P_STOPPED; }
     bool playing() const { return state_ == P2P_STREAMING; }
     bool hasPluginMenu() const { return has_plugin_menu_; }
-    bool canExport() const { return !active() && seconds_ > 0; }
+    bool canExport() const { return !diagnostics_ && !active() && seconds_ > 0; }
     int qualityIndex() const { return quality_index_; }
     int bitrateIndex() const { return bitrate_index_; }
     std::uint32_t confirmedBitrate() const { return confirmed_bitrate_; }
@@ -169,6 +182,7 @@ public:
     const auto& overlayItems() const { return overlay_items_; }
 
     QString tabTitle() const {
+        if (diagnostics_) return QStringLiteral("%1 · 诊断").arg(name_);
         if (playing() && width_ && height_) {
             return QStringLiteral("%1 · 屏幕1").arg(name_);
         }
@@ -185,6 +199,7 @@ public:
         if (driver_ && driver_->handle()) {
             syncVideo();
             driver_->update(p2p_stream_start(driver_->handle(), nullptr, 60));
+            if (diagnostics_) return;
             setQuality(quality_index_);
             setBitrate(bitrate_index_);
             pushAudioOptions();
@@ -236,7 +251,7 @@ public:
     }
 
     void pushAudioOptions() {
-        if (!driver_ || !driver_->handle()) return;
+        if (diagnostics_ || !driver_ || !driver_->handle()) return;
         const p2p_audio_options_v1 opt{
             (speaker_enabled_ && tab_focused_) ? 1 : 0,
             (mic_enabled_ && tab_focused_) ? 1 : 0,
@@ -247,6 +262,7 @@ public:
     }
 
     void syncVideo() {
+        if (!video_) return;
         if (driver_) driver_->resize(video_->isVisible() && !window()->isMinimized());
         updateConnectionOverlays();
     }
@@ -262,7 +278,8 @@ protected:
 
 private:
     void updateConnectionOverlays(bool force = true) {
-        if (!AppSettings::instance().data().show_diagnostics || !playing() || !video_->isVisible() || window()->isMinimized()) {
+        if (!video_ || !AppSettings::instance().data().show_diagnostics || !playing() || !video_->isVisible() ||
+            window()->isMinimized()) {
             overlay_timer_.stop();
             overlays_.Hide();
             return;
@@ -291,6 +308,7 @@ private:
 
     void onSnapshot(const p2p_stream_snapshot_v1& snapshot) {
         state_ = snapshot.state;
+        if (share_) share_->setEnabled(playing());
         seconds_ = snapshot.seconds;
         width_ = snapshot.width;
         height_ = snapshot.height;
@@ -312,7 +330,9 @@ private:
 
     QString device_;
     QString name_;
+    bool diagnostics_{};
     std::function<void()> on_changed_;
+    QPushButton* share_{};
     QWidget* video_{};
     std::unique_ptr<StreamDriver> driver_;
     PluginDialogManager* dialogs_{};
@@ -471,8 +491,9 @@ RemoteWindow::RemoteWindow(QWidget* parent)
 RemoteWindow::~RemoteWindow() = default;
 
 void RemoteWindow::openSession(p2p_account* account, const QString& device, const QString& name,
-    const LaunchOptions& options) {
-    if (const int existing = findSession(device); existing >= 0) {
+    const LaunchOptions& options, bool diagnostics) {
+    account_ = account;
+    if (const int existing = findSession(device, diagnostics); existing >= 0) {
         tabs_->setCurrentIndex(existing);
         if (auto* session = sessionAt(existing); session && !session->active()) {
             session->start();
@@ -484,8 +505,9 @@ void RemoteWindow::openSession(p2p_account* account, const QString& device, cons
     }
 
     auto* session = new RemoteSessionTab(
-        account, device, name, options,
+        account, device, name, options, diagnostics,
         [this] { toggleFullscreen(); },
+        [this] { shareAgentDiagnostics(); },
         [this] { refreshChrome(); },
         this, stack_);
     sessions_.push_back(session);
@@ -568,9 +590,10 @@ RemoteSessionTab* RemoteWindow::sessionAt(int index) const {
     return sessions_[static_cast<size_t>(index)];
 }
 
-int RemoteWindow::findSession(const QString& device) const {
+int RemoteWindow::findSession(const QString& device, bool diagnostics) const {
     for (int i = 0; i < static_cast<int>(sessions_.size()); ++i) {
-        if (sessions_[static_cast<size_t>(i)]->device() == device) return i;
+        const auto* session = sessions_[static_cast<size_t>(i)];
+        if (session->device() == device && session->diagnostics() == diagnostics) return i;
     }
     return -1;
 }
@@ -600,6 +623,7 @@ void RemoteWindow::onTabMoved(int from, int to) {
 void RemoteWindow::closeTab(int index) {
     auto* session = sessionAt(index);
     if (!session) return;
+    if (agent_target_ == session) stopAgentSharing();
     sessions_.erase(sessions_.begin() + index);
     tabs_->removeTab(index);
     stack_->removeWidget(session);
@@ -636,8 +660,9 @@ void RemoteWindow::refreshChrome() {
 
     setWindowTitle(QStringLiteral("%1 · P2P Remote").arg(current->name()));
     const bool has_handle = current->handle() != nullptr;
-    display_menu_->setEnabled(has_handle);
-    audio_menu_->setEnabled(has_handle);
+    display_menu_->setEnabled(has_handle && !current->diagnostics());
+    audio_menu_->setEnabled(has_handle && !current->diagnostics());
+    fullscreen_->setEnabled(fullscreen_mode_ || !current->diagnostics());
     actions_menu_->setEnabled(has_handle);
 
     const bool mic_live = has_handle && current->playing() && current->micEnabled();
@@ -654,10 +679,13 @@ void RemoteWindow::refreshChrome() {
     if (!current->noticeText().isEmpty()) {
         left += QStringLiteral("  ·  ") + current->noticeText();
     }
+    const bool agent_shared = agent_broker_ && agent_broker_->active();
+    if (!agent_shared && agent_dialog_) agent_dialog_->close();
+    if (agent_shared) left += QStringLiteral("  ·  正在共享 Agent 只读诊断");
     if (status_text_->text() != left) status_text_->setText(left);
 
     const bool need_statusbar = !fullscreen_mode_
-        && (!current->playing() || !current->noticeText().isEmpty());
+        && (!current->playing() || current->diagnostics() || !current->noticeText().isEmpty() || agent_shared);
     statusbar_->setVisible(need_statusbar);
 }
 
@@ -954,6 +982,15 @@ void RemoteWindow::showActionsMenu() {
     auto* open_settings = menu->addAction(QStringLiteral("设置…"));
     connect(open_settings, &QAction::triggered, this, &RemoteWindow::openSettings);
 
+    const bool shared = agent_broker_ && agent_broker_->active();
+    auto* share = menu->addAction(shared ? QStringLiteral("停止本机 Agent 共享")
+        : QStringLiteral("共享诊断给本机 Agent…"));
+    share->setEnabled(shared || session->playing());
+    connect(share, &QAction::triggered, this, [this, shared] {
+        if (shared) stopAgentSharing();
+        else shareAgentDiagnostics();
+    });
+
     auto* close_tab = menu->addAction(QStringLiteral("关闭当前标签页"));
     connect(close_tab, &QAction::triggered, this, [this] {
         closeTab(tabs_->currentIndex());
@@ -962,4 +999,49 @@ void RemoteWindow::showActionsMenu() {
 
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
     menu->popup(actions_menu_->mapToGlobal(QPoint(0, actions_menu_->height())));
+}
+
+void RemoteWindow::shareAgentDiagnostics() {
+    auto* session = currentSession();
+    if (!session || !session->playing() || !account_) return;
+    if (agent_dialog_) agent_dialog_->close();
+    if (!agent_broker_) agent_broker_ = std::make_unique<AgentBroker>(this);
+    const QPointer<RemoteSessionTab> target(session);
+    QMap<QString, QStringList> reports;
+    for (const auto& plugin : AppSettings::discoverPlugins()) {
+        reports.insert(plugin.agent_reports);
+    }
+    if (!agent_broker_->start(account_, session->device(), [target] {
+        return target && target->playing() ? target->handle() : nullptr;
+    }, session->diagnostics(), std::move(reports))) {
+        QMessageBox::warning(this, QStringLiteral("AI Agent 诊断"), QStringLiteral("无法启动本机诊断共享。"));
+        return;
+    }
+    agent_target_ = session;
+    refreshChrome();
+
+    auto* dialog = new FramelessDialog(QStringLiteral("本机 Agent 诊断共享"), false, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    agent_dialog_ = dialog;
+    dialog->resize(470, 215);
+    auto* summary = new QLabel(QStringLiteral("已选择 %1。每次查询仍须被控端批准。").arg(session->name()), dialog);
+    summary->setTextFormat(Qt::PlainText);
+    summary->setWordWrap(true);
+    dialog->contentLayout()->addWidget(summary);
+    auto* token = new QLineEdit(agent_broker_->token(), dialog);
+    token->setReadOnly(true);
+    token->setAccessibleName(QStringLiteral("本机接入码"));
+    dialog->contentLayout()->addWidget(token);
+    auto* stop = new QPushButton(QStringLiteral("停止共享"), dialog);
+    connect(stop, &QPushButton::clicked, this, &RemoteWindow::stopAgentSharing);
+    dialog->contentLayout()->addWidget(stop);
+    dialog->show();
+    token->selectAll();
+}
+
+void RemoteWindow::stopAgentSharing() {
+    if (agent_broker_) agent_broker_->stop();
+    agent_target_.clear();
+    if (agent_dialog_) agent_dialog_->close();
+    refreshChrome();
 }

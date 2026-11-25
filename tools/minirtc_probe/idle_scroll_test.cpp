@@ -282,16 +282,39 @@ int Run(std::string_view mode) {
     }
     return misses ? 1 : 0;
 }
+
+int CheckDiagnosticsConnection() {
+    const auto host_events = std::make_shared<StreamEvents>();
+    const auto viewer_events = std::make_shared<StreamEvents>();
+    ConnectionOptions options;
+    options.ice_trace_dir = std::filesystem::temp_directory_path() / L"P2PRemote" / L"diagnostics-rtc-test";
+    MiniRtcCall host(true, host_events, options, false, 30, nullptr, nullptr, true);
+    MiniRtcCall viewer(false, viewer_events, options, false, 30, nullptr, nullptr, true);
+    PeerState a, b;
+    const auto deadline = Clock::now() + 8s;
+    while (!a.connected || !b.connected) {
+        Relay(*host_events, viewer, L"host", a);
+        Relay(*viewer_events, host, L"viewer", b);
+        if (Clock::now() >= deadline) throw std::runtime_error("Diagnostics-only DTLS connection did not establish");
+        std::this_thread::sleep_for(2ms);
+    }
+    host.SetPluginsConnected(true);
+    viewer.SetPluginsConnected(true);
+    if (!host.Plugins() || !viewer.Plugins() || host.InputReady() || viewer.InputReady() ||
+        host.HasFrame() || viewer.HasFrame()) throw std::runtime_error("Diagnostics unexpectedly enabled media or input");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const std::string_view mode = argc == 2 ? argv[1] : "";
-        if (argc != 1 && mode != "--continuous" && mode != "--encoder-backlog") {
-            throw std::runtime_error("Usage: idle_scroll_test [--continuous | --encoder-backlog]");
+        if (argc != 1 && mode != "--continuous" && mode != "--encoder-backlog" && mode != "--diagnostics-only") {
+            throw std::runtime_error("Usage: idle_scroll_test [--continuous | --encoder-backlog | --diagnostics-only]");
         }
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        return Run(mode);
+        return mode == "--diagnostics-only" ? CheckDiagnosticsConnection() : Run(mode);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "Idle scroll test failed: %s\n", error.what());
         return 1;

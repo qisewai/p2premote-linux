@@ -175,6 +175,7 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 	expect(host, "ready")
 	expect(open(a.Token, "join_internet", addedA.ID), "error")
 	expect(open(stranger.Token, "join_internet", addedA.ID), "error")
+	expect(open(b.Token, "join_diagnostics", addedA.ID), "error")
 	call("DELETE", "devices/"+addedA.ID, stranger.Token, nil, 204, nil)
 	call("GET", "devices", stranger.Token, nil, 200, &visible)
 	if len(visible.Devices) != 0 {
@@ -229,6 +230,18 @@ func TestManagedAccountsAndOwnedSignaling(t *testing.T) {
 	call("POST", "devices/current", again.Token, nil, 200, &repeated)
 	if repeated.ID == "" || repeated.ID == addedA.ID {
 		t.Fatal("re-added device reused its removed ID")
+	}
+	interactive := open(again.Token, "listen_internet", "")
+	expect(interactive, "ready")
+	expect(open(stranger.Token, "join_diagnostics", repeated.ID), "error")
+	readOnly := open(b.Token, "join_diagnostics", repeated.ID)
+	expect(readOnly, "waiting")
+	expect(interactive, "request_diagnostics")
+	if err := write(ctx, interactive, message{Type: "accept", Payload: "diagnostics"}); err != nil {
+		t.Fatal(err)
+	}
+	if accepted := expect(readOnly, "accepted"); accepted.Payload != "diagnostics" {
+		t.Fatalf("unexpected diagnostic mode: %+v", accepted)
 	}
 	expect(open(service.Token, "listen_internet", ""), "error")
 	server.Close()

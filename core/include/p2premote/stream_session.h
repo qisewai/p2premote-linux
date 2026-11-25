@@ -89,6 +89,13 @@ public:
     bool HasPluginMenu() const;
     std::vector<PluginMenuItem> PluginMenu() const;
     void InvokePluginMenu(unsigned id);
+    std::uint32_t PendingAgentApproval(AgentTool* tool = nullptr) const;
+    void DecideAgentApproval(std::uint32_t id, bool approved, std::string_view image = {});
+    void RevokeAgentApproval(bool pause);
+    void SetAgentPromptInputBlocked(bool blocked);
+    std::uint32_t RequestAgentSummary(AgentTool tool = AgentTool::system_info);
+    std::optional<AgentSummary> TakeAgentSummary(std::uint32_t id);
+    void CancelAgentSummary(std::uint32_t id);
     std::vector<PluginUiCommand> TakePluginUiCommands();
     void SendPluginUiEvent(PluginUiEvent event);
     void UpdatePluginLockState(bool caps, bool num);

@@ -32,6 +32,7 @@ private:
         QString id;
         QWidget* card{};
         int nav_row{};
+        bool host{};
         QVector<PluginFieldBinding> fields;
     };
 

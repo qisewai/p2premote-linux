@@ -9,6 +9,7 @@
 #include "dxgi_capturer.h"
 #include "minirtc_call.h"
 #include "plugin_host.h"
+#include "plugin_settings.h"
 #include "qpc.h"
 #include "signal_socket.h"
 #include "stream_events.h"
@@ -31,6 +32,20 @@ namespace {
 constexpr ULONGLONG reconnect_window_ms = 30'000;
 constexpr ULONGLONG close_grace_ms = 1'000;
 constexpr ULONGLONG video_settings_timeout_ms = 3'000;
+
+bool DiagnosticsEnabled() {
+    try {
+        const auto root = DefaultPluginSettingsDirectory();
+        if (root.empty()) return false;
+        const PluginSettings settings(root / L"ai-agent.host.json");
+        for (const auto* key : {L"allow_host_access", L"allow_screen_snapshot"}) {
+            const auto value = settings.Get(key);
+            if (value && value.ValueType() == winrt::Windows::Data::Json::JsonValueType::Boolean &&
+                value.GetBoolean()) return true;
+        }
+    } catch (...) {}
+    return false;
+}
 
 struct VideoLimits {
     int width;
@@ -259,6 +274,7 @@ struct ActiveStream {
     unsigned refinement_left{};
     std::uint64_t idle_repeats{};
     bool dynamic_cadence{};
+    bool diagnostics{};
     std::unique_ptr<D3d11VideoConverter> converter;
     bool gpu_conversion_failed{};
     bool gpu_texture_conversion_failed{};
@@ -403,6 +419,8 @@ struct StreamSession::Impl {
         unsigned attempts{};
         bool desktop{};
     };
+
+    bool agent_prompt_input_blocked{};
 
     Impl(bool is_host, ConnectionOptions options) : host(is_host), connection(std::move(options)) {
         if (connection.signal_url.empty()) connection.signal_url = L"ws://127.0.0.1:8787/signal";
@@ -564,6 +582,7 @@ void StreamSession::Open(HMONITOR monitor, HWND surface, StreamFrameRate frame_r
     auto trace = connection.latency_trace_dir.empty() ? nullptr
         : std::make_shared<LatencyTrace>(connection.latency_trace_dir, impl_->host);
     auto active = std::make_unique<ActiveStream>(std::move(trace));
+    active->diagnostics = !impl_->host && connection.diagnostics;
     active->monitor = monitor;
     active->surface = surface;
     active->dynamic_cadence = impl_->host && connection.DynamicCadenceEnabled();
@@ -571,7 +590,8 @@ void StreamSession::Open(HMONITOR monitor, HWND surface, StreamFrameRate frame_r
     active->capture_interval = impl_->host && NeedsCaptureRateLimit(monitor, target_fps) ? QpcFrequency() / target_fps : 0;
     const auto target = !impl_->host ? winrt::to_string(connection.remote_device) : std::string{};
     active->signal = std::make_unique<SignalSocket>(active->events, connection.signal_url,
-        impl_->host ? "listen_internet" : "join_internet", target, connection.access_token);
+        impl_->host ? "listen_internet" : active->diagnostics ? "join_diagnostics" : "join_internet",
+        target, connection.access_token);
     impl_->samples.clear();
     impl_->stats = {};
     impl_->stats.target_fps = impl_->host ? target_fps : 0;
@@ -585,8 +605,19 @@ void StreamSession::Open(HMONITOR monitor, HWND surface, StreamFrameRate frame_r
 void StreamSession::Approve(StreamInputMode input) {
     if (!impl_->host || impl_->state != StreamState::approval) return;
     auto& active = *impl_->active;
+    if (active.diagnostics) {
+        active.negotiation_start = QpcNow();
+        impl_->state = StreamState::negotiating;
+        impl_->detail = L"正在建立只读诊断连接";
+        active.rtc = std::make_unique<MiniRtcCall>(true, active.events, impl_->connection,
+            false, 30, nullptr, nullptr, true);
+        active.signal->Send("accept", "diagnostics");
+        return;
+    }
     active.input_mode = input;
-    if (input == StreamInputMode::desktop) active.desktop = std::make_unique<DesktopInput>(active.monitor, active.events->Trace().get());
+    if (input == StreamInputMode::desktop && !impl_->agent_prompt_input_blocked) {
+        active.desktop = std::make_unique<DesktopInput>(active.monitor, active.events->Trace().get());
+    }
     active.negotiation_start = QpcNow();
     impl_->state = StreamState::negotiating;
     impl_->detail = L"已授权，正在建立视频连接";
@@ -622,6 +653,7 @@ StreamAudioOptions StreamSession::AudioOptions() const noexcept {
 void StreamSession::ApplyAudioOptions() {
     if (impl_->host || impl_->state != StreamState::streaming || !impl_->active) return;
     auto& active = *impl_->active;
+    if (active.diagnostics) return;
     if (!active.rtc || active.transport_close_deadline) return;
     const auto& opt = impl_->audio_options;
 
@@ -658,7 +690,7 @@ void StreamSession::ApplyAudioOptions() {
 void StreamSession::UpdateVideoSettings() {
     if (impl_->host || impl_->state != StreamState::streaming) return;
     auto& active = *impl_->active;
-    if (active.transport_close_deadline) return;
+    if (active.diagnostics || active.transport_close_deadline) return;
     const auto now = GetTickCount64();
     const auto resolution = impl_->requested_quality;
     const auto preset = impl_->requested_bitrate == VideoBitratePreset::automatic ? active.plugin_bitrate : impl_->requested_bitrate;
@@ -815,16 +847,34 @@ void StreamSession::ProcessEvents() {
                 impl_->reconnect.reset();
                 impl_->detail = L"等待同账号设备连接";
                 if (impl_->connection.auto_control) impl_->detail += L" · 自动允许整桌面控制";
-            } else if (impl_->host && impl_->state == StreamState::waiting && event.name == "request") {
+            } else if (impl_->host && impl_->state == StreamState::waiting &&
+                (event.name == "request" || event.name == "request_diagnostics")) {
+                const bool diagnostics = event.name == "request_diagnostics";
+                if (diagnostics && (!impl_->connection.diagnostics || !DiagnosticsEnabled())) {
+                    active.signal->Send("reject", {});
+                    break;
+                }
+                active.diagnostics = diagnostics;
                 impl_->state = StreamState::approval;
-                if (impl_->connection.auto_control) Approve(StreamInputMode::desktop);
+                if (active.diagnostics) Approve(StreamInputMode::view_only);
+                else if (impl_->connection.auto_control) Approve(StreamInputMode::desktop);
                 else impl_->detail = L"收到同账号设备连接请求，请确认授权";
             } else if (!impl_->host && event.name == "waiting" && impl_->state == StreamState::waiting) {
                 impl_->detail = L"等待 Host 确认";
             } else if (!impl_->host && event.name == "accepted" && impl_->state == StreamState::waiting) {
+                if (active.diagnostics != (event.payload == "diagnostics")) {
+                    Stop(L"对端未接受所选连接模式");
+                    return;
+                }
                 impl_->state = StreamState::negotiating;
-                impl_->detail = L"Host 已允许，正在建立视频连接";
                 active.negotiation_start = QpcNow();
+                if (active.diagnostics) {
+                    impl_->detail = L"正在建立只读诊断连接";
+                    active.rtc = std::make_unique<MiniRtcCall>(false, active.events, impl_->connection,
+                        false, 30, nullptr, nullptr, true);
+                    break;
+                }
+                impl_->detail = L"Host 已允许，正在建立视频连接";
                 active.device = CreateD3d11Device(true);
                 active.overlays = std::make_shared<PluginOverlays>();
                 active.rtc = std::make_unique<MiniRtcCall>(false, active.events, impl_->connection,
@@ -844,6 +894,14 @@ void StreamSession::ProcessEvents() {
             break;
         case StreamEventType::connected:
             if (impl_->state == StreamState::negotiating) {
+                if (active.diagnostics) {
+                    impl_->start = QpcNow();
+                    impl_->state = StreamState::streaming;
+                    impl_->reconnect.reset();
+                    impl_->detail = L"只读诊断已连接";
+                    active.rtc->SetPluginsConnected(true);
+                    break;
+                }
                 if (impl_->host) {
                     if (!active.device) active.device = CreateD3d11Device(true);
                     active.pixels = std::make_unique<CapturePixels>(active.device.get());
@@ -1024,6 +1082,56 @@ void StreamSession::InvokePluginMenu(unsigned id) {
     if (auto* plugins = impl_->active->rtc->Plugins()) plugins->Invoke(id);
 }
 
+std::uint32_t StreamSession::PendingAgentApproval(AgentTool* tool) const {
+    if (!impl_->host || !impl_->active || !impl_->active->rtc) return 0;
+    const auto* plugins = impl_->active->rtc->Plugins();
+    return plugins ? plugins->PendingAgentApproval(tool) : 0;
+}
+
+void StreamSession::DecideAgentApproval(std::uint32_t id, bool approved, std::string_view image) {
+    if (!impl_->host || !impl_->active || !impl_->active->rtc) return;
+    if (auto* plugins = impl_->active->rtc->Plugins()) plugins->DecideAgentApproval(id, approved, image);
+}
+
+void StreamSession::RevokeAgentApproval(bool pause) {
+    if (!impl_->host || !impl_->active || !impl_->active->rtc) return;
+    if (auto* plugins = impl_->active->rtc->Plugins()) plugins->RevokeAgentApproval(pause);
+}
+
+void StreamSession::SetAgentPromptInputBlocked(bool blocked) {
+    if (!impl_->host || impl_->agent_prompt_input_blocked == blocked) return;
+    impl_->agent_prompt_input_blocked = blocked;
+    auto* active = impl_->active.get();
+    if (!active || active->input_mode != StreamInputMode::desktop) return;
+    if (blocked) {
+        active->events->SetDesktopInput(nullptr);
+        // Join the input worker before presenting the local approval buttons.
+        active->desktop.reset();
+    } else if (!active->desktop) {
+        active->desktop = std::make_unique<DesktopInput>(active->monitor, active->events->Trace().get());
+        if (InputReady()) active->events->SetDesktopInput(active->desktop.get());
+    }
+}
+
+std::uint32_t StreamSession::RequestAgentSummary(AgentTool tool) {
+    if (impl_->host || !impl_->active || !impl_->active->rtc || impl_->state != StreamState::streaming) return 0;
+    auto* plugins = impl_->active->rtc->Plugins();
+    return plugins ? plugins->RequestAgentSummary(tool) : 0;
+}
+
+std::optional<AgentSummary> StreamSession::TakeAgentSummary(std::uint32_t id) {
+    if (!impl_->host && impl_->active && impl_->active->rtc) {
+        if (auto* plugins = impl_->active->rtc->Plugins()) return plugins->TakeAgentSummary(id);
+    }
+    return AgentSummary{"disconnected", {}, {}};
+}
+
+void StreamSession::CancelAgentSummary(std::uint32_t id) {
+    if (!impl_->host && impl_->active && impl_->active->rtc) {
+        if (auto* plugins = impl_->active->rtc->Plugins()) plugins->CancelAgentSummary(id);
+    }
+}
+
 std::vector<PluginUiCommand> StreamSession::TakePluginUiCommands() {
     if (!impl_->host && impl_->active && impl_->active->rtc) {
         if (auto* plugins = impl_->active->rtc->Plugins()) {
@@ -1107,7 +1215,7 @@ void StreamSession::ProcessPluginActions() {
 
 bool StreamSession::InputReady() const noexcept {
     return impl_->state == StreamState::streaming && impl_->active && impl_->active->input_ready
-        && !impl_->active->transport_close_deadline;
+        && !impl_->active->transport_close_deadline && !impl_->agent_prompt_input_blocked;
 }
 
 bool StreamSession::LocalCursor(HCURSOR& cursor) const noexcept {
@@ -1343,6 +1451,7 @@ void StreamSession::Tick() {
             if (now_ms >= active.transport_close_deadline) Recover(impl_->detail);
             return;
         }
+        if (active.diagnostics) return;
         const auto now = QpcNow();
         if (impl_->host && now_ms - active.last_desktop_check >= 250) {
             active.last_desktop_check = now_ms;

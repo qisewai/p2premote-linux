@@ -16,6 +16,7 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QMessageBox;
 class QPushButton;
 class QStackedWidget;
 class QSystemTrayIcon;
@@ -58,10 +59,14 @@ private:
     void toggleReceiving();
     void startReceiving();
     void stopReceiving();
+    void showAgentApproval(std::uint32_t id, int tool, std::uint64_t generation, void* monitor);
+    std::uint32_t clearAgentApproval();
+    void stopAgentDiagnostics();
+    void openAgentAudit();
     void refreshServiceStatus();
     void toggleHostService();
     void relaunchAsAdmin();
-    void connectDevice();
+    void connectDevice(bool diagnostics = false);
     void closeSessions();
 
     LaunchOptions options_;
@@ -80,6 +85,9 @@ private:
     QTimer service_refresh_;
     std::jthread service_status_thread_;
     std::uint64_t service_status_generation_{};
+    std::uint32_t agent_prompt_id_{};
+    QPointer<QMessageBox> agent_prompt_;
+    QLabel* agent_status_{};
     bool service_status_pending_{};
     bool elevated_{};
     QString loaded_server_;
@@ -94,6 +102,7 @@ private:
     QComboBox* screens_{};
     QPushButton *login_{}, *register_{}, *connect_{}, *receive_{}, *refresh_button_{}, *logout_{};
     QPushButton *add_device_{}, *remove_device_{};
+    QPushButton* connect_diagnostics_{};
     QPushButton *service_button_{}, *elevate_button_{};
     QSystemTrayIcon* tray_{};
     QAction* tray_receive_{};

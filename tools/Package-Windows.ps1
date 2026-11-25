@@ -127,7 +127,8 @@ try {
         Write-Host '[1/3] Configuring and building Windows x64 Release'
         Invoke-CMake @('--preset', 'windows-x64-qt', '-B', $build,
             "-DP2PREMOTE_MINIRTC_DIR=$MiniRtcDir", "-DP2PREMOTE_GHOSTTY_VT_DIR=$GhosttyVtDir")
-        Invoke-CMake @('--build', $build, '--config', 'Release', '--target', 'p2premote_qt', 'p2premote', 'p2premote_service')
+        Invoke-CMake @('--build', $build, '--config', 'Release', '--target',
+            'p2premote_qt', 'p2premote', 'p2premote_service', 'p2p_cli', 'p2premote_mcp')
 
         Write-Host '[2/3] Installing the clients and runtime dependencies'
         [void][IO.Directory]::CreateDirectory($output)
@@ -138,10 +139,10 @@ try {
         [void][IO.Directory]::CreateDirectory($stage)
         Invoke-CMake @('--install', $build, '--config', 'Release', '--prefix', $stage)
         foreach ($file in @(
-            'p2premote_qt.exe', 'p2premote.exe', 'p2premote_service.exe', 'p2premote_core.dll', 'p2premote_minirtc.dll',
-            'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'platforms\qwindows.dll',
+            'p2premote_qt.exe', 'p2premote.exe', 'p2premote_service.exe', 'p2premote_core.dll', 'p2premote_minirtc.dll', 'p2premote_mcp.exe', 'p2p-cli.exe',
+            'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'Qt6Network.dll', 'platforms\qwindows.dll',
             'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'ghostty-vt.dll',
-            'licenses\ghostty-vt.txt', 'lua-notice.html', 'plugins\remote-terminal\main.lua'
+            'licenses\ghostty-vt.txt', 'lua-notice.html', 'plugins\remote-terminal\main.lua', 'plugins\ai-agent\main.lua'
         )) {
             if (!(Test-Path -LiteralPath (Join-Path $stage $file) -PathType Leaf)) {
                 throw "The portable installation is missing $file."

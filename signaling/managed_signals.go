@@ -30,7 +30,7 @@ func (h *hub) enterManaged(c *client, first message) (*room, error) {
 		h.deviceHosts[device.ID] = r
 		c.send("ready", "")
 		return r, nil
-	case "join_internet":
+	case "join_internet", "join_diagnostics":
 		if identity.serviceDevice != "" {
 			return nil, errors.New("请在客户端连接设备")
 		}
@@ -43,6 +43,11 @@ func (h *hub) enterManaged(c *client, first message) (*room, error) {
 		}
 		if r.stage != "waiting" {
 			return nil, errDirectUnavailable
+		}
+		r.diagnostics = first.Type == "join_diagnostics"
+		if r.diagnostics && r.host.identity.serviceDevice != "" {
+			r.diagnostics = false
+			return nil, errors.New("Diagnostics requires an interactive host")
 		}
 		request(r, c)
 		h.startExpiry(r)

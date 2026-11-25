@@ -27,7 +27,8 @@ class MiniRtcCall final {
 public:
     static bool Available(const ConnectionOptions& options);
     MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
-        bool allow_input, unsigned frame_rate, ID3D11Device* device, std::shared_ptr<PluginOverlays> overlays = {});
+        bool allow_input, unsigned frame_rate, ID3D11Device* device, std::shared_ptr<PluginOverlays> overlays = {},
+        bool diagnostics = false);
     ~MiniRtcCall();
 
     void ReceiveSignal(const std::string& payload);
@@ -63,7 +64,7 @@ private:
     static void Network(const char*, size_t, TraversalMode, const MiniRtcNetTrafficStats*, const char*, size_t, void*);
     void SendWorkspaceMessage(std::string_view kind) noexcept;
 
-    const bool host_, allow_input_;
+    const bool host_, allow_input_, diagnostics_;
     const std::shared_ptr<StreamEvents> events_;
     winrt::com_ptr<ID3D11Device> device_;
     const native_minirtc::Api* api_{};

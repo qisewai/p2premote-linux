@@ -9,6 +9,15 @@
 
 namespace p2premote {
 
+enum class AgentTool { system_info, screen_snapshot };
+inline constexpr std::size_t agent_image_limit = 512 * 1024;
+
+struct AgentSummary {
+    std::string status;
+    std::string snapshot;
+    std::string image;
+};
+
 struct PluginMenuItem {
     unsigned id{};
     std::wstring label;

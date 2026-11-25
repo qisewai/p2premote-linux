@@ -24,6 +24,7 @@ struct ConnectionOptions {
     std::vector<IceServerOptions> ice_servers;
     bool relay_only{};
     bool auto_control{};
+    bool diagnostics{};
     bool fixed_cadence{};
     bool desktop_duplication{true};
     bool video_cursor{};

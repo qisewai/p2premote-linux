@@ -4,13 +4,20 @@
 #include "settings_dialog.h"
 
 #include <QApplication>
+#include <QBuffer>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QDateTime>
+#include <QDir>
 #include <QEvent>
 #include <QFormLayout>
+#include <QFile>
 #include <QFrame>
 #include <QLabel>
+#include <QJsonDocument>
+#include <QHeaderView>
+#include <QImage>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
@@ -21,15 +28,19 @@
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
+#include <QTableWidget>
 #include <QVBoxLayout>
 
 #include <windows.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 #include <atomic>
 #include <functional>
 #include <future>
+#include <mutex>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -68,14 +79,81 @@ BOOL CALLBACK enumMonitors(HMONITOR monitor, HDC, LPRECT, LPARAM context) {
     }
 }
 
+bool interactiveDesktop() {
+    const auto desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!desktop) return false;
+    wchar_t name[32]{};
+    DWORD size{};
+    const bool valid = GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name), &size) &&
+        _wcsicmp(name, L"Default") == 0;
+    CloseDesktop(desktop);
+    return valid;
+}
+
+QByteArray captureAgentScreen(void* monitor) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(static_cast<HMONITOR>(monitor), &info) || !interactiveDesktop()) return {};
+    DwmFlush();
+    if (!interactiveDesktop()) return {};
+    const auto& area = info.rcMonitor;
+    const QSize source(area.right - area.left, area.bottom - area.top);
+    const auto output = source.width() > 1280 || source.height() > 720
+        ? source.scaled(QSize(1280, 720), Qt::KeepAspectRatio) : source;
+    if (output.isEmpty()) return {};
+
+    struct DesktopDc {
+        HDC dc{GetDC(nullptr)};
+        ~DesktopDc() { if (dc) ReleaseDC(nullptr, dc); }
+    } desktop;
+    if (!desktop.dc) return {};
+    const std::unique_ptr<std::remove_pointer_t<HDC>, decltype(&DeleteDC)> memory(CreateCompatibleDC(desktop.dc), DeleteDC);
+    if (!memory) return {};
+    BITMAPINFO bitmap{};
+    bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap.bmiHeader.biWidth = output.width();
+    bitmap.bmiHeader.biHeight = -output.height();
+    bitmap.bmiHeader.biPlanes = 1;
+    bitmap.bmiHeader.biBitCount = 32;
+    bitmap.bmiHeader.biCompression = BI_RGB;
+    void* pixels{};
+    const std::unique_ptr<std::remove_pointer_t<HBITMAP>, decltype(&DeleteObject)> dib(
+        CreateDIBSection(desktop.dc, &bitmap, DIB_RGB_COLORS, &pixels, nullptr, 0), DeleteObject);
+    if (!dib || !pixels) return {};
+    const auto previous = SelectObject(memory.get(), dib.get());
+    if (!previous || previous == HGDI_ERROR) return {};
+    SetStretchBltMode(memory.get(), HALFTONE);
+    SetBrushOrgEx(memory.get(), 0, 0, nullptr);
+    const auto copied = StretchBlt(memory.get(), 0, 0, output.width(), output.height(), desktop.dc,
+        area.left, area.top, source.width(), source.height(), SRCCOPY | CAPTUREBLT);
+    GdiFlush();
+    SelectObject(memory.get(), previous);
+    if (!copied || !interactiveDesktop()) return {};
+    auto image = QImage(static_cast<const uchar*>(pixels), output.width(), output.height(), QImage::Format_RGB32).copy();
+    if (image.isNull() || !interactiveDesktop()) return {};
+    for (const auto& size : {QSize(1280, 720), QSize(960, 540), QSize(640, 360), QSize(480, 270)}) {
+        if (image.width() > size.width() || image.height() > size.height()) {
+            image = image.scaled(size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        }
+        QByteArray png;
+        QBuffer buffer(&png);
+        if (buffer.open(QIODevice::WriteOnly) && image.save(&buffer, "PNG") && png.size() <= P2P_AGENT_IMAGE_LIMIT) {
+            return png;
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 class HostSession final {
 public:
     using Callback = std::function<void(int state, const QString& status, bool desktop_control)>;
+    using AgentCallback = std::function<void(std::uint32_t id, int tool)>;
 
-    HostSession(p2p_account* account, void* monitor, LaunchOptions options, Callback on_update, QString* error)
-        : wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr)), on_update_(std::move(on_update)) {
+    HostSession(p2p_account* account, void* monitor, LaunchOptions options, Callback on_update,
+        AgentCallback on_agent, QString* error)
+        : wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr)), on_update_(std::move(on_update)), on_agent_(std::move(on_agent)) {
         if (!wake_) {
             if (error) *error = QStringLiteral("无法创建接收线程唤醒事件。");
             return;
@@ -108,7 +186,26 @@ public:
         if (wake_) SetEvent(wake_);
     }
 
+    void answerAgent(std::uint32_t id, bool approved, QByteArray png = {}) {
+        {
+            const std::lock_guard lock(agent_mutex_);
+            agent_answer_ = AgentAnswer{id, approved, std::move(png)};
+        }
+        if (wake_) SetEvent(wake_);
+    }
+
+    void revokeAgent(bool temporary_block) {
+        agent_revoke_.store(temporary_block ? 2 : 1, std::memory_order_release);
+        if (wake_) SetEvent(wake_);
+    }
+
 private:
+    struct AgentAnswer {
+        std::uint32_t id;
+        bool approved;
+        QByteArray png;
+    };
+
     void stop() {
         if (thread_.joinable()) {
             thread_.request_stop();
@@ -120,7 +217,7 @@ private:
     void run(std::stop_token stop, p2p_account* account, void* monitor, const LaunchOptions& options,
         std::promise<QString> started) {
         const p2p_connection_options_v1 settings{
-            options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, 1};
+            options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, 1, 1};
         std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream(
             p2p_stream_create(account, 1, nullptr, nullptr, &settings), p2p_stream_destroy);
         if (!stream) {
@@ -136,6 +233,8 @@ private:
         int last_state = -1;
         bool last_desktop = false;
         bool input_ready = false;
+        std::uint32_t agent_approval{};
+        std::uint32_t input_blocked_for{};
         QString last_status;
         auto publish = [&](bool force) {
             p2p_stream_snapshot_v1 snapshot{};
@@ -208,6 +307,29 @@ private:
                 check_snapshot = true;
             }
 
+            if (const auto revoke = agent_revoke_.exchange(0, std::memory_order_acq_rel)) {
+                p2p_stream_revoke_agent_approval(stream.get(), revoke == 2);
+                check_snapshot = true;
+            }
+            std::optional<AgentAnswer> answer;
+            {
+                const std::lock_guard lock(agent_mutex_);
+                answer = std::exchange(agent_answer_, {});
+            }
+            if (answer) {
+                const auto id = answer->id;
+                p2p_stream_decide_agent_approval(stream.get(), id, answer->approved, answer->png.constData(),
+                    static_cast<std::size_t>(answer->png.size()));
+                if (input_blocked_for == id) {
+                    if (p2p_stream_block_agent_prompt_input(stream.get(), 0) != P2P_OK) {
+                        fail();
+                        break;
+                    }
+                    input_blocked_for = 0;
+                }
+                check_snapshot = true;
+            }
+
             if (waited >= WAIT_OBJECT_0 + 1 && waited < WAIT_OBJECT_0 + count) {
                 const auto kind = kinds[waited - WAIT_OBJECT_0];
                 if (p2p_stream_dispatch(stream.get(), kind) != P2P_OK) {
@@ -246,11 +368,30 @@ private:
                 || (p2p_stream_input_ready(stream.get()) != 0) != input_ready) {
                 if (!publish(false)) break;
             }
+            if (check_snapshot) {
+                int tool{};
+                const auto next = p2p_stream_pending_agent_approval(stream.get(), &tool);
+                if (next != agent_approval) {
+                    if (next) {
+                        if (p2p_stream_block_agent_prompt_input(stream.get(), 1) != P2P_OK) {
+                            fail();
+                            break;
+                        }
+                        input_blocked_for = next;
+                    }
+                    agent_approval = next;
+                    if (on_agent_) on_agent_(next, tool);
+                }
+            }
         }
     }
 
     HANDLE wake_{};
     Callback on_update_;
+    AgentCallback on_agent_;
+    std::mutex agent_mutex_;
+    std::optional<AgentAnswer> agent_answer_;
+    std::atomic<int> agent_revoke_{};
     std::atomic<bool> display_changed_{false};
     std::atomic<bool> stopped_{false};
     bool started_{false};
@@ -442,6 +583,17 @@ QWidget* AccountWindow::makeDevicesPage() {
     service_button_ = new QPushButton(QStringLiteral("启用系统服务"), receiver);
     service_row->addWidget(service_button_);
     local->addLayout(service_row);
+    auto* agent_row = new QHBoxLayout;
+    agent_status_ = new QLabel(QStringLiteral("AI Agent 诊断"), receiver);
+    agent_status_->setObjectName(QStringLiteral("muted"));
+    agent_row->addWidget(agent_status_, 1);
+    auto* audit = new QPushButton(QStringLiteral("诊断记录…"), receiver);
+    connect(audit, &QPushButton::clicked, this, &AccountWindow::openAgentAudit);
+    agent_row->addWidget(audit);
+    auto* stop_agent = new QPushButton(QStringLiteral("暂停诊断"), receiver);
+    connect(stop_agent, &QPushButton::clicked, this, &AccountWindow::stopAgentDiagnostics);
+    agent_row->addWidget(stop_agent);
+    local->addLayout(agent_row);
     layout->addWidget(receiver);
 
     devices_ = new QListWidget(page);
@@ -451,10 +603,12 @@ QWidget* AccountWindow::makeDevicesPage() {
     layout->addWidget(devices_, 1);
     auto* lower = new QHBoxLayout;
     connect_ = new QPushButton(QStringLiteral("连接设备"), page);
+    connect_diagnostics_ = new QPushButton(QStringLiteral("只读诊断"), page);
     connect_->setObjectName(QStringLiteral("primary"));
     refresh_button_ = new QPushButton(QStringLiteral("刷新列表"), page);
     remove_device_ = new QPushButton(QStringLiteral("移除设备"), page);
     lower->addWidget(connect_);
+    lower->addWidget(connect_diagnostics_);
     lower->addWidget(refresh_button_);
     lower->addWidget(remove_device_);
     lower->addStretch();
@@ -467,8 +621,9 @@ QWidget* AccountWindow::makeDevicesPage() {
     connect(refresh_button_, &QPushButton::clicked, this, &AccountWindow::refresh);
     connect(add_device_, &QPushButton::clicked, this, &AccountWindow::addLocalDevice);
     connect(remove_device_, &QPushButton::clicked, this, &AccountWindow::removeSelectedDevice);
-    connect(connect_, &QPushButton::clicked, this, &AccountWindow::connectDevice);
-    connect(devices_, &QListWidget::itemDoubleClicked, this, &AccountWindow::connectDevice);
+    connect(connect_, &QPushButton::clicked, this, [this] { connectDevice(); });
+    connect(connect_diagnostics_, &QPushButton::clicked, this, [this] { connectDevice(true); });
+    connect(devices_, &QListWidget::itemDoubleClicked, this, [this] { connectDevice(); });
     connect(devices_, &QListWidget::itemSelectionChanged, this, &AccountWindow::updateControls);
     return page;
 }
@@ -480,6 +635,11 @@ void AccountWindow::makeTray() {
     auto* menu = new QMenu(this);
     menu->addAction(QStringLiteral("打开 P2P Remote"), this, &AccountWindow::restore);
     tray_receive_ = menu->addAction(QString{}, this, &AccountWindow::toggleReceiving);
+    menu->addAction(QStringLiteral("AI Agent 诊断记录…"), this, &AccountWindow::openAgentAudit);
+    menu->addAction(QStringLiteral("暂停 AI Agent 诊断"), this, &AccountWindow::stopAgentDiagnostics);
+    menu->addAction(QStringLiteral("停止本机 Agent 共享"), this, [this] {
+        if (viewer_) viewer_->stopAgentSharing();
+    });
     menu->addAction(QStringLiteral("设置…"), this, &AccountWindow::openSettings);
     menu->addSeparator();
     menu->addAction(QStringLiteral("退出程序"), this, &AccountWindow::quit);
@@ -571,6 +731,7 @@ void AccountWindow::updateControls() {
         (selected_id == winText(local) || (service_info_.running && selected_id == service_info_.device_id));
     connect_->setEnabled(signed_in && item && item->data(device_state_role).toString() == QStringLiteral("online")
         && !is_self_device);
+    connect_diagnostics_->setEnabled(connect_->isEnabled());
     refresh_button_->setEnabled(!busy);
     add_device_->setVisible(!local);
     add_device_->setEnabled(signed_in && !busy);
@@ -824,6 +985,11 @@ void AccountWindow::startReceiving() {
                     setStatus(text);
                 }
             }, Qt::QueuedConnection);
+        }, [this, generation, screen](std::uint32_t id, int tool) {
+            QMetaObject::invokeMethod(this, [this, generation, id, tool, screen] {
+                showAgentApproval(id, tool, generation, screen);
+            },
+                Qt::QueuedConnection);
         }, &error);
     if (!session->valid()) {
         setStatus(error);
@@ -837,12 +1003,121 @@ void AccountWindow::startReceiving() {
 
 void AccountWindow::stopReceiving() {
     ++host_generation_;
+    clearAgentApproval();
     host_.reset();
     if (hotkey_) {
         UnregisterHotKey(reinterpret_cast<HWND>(winId()), stop_hotkey);
         hotkey_ = false;
     }
     updateControls();
+}
+
+std::uint32_t AccountWindow::clearAgentApproval() {
+    const auto previous = std::exchange(agent_prompt_id_, 0);
+    if (auto* prompt = agent_prompt_.data()) {
+        prompt->hide();
+        prompt->deleteLater();
+        agent_prompt_.clear();
+    }
+    if (agent_status_) agent_status_->setText(QStringLiteral("AI Agent 诊断"));
+    return previous;
+}
+
+void AccountWindow::showAgentApproval(std::uint32_t id, int tool, std::uint64_t generation, void* monitor) {
+    if (generation != host_generation_ || !host_ || id == agent_prompt_id_) return;
+    const auto previous = clearAgentApproval();
+    if (previous) host_->answerAgent(previous, false);
+    if (!id) return;
+    const bool screen = tool == P2P_AGENT_SCREEN_SNAPSHOT;
+    auto* prompt = new QMessageBox(QMessageBox::Question, QStringLiteral("AI Agent 诊断"), screen
+        ? QStringLiteral("已连接的主控请求截取当前共享显示器的一帧。是否批准？")
+        : QStringLiteral("已连接的主控请求查看本机系统摘要。是否批准本次请求？"), QMessageBox::NoButton, this);
+    prompt->setAttribute(Qt::WA_DeleteOnClose);
+    prompt->setWindowFlag(Qt::WindowStaysOnTopHint);
+    prompt->setInformativeText(screen
+        ? QStringLiteral("批准后，将把所选显示器当前可见内容发送给主控端。请确认屏幕上可见的内容可以共享。")
+        : QStringLiteral("摘要包括系统版本、硬件、开机时长、系统盘容量、主机名和被控程序运行账户及权限。"
+        "\n批准仅对本次生效，未确认将自动拒绝。确认期间本会话的远程键鼠暂停。"));
+    auto* approve = prompt->addButton(QStringLiteral("批准本次"), QMessageBox::AcceptRole);
+    auto* reject = prompt->addButton(QStringLiteral("拒绝"), QMessageBox::RejectRole);
+    prompt->setDefaultButton(reject);
+    prompt->setEscapeButton(reject);
+    agent_prompt_ = prompt;
+    agent_prompt_id_ = id;
+    agent_status_->setText(QStringLiteral("AI Agent 诊断 · 1 条待审批"));
+    connect(prompt, &QMessageBox::finished, this, [this, generation, id, prompt, approve, screen, monitor] {
+        if (generation != host_generation_ || agent_prompt_id_ != id || !host_) return;
+        const bool approved = prompt->clickedButton() == approve;
+        clearAgentApproval();
+        host_->answerAgent(id, approved, approved && screen ? captureAgentScreen(monitor) : QByteArray{});
+    });
+    prompt->show();
+    prompt->raise();
+}
+
+void AccountWindow::stopAgentDiagnostics() {
+    const bool saved = AppSettings::savePluginConfig(QStringLiteral("ai-agent"),
+        {{QStringLiteral("allow_host_access"), false}, {QStringLiteral("allow_screen_snapshot"), false}}, true);
+    if (host_) {
+        host_->revokeAgent(!saved);
+        if (const auto id = clearAgentApproval()) host_->answerAgent(id, false);
+    }
+    const auto message = saved ? QStringLiteral("已暂停 AI Agent 诊断。可在设置中重新开启。")
+        : QStringLiteral("无法保存 AI Agent 授权设置。");
+    if (saved) setStatus(message);
+    else QMessageBox::warning(this, QStringLiteral("AI Agent 诊断"), message);
+}
+
+void AccountWindow::openAgentAudit() {
+    const auto directory = AppSettings::pluginConfigDirectory();
+    QVector<QJsonObject> records;
+    if (!directory.isEmpty()) {
+        const QDir logs(directory);
+        for (const auto& name : {QStringLiteral("ai-agent.audit.previous.jsonl"), QStringLiteral("ai-agent.audit.jsonl")}) {
+            QFile file(logs.filePath(name));
+            if (!file.open(QIODevice::ReadOnly) || file.size() > 256 * 1024) continue;
+            for (const auto& line : file.read(256 * 1024).split('\n')) {
+                const auto event = QJsonDocument::fromJson(line).object();
+                if (event.value(QStringLiteral("tool")).toString() == QStringLiteral("system_info")) records.append(event);
+            }
+        }
+    }
+    auto* dialog = new FramelessDialog(QStringLiteral("AI Agent 诊断记录"), true, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->resize(650, 370);
+    const auto count = std::min<qsizetype>(records.size(), 200);
+    if (!count) {
+        dialog->contentLayout()->addWidget(new QLabel(QStringLiteral("暂无本机诊断记录。"), dialog));
+    } else {
+        auto* table = new QTableWidget(static_cast<int>(count), 5, dialog);
+        table->setHorizontalHeaderLabels({QStringLiteral("时间"), QStringLiteral("请求"), QStringLiteral("操作"), QStringLiteral("结果"),
+            QStringLiteral("耗时 (ms)")});
+        table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+        table->verticalHeader()->hide();
+        table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        const QHash<QString, QString> outcomes{
+            {QStringLiteral("approved"), QStringLiteral("已批准")},
+            {QStringLiteral("denied"), QStringLiteral("已拒绝")},
+            {QStringLiteral("expired"), QStringLiteral("超时")},
+            {QStringLiteral("revoked"), QStringLiteral("已撤销")},
+            {QStringLiteral("cancelled"), QStringLiteral("主控已取消")},
+            {QStringLiteral("disconnected"), QStringLiteral("会话已断开")},
+            {QStringLiteral("unavailable"), QStringLiteral("不可用")}
+        };
+        for (int row = 0; row < count; ++row) {
+            const auto& record = records[records.size() - 1 - row];
+            const auto date = QDateTime::fromString(record.value(QStringLiteral("utc")).toString(), Qt::ISODate).toLocalTime();
+            table->setItem(row, 0, new QTableWidgetItem(date.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))));
+            table->setItem(row, 1, new QTableWidgetItem(QString::number(record.value(QStringLiteral("id")).toInteger())));
+            table->setItem(row, 2, new QTableWidgetItem(record.value(QStringLiteral("tool")).toString() ==
+                QStringLiteral("screen_snapshot") ? QStringLiteral("屏幕截图") : QStringLiteral("系统摘要")));
+            table->setItem(row, 3, new QTableWidgetItem(outcomes.value(record.value(QStringLiteral("result")).toString(),
+                QStringLiteral("未知"))));
+            table->setItem(row, 4, new QTableWidgetItem(QString::number(record.value(QStringLiteral("elapsed_ms")).toInteger())));
+        }
+        dialog->contentLayout()->addWidget(table);
+    }
+    dialog->show();
 }
 
 void AccountWindow::refreshServiceStatus() {
@@ -918,12 +1193,12 @@ void AccountWindow::relaunchAsAdmin() {
     quit();
 }
 
-void AccountWindow::connectDevice() {
+void AccountWindow::connectDevice(bool diagnostics) {
     if (!connect_->isEnabled()) return;
     const auto* item = devices_->currentItem();
     if (!viewer_) viewer_ = new RemoteWindow(this);
     viewer_->openSession(account_.get(), item->data(Qt::UserRole).toString(),
-        item->data(device_name_role).toString(), options_);
+        item->data(device_name_role).toString(), options_, diagnostics);
 }
 
 void AccountWindow::closeSessions() {

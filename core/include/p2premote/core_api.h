@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define P2P_CORE_ABI_VERSION 3u
+#define P2P_CORE_ABI_VERSION 7u
 /* The viewer posts this message to video_parent for a local F11 fullscreen toggle. */
 #define P2P_VIDEO_FULLSCREEN_MESSAGE 0x8042u
 
@@ -51,6 +51,8 @@ typedef struct p2p_connection_options_v1 {
     const char* stun_url;
     int32_t stun_only;
     int32_t auto_control;
+    /* Viewer opens a diagnostics-only session. Interactive host accepts such requests. */
+    int32_t diagnostics;
 } p2p_connection_options_v1;
 
 typedef struct p2p_stream_snapshot_v1 {
@@ -180,7 +182,28 @@ P2P_CORE_API size_t p2p_stream_read_menu(p2p_stream* stream);
 /* Menu text views expire at the next read_menu call or destruction. */
 P2P_CORE_API int32_t p2p_stream_menu_item(const p2p_stream* stream, size_t index, p2p_menu_item* item);
 P2P_CORE_API int32_t p2p_stream_invoke_menu(p2p_stream* stream, uint32_t id);
-P2P_CORE_API int32_t p2p_plugin_update_viewer_config(const char* plugin_id, const char* updates_json);
+enum p2p_plugin_config_role {
+    P2P_PLUGIN_CONFIG_VIEWER = 0,
+    P2P_PLUGIN_CONFIG_HOST = 1
+};
+P2P_CORE_API int32_t p2p_plugin_update_config(const char* plugin_id, int32_t role, const char* updates_json);
+/* Host-session thread only. Zero means there is no actionable approval. */
+enum p2p_agent_tool { P2P_AGENT_SYSTEM_INFO, P2P_AGENT_SCREEN_SNAPSHOT };
+enum { P2P_AGENT_IMAGE_LIMIT = 512 * 1024 };
+P2P_CORE_API uint32_t p2p_stream_pending_agent_approval(const p2p_stream* stream, int32_t* tool);
+P2P_CORE_API int32_t p2p_stream_decide_agent_approval(p2p_stream* stream, uint32_t id, int32_t approved,
+    const char* image_png, size_t image_size);
+P2P_CORE_API int32_t p2p_stream_revoke_agent_approval(p2p_stream* stream, int32_t pause);
+P2P_CORE_API int32_t p2p_stream_block_agent_prompt_input(p2p_stream* stream, int32_t blocked);
+typedef struct p2p_agent_summary {
+    const char* status;
+    const char* snapshot_json;
+    const char* image_png;
+    size_t image_size;
+} p2p_agent_summary;
+P2P_CORE_API uint32_t p2p_stream_request_agent_summary(p2p_stream* stream, int32_t tool);
+P2P_CORE_API int32_t p2p_stream_take_agent_summary(p2p_stream* stream, uint32_t id, p2p_agent_summary* summary);
+P2P_CORE_API int32_t p2p_stream_cancel_agent_summary(p2p_stream* stream, uint32_t id);
 /*
  * Declarative plugin UI commands and events (UTF-8 JSON, frontend-agnostic).
  * poll_ui_command returns P2P_OK when a command is dequeued, P2P_PENDING when empty.

@@ -270,7 +270,7 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
         SetWorkerStatus(shared, P2P_WAITING, L"系统服务已就绪 · 等待远程连接 (SYSTEM)", false, dev_id, cfg->user, cfg->monitor_index);
 
         while (WaitForSingleObject(stop_event, 0) == WAIT_TIMEOUT) {
-            const p2p_connection_options_v1 settings{L"", L"", "", 0, 1};
+            const p2p_connection_options_v1 settings{L"", L"", "", 0, 1, 0};
             std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream(
                 p2p_stream_create(account.get(), 1, nullptr, nullptr, &settings), p2p_stream_destroy);
             if (!stream) {

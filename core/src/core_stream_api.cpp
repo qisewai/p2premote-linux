@@ -16,8 +16,9 @@ using namespace p2premote::abi;
 
 struct p2p_stream {
     p2p_stream(bool host, ConnectionOptions connection, HWND parent)
-        : host(host), poll_cursor(host || !connection.video_cursor), session(host, std::move(connection)), input(session) {
-        if (host) return;
+        : host(host), diagnostics(connection.diagnostics && !host), poll_cursor(host || !connection.video_cursor),
+          session(host, std::move(connection)), input(session) {
+        if (host || diagnostics) return;
         if (!parent || GetWindowThreadProcessId(parent, nullptr) != GetCurrentThreadId()) {
             throw std::invalid_argument("视频窗口必须由当前线程创建");
         }
@@ -150,6 +151,7 @@ struct p2p_stream {
 
     Apartment apartment{winrt::apartment_type::single_threaded};
     bool host;
+    bool diagnostics;
     bool poll_cursor;
     StreamSession session;
     ViewerInput input;
@@ -165,6 +167,7 @@ struct p2p_stream {
     std::vector<PluginMenuItem> menu;
     std::deque<PluginUiCommand> ui_commands;
     PluginUiCommand current_ui_command;
+    AgentSummary current_agent_summary;
 };
 
 p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host,
@@ -175,7 +178,8 @@ p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host,
         if (host && !p2p_account_device_id(account)) {
             throw std::invalid_argument("请先将本机添加到账号设备");
         }
-        if (!host && (!remote_device || !*remote_device || !video_parent)) {
+        connection.diagnostics = options && options->diagnostics;
+        if (!host && (!remote_device || !*remote_device || (!video_parent && !connection.diagnostics))) {
             throw std::invalid_argument("请选择目标设备并创建视频窗口");
         }
         connection.auto_control = host && (!options || options->auto_control);
@@ -201,7 +205,8 @@ void p2p_stream_destroy(p2p_stream* stream) { delete stream; }
 int32_t p2p_stream_start(p2p_stream* stream, void* monitor, uint32_t fps) {
     return Guard([&] {
         auto& state = Required(stream);
-        if ((state.host && !monitor) || (!state.host && !state.surface) || (fps != 30 && fps != 60)) {
+        if ((state.host && !monitor) || (!state.host && !state.diagnostics && !state.surface) ||
+            (fps != 30 && fps != 60)) {
             throw std::invalid_argument("无效的串流窗口、显示器或帧率");
         }
         state.session.Start(static_cast<HMONITOR>(monitor), state.surface, static_cast<StreamFrameRate>(fps));
@@ -424,9 +429,10 @@ int32_t p2p_stream_invoke_menu(p2p_stream* stream, uint32_t id) {
     });
 }
 
-int32_t p2p_plugin_update_viewer_config(const char* plugin_id, const char* updates_json) {
+int32_t p2p_plugin_update_config(const char* plugin_id, int32_t role, const char* updates_json) {
     return Guard([&] {
-        if (!plugin_id || !IsPluginIdentifier(plugin_id) || !updates_json ||
+        if (!plugin_id || !IsPluginIdentifier(plugin_id) ||
+            (role != P2P_PLUGIN_CONFIG_VIEWER && role != P2P_PLUGIN_CONFIG_HOST) || !updates_json ||
             strnlen_s(updates_json, 16 * 1024 + 1) > 16 * 1024) {
             throw std::invalid_argument("无效的插件配置");
         }
@@ -449,10 +455,68 @@ int32_t p2p_plugin_update_viewer_config(const char* plugin_id, const char* updat
             }
         }
         const auto directory = DefaultPluginSettingsDirectory();
-        if (directory.empty() || !PluginSettings(directory / (std::string(plugin_id) + ".viewer.json")).Merge(updates)) {
+        const auto extension = role == P2P_PLUGIN_CONFIG_HOST ? ".host.json" : ".viewer.json";
+        if (directory.empty() || !PluginSettings(directory / (std::string(plugin_id) + extension)).Merge(updates)) {
             throw std::runtime_error("无法保存插件配置");
         }
     });
+}
+
+uint32_t p2p_stream_pending_agent_approval(const p2p_stream* stream, int32_t* tool) {
+    uint32_t id{};
+    Guard([&] {
+        AgentTool pending{};
+        id = Required(stream).session.PendingAgentApproval(&pending);
+        if (tool) *tool = pending == AgentTool::screen_snapshot ? P2P_AGENT_SCREEN_SNAPSHOT : P2P_AGENT_SYSTEM_INFO;
+    });
+    return id;
+}
+
+int32_t p2p_stream_decide_agent_approval(p2p_stream* stream, uint32_t id, int32_t approved,
+    const char* image_png, size_t image_size) {
+    return Guard([&] {
+        const auto image = image_png && image_size <= agent_image_limit
+            ? std::string_view(image_png, image_size) : std::string_view{};
+        Required(stream).session.DecideAgentApproval(id, approved != 0, image);
+    });
+}
+
+int32_t p2p_stream_revoke_agent_approval(p2p_stream* stream, int32_t pause) {
+    return Guard([&] { Required(stream).session.RevokeAgentApproval(pause != 0); });
+}
+
+int32_t p2p_stream_block_agent_prompt_input(p2p_stream* stream, int32_t blocked) {
+    return Guard([&] { Required(stream).session.SetAgentPromptInputBlocked(blocked != 0); });
+}
+
+uint32_t p2p_stream_request_agent_summary(p2p_stream* stream, int32_t tool) {
+    uint32_t id{};
+    Guard([&] {
+        if (tool != P2P_AGENT_SYSTEM_INFO && tool != P2P_AGENT_SCREEN_SNAPSHOT) return;
+        id = Required(stream).session.RequestAgentSummary(
+            tool == P2P_AGENT_SCREEN_SNAPSHOT ? AgentTool::screen_snapshot : AgentTool::system_info);
+    });
+    return id;
+}
+
+int32_t p2p_stream_take_agent_summary(p2p_stream* stream, uint32_t id, p2p_agent_summary* summary) {
+    bool ready{};
+    const auto result = Guard([&] {
+        auto& state = Required(stream);
+        auto& out = Required(summary);
+        out = {};
+        if (auto response = state.session.TakeAgentSummary(id)) {
+            state.current_agent_summary = std::move(*response);
+            out = {state.current_agent_summary.status.c_str(), state.current_agent_summary.snapshot.c_str(),
+                state.current_agent_summary.image.data(), state.current_agent_summary.image.size()};
+            ready = true;
+        }
+    });
+    return result != P2P_OK || ready ? result : P2P_PENDING;
+}
+
+int32_t p2p_stream_cancel_agent_summary(p2p_stream* stream, uint32_t id) {
+    return Guard([&] { Required(stream).session.CancelAgentSummary(id); });
 }
 
 int32_t p2p_stream_poll_ui_command(p2p_stream* stream, p2p_ui_command* command) {

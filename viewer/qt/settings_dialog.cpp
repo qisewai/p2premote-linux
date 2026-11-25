@@ -376,8 +376,8 @@ void SettingsDialog::addPluginCard(const PluginSettingSpec& spec, int nav_row) {
     card_layout->addWidget(makeSectionTitle(spec.section, card));
     if (!spec.description.isEmpty()) card_layout->addWidget(makeMuted(spec.description, card));
 
-    PluginCardBinding binding{spec.id, card, nav_row, {}};
-    const auto saved = AppSettings::loadPluginConfig(spec.id);
+    PluginCardBinding binding{spec.id, card, nav_row, spec.host_config, {}};
+    const auto saved = AppSettings::loadPluginConfig(spec.id, spec.host_config);
 
     for (const auto& field : spec.fields) {
         const bool has_saved = saved.contains(field.key);
@@ -538,7 +538,7 @@ bool SettingsDialog::saveAll() {
             if (plugin_reset_ || value != field.initial) updates.insert(field.field.key, value);
         }
         if (updates.isEmpty()) continue;
-        if (!AppSettings::savePluginConfig(card.id, updates)) {
+        if (!AppSettings::savePluginConfig(card.id, updates, card.host)) {
             save_hint_->setText(QStringLiteral("无法保存 %1 的设置。").arg(card.id));
             showPluginConfig(card.id);
             return false;

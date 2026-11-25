@@ -59,6 +59,7 @@ type room struct {
 	stage        string
 	expiration   *time.Timer
 	miniJoined   bool
+	diagnostics  bool
 }
 
 type hub struct {
@@ -79,10 +80,11 @@ func (h *hub) remove(r *room) {
 }
 
 func (h *hub) startExpiry(r *room) {
+	viewer := r.viewer
 	r.expiration = time.AfterFunc(roomLifetime, func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		if h.contains(r) && (r.stage == "waiting" || r.stage == "requested") {
+		if h.contains(r) && r.viewer == viewer && r.stage == "requested" {
 			h.remove(r)
 			r.host.send("error", "会话已过期，请重新连接")
 			r.viewer.send("error", "会话已过期，请重新连接")
@@ -93,7 +95,11 @@ func (h *hub) startExpiry(r *room) {
 func request(r *room, viewer *client) {
 	r.viewer, r.stage = viewer, "requested"
 	viewer.send("waiting", "")
-	r.host.sendMessage(message{Type: "request", Payload: viewer.ip.String()})
+	kind := "request"
+	if r.diagnostics {
+		kind = "request_diagnostics"
+	}
+	r.host.send(kind, viewer.ip.String())
 }
 
 func (h *hub) enter(c *client, first message) (*room, error) {
@@ -109,7 +115,18 @@ func (h *hub) relay(r *room, from *client, m message) bool {
 		return false
 	}
 	if r.stage == "requested" {
-		if from != r.host || m.Type != "accept" || (m.Payload != "control" && m.Payload != "view") {
+		if from == r.host && r.diagnostics && m.Type == "reject" {
+			r.viewer.send("error", "远端未开启只读诊断")
+			r.viewer, r.stage, r.diagnostics = nil, "waiting", false
+			if r.expiration != nil {
+				r.expiration.Stop()
+				r.expiration = nil
+			}
+			return true
+		}
+		validMode := m.Payload == "diagnostics" && r.diagnostics ||
+			!r.diagnostics && (m.Payload == "control" || m.Payload == "view")
+		if from != r.host || m.Type != "accept" || !validMode {
 			return false
 		}
 		r.stage = "accepted"
@@ -125,7 +142,7 @@ func (h *hub) relay(r *room, from *client, m message) bool {
 func (h *hub) leave(r *room, c *client, interrupted bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.contains(r) {
+	if !h.contains(r) || (c != r.host && c != r.viewer) {
 		return
 	}
 	h.remove(r)

@@ -1,4 +1,5 @@
 #include "plugin_host.h"
+#include "agent_audit.h"
 
 #include "clipboard_bridge.h"
 #include "file_clipboard.h"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -97,6 +99,7 @@ struct Manifest {
     bool fs{};
     bool pty{};
     bool overlay{};
+    bool sys{};
     PluginOverlayItem overlay_defaults;
 };
 
@@ -164,6 +167,7 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
         else if (name == L"fs") manifest.fs = true;
         else if (name == L"pty") manifest.pty = true;
         else if (name == L"overlay") manifest.overlay = true;
+        else if (name == L"sys") manifest.sys = true;
         else throw std::runtime_error("Unknown plugin permission");
     }
     if (manifest.overlay) {
@@ -183,6 +187,57 @@ std::optional<Manifest> ReadManifest(const IJsonObjectStatics& json_factory, con
     }
     entry = directory / filename;
     return manifest;
+}
+
+constexpr ULONGLONG agent_approval_timeout_ms = 15'000;
+
+struct AgentRequest {
+    enum class Decision { waiting, approved, denied, revoked, cancelled };
+    std::uint32_t id{};
+    ULONGLONG started{};
+    AgentTool tool{};
+    Decision decision{Decision::waiting};
+    std::string image;
+};
+
+// Lua menu requests use the lower half of the sequence space.
+constexpr std::uint32_t local_agent_id_bit = 0x80000000u;
+constexpr std::size_t agent_header_bytes = 4;
+constexpr std::size_t agent_summary_limit = 4096;
+constexpr std::size_t agent_image_chunk = 16 * 1024;
+constexpr std::string_view png_signature = "\x89PNG\r\n\x1a\n";
+
+bool ValidAgentImage(std::string_view image) {
+    if (image.size() < 45 || image.size() > agent_image_limit || !image.starts_with(png_signature) ||
+        image.substr(12, 4) != "IHDR" || image.substr(image.size() - 8, 4) != "IEND") return false;
+    const auto dimension = [&](std::size_t offset) {
+        std::uint32_t value{};
+        for (unsigned i = 0; i < 4; ++i) value = (value << 8) | static_cast<unsigned char>(image[offset + i]);
+        return value;
+    };
+    return dimension(16) > 0 && dimension(16) <= 1280 && dimension(20) > 0 && dimension(20) <= 720;
+}
+
+struct LocalAgentQuery {
+    std::uint32_t id{};
+    bool sent{};
+    AgentTool tool{};
+    std::uint32_t chunk{};
+    AgentSummary result;
+};
+
+std::string AgentHeader(std::uint32_t id) {
+    std::string bytes(agent_header_bytes, '\0');
+    for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>(id >> (i * 8));
+    return bytes;
+}
+
+std::uint32_t AgentHeaderId(std::string_view bytes) {
+    std::uint32_t id{};
+    for (std::size_t i = 0; i < agent_header_bytes; ++i) {
+        id |= static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[i])) << (i * 8);
+    }
+    return id;
 }
 
 class Workspace {
@@ -263,6 +318,10 @@ public:
     std::deque<PluginUiCommand> ui_commands;
     std::deque<PluginUiEvent> ui_events;
     PluginMetrics metrics;
+    std::optional<AgentRequest> agent_request;
+    std::optional<LocalAgentQuery> local_agent_query;
+    std::uint32_t cancel_agent_query{};
+    bool agent_paused{};
     std::optional<std::pair<bool, bool>> lock_state;
     bool lock_state_dirty{};
     std::atomic_uint lock_key_consumers{};
@@ -860,8 +919,9 @@ class PluginRuntime {
 public:
     PluginRuntime(bool host, const PluginHost::SendFrame& send, const std::atomic_bool& connected,
         Workspace& workspace, std::filesystem::path config_root, HANDLE wake, bool local_overlay,
-        PluginOverlays& overlays)
-        : host(host), local_overlay(local_overlay), workspace(workspace), config_root(std::move(config_root)),
+        PluginOverlays& overlays, bool diagnostics_only)
+        : host(host), local_overlay(local_overlay), diagnostics_only(diagnostics_only),
+          workspace(workspace), config_root(std::move(config_root)),
           wake(wake), overlays(overlays), send_(send), connected_(connected) {}
 
     bool Connected() const noexcept { return connected_.load(); }
@@ -886,6 +946,7 @@ public:
 
     const bool host;
     const bool local_overlay;
+    const bool diagnostics_only;
     Workspace& workspace;
     const std::filesystem::path config_root;
     const HANDLE wake;
@@ -2231,6 +2292,190 @@ private:
         return *settings_;
     }
 
+    bool AllowsAgentDiagnostics(AgentTool tool) {
+        if (tool == AgentTool::screen_snapshot && !runtime_.diagnostics_only) return false;
+        try {
+            const auto access = Settings().Get(tool == AgentTool::screen_snapshot ? L"allow_screen_snapshot" : L"allow_host_access");
+            return access && access.ValueType() == JsonValueType::Boolean && access.GetBoolean();
+        } catch (...) { return false; }
+    }
+
+    static int AgentStatus(lua_State* state, const char* status) {
+        lua_pushnil(state);
+        lua_pushstring(state, status);
+        return 2;
+    }
+
+    static int BeginSystemInfo(lua_State* state) {
+        auto& self = Self(state);
+        auto& runtime = self.runtime_;
+        if (!runtime.host || !runtime.Connected()) return AgentStatus(state, "unavailable");
+        static std::atomic_uint32_t next_id{1};
+        const auto id = next_id.fetch_add(1, std::memory_order_relaxed);
+        if (!id) return AgentStatus(state, "unavailable");
+        const auto tool = lua_toboolean(state, 1) ? AgentTool::screen_snapshot : AgentTool::system_info;
+        const auto allowed = self.AllowsAgentDiagnostics(tool);
+        const auto now = GetTickCount64();
+        auto& workspace = runtime.workspace;
+        bool paused{};
+        bool busy{};
+        {
+            const std::lock_guard lock(workspace.mutex);
+            paused = workspace.agent_paused;
+            busy = workspace.agent_request.has_value();
+            if (allowed && !paused && !busy) {
+                workspace.agent_request.emplace();
+                workspace.agent_request->id = id;
+                workspace.agent_request->started = now;
+                workspace.agent_request->tool = tool;
+            }
+        }
+        if (!allowed || paused) {
+            RecordAgentAudit(runtime.config_root, id, paused ? AgentAuditResult::revoked : AgentAuditResult::denied, 0, tool);
+            return AgentStatus(state, "denied");
+        }
+        if (busy) return AgentStatus(state, "busy");
+        workspace.Signal();
+        lua_pushinteger(state, id);
+        return 1;
+    }
+
+    static int PollSystemInfo(lua_State* state) {
+        auto& self = Self(state);
+        auto& runtime = self.runtime_;
+        auto& workspace = runtime.workspace;
+        const auto id = luaL_checkinteger(state, 1);
+        const auto tool = lua_toboolean(state, 2) ? AgentTool::screen_snapshot : AgentTool::system_info;
+        const auto allowed = self.AllowsAgentDiagnostics(tool);
+        const auto now = GetTickCount64();
+        std::optional<AgentRequest> finished;
+        {
+            const std::lock_guard lock(workspace.mutex);
+            auto& request = workspace.agent_request;
+            if (request && request->id == id && request->tool == tool) {
+                const bool expired = now - request->started >= agent_approval_timeout_ms;
+                if (!allowed || workspace.agent_paused) request->decision = AgentRequest::Decision::revoked;
+                if (expired || request->decision != AgentRequest::Decision::waiting) {
+                    finished = std::exchange(request, std::nullopt);
+                }
+            }
+        }
+        if (!finished) return AgentStatus(state, "pending");
+        workspace.Signal();
+        const auto elapsed = now - finished->started;
+        const auto record = [&](AgentAuditResult result) {
+            return RecordAgentAudit(runtime.config_root, finished->id, result, elapsed, tool);
+        };
+        if (finished->decision == AgentRequest::Decision::cancelled) {
+            record(AgentAuditResult::cancelled);
+            return AgentStatus(state, "cancelled");
+        }
+        if (finished->decision == AgentRequest::Decision::revoked) {
+            record(AgentAuditResult::revoked);
+            return AgentStatus(state, "revoked");
+        }
+        if (finished->decision == AgentRequest::Decision::denied) {
+            record(AgentAuditResult::denied);
+            return AgentStatus(state, "denied");
+        }
+        if (finished->decision != AgentRequest::Decision::approved || elapsed >= agent_approval_timeout_ms) {
+            record(AgentAuditResult::expired);
+            return AgentStatus(state, "expired");
+        }
+        if (!runtime.Connected()) {
+            record(AgentAuditResult::disconnected);
+            return AgentStatus(state, "unavailable");
+        }
+        if (tool == AgentTool::screen_snapshot ? finished->image.empty() : !PushSystemInfo(state)) {
+            record(AgentAuditResult::unavailable);
+            return AgentStatus(state, "unavailable");
+        }
+        if (tool == AgentTool::screen_snapshot) PushString(state, finished->image);
+        if (!record(AgentAuditResult::approved)) {
+            lua_pop(state, 1);
+            return AgentStatus(state, "unavailable");
+        }
+        return 1;
+    }
+
+    static int CancelSystemInfo(lua_State* state) {
+        const auto id = luaL_checkinteger(state, 1);
+        auto& workspace = Self(state).runtime_.workspace;
+        const std::lock_guard lock(workspace.mutex);
+        if (auto& request = workspace.agent_request; request && request->id == id) {
+            if (request->decision == AgentRequest::Decision::waiting ||
+                request->decision == AgentRequest::Decision::approved) {
+                request->decision = AgentRequest::Decision::cancelled;
+            }
+        }
+        return 0;
+    }
+
+    static bool PushSystemInfo(lua_State* state) {
+        using GetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
+        const auto get_version = std::bit_cast<GetVersion>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+        OSVERSIONINFOW version{};
+        version.dwOSVersionInfoSize = sizeof(version);
+        MEMORYSTATUSEX memory{};
+        memory.dwLength = sizeof(memory);
+        if (!get_version || get_version(&version) != 0 || !GlobalMemoryStatusEx(&memory)) return false;
+        SYSTEM_INFO system{};
+        GetNativeSystemInfo(&system);
+        const char* architecture = "unknown";
+        switch (system.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64: architecture = "x64"; break;
+        case PROCESSOR_ARCHITECTURE_ARM64: architecture = "arm64"; break;
+        case PROCESSOR_ARCHITECTURE_INTEL: architecture = "x86"; break;
+        }
+        const auto integer = [state](const char* key, lua_Integer value) {
+            lua_pushinteger(state, value);
+            lua_setfield(state, -2, key);
+        };
+        const auto text = [state](const char* key, std::wstring_view value) {
+            const auto utf8 = winrt::to_string(value);
+            lua_pushlstring(state, utf8.data(), utf8.size());
+            lua_setfield(state, -2, key);
+        };
+        constexpr auto mib = 1024ULL * 1024;
+        lua_createtable(state, 0, 14);
+        integer("schema", 1);
+        lua_pushstring(state, architecture);
+        lua_setfield(state, -2, "architecture");
+        integer("windows_major", version.dwMajorVersion);
+        integer("windows_minor", version.dwMinorVersion);
+        integer("windows_build", version.dwBuildNumber);
+        integer("logical_processors", GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+        integer("memory_total_mib", static_cast<lua_Integer>(memory.ullTotalPhys / mib));
+        integer("memory_available_mib", static_cast<lua_Integer>(memory.ullAvailPhys / mib));
+        integer("uptime_seconds", static_cast<lua_Integer>(GetTickCount64() / 1000));
+        wchar_t windows_directory[MAX_PATH]{};
+        const auto windows_length = GetWindowsDirectoryW(windows_directory, MAX_PATH);
+        wchar_t volume[MAX_PATH]{};
+        ULARGE_INTEGER total{}, free{};
+        if (windows_length && windows_length < MAX_PATH &&
+            GetVolumePathNameW(windows_directory, volume, MAX_PATH) && GetDriveTypeW(volume) == DRIVE_FIXED &&
+            GetDiskFreeSpaceExW(volume, nullptr, &total, &free)) {
+            integer("system_disk_total_mib", static_cast<lua_Integer>(total.QuadPart / mib));
+            integer("system_disk_free_mib", static_cast<lua_Integer>(free.QuadPart / mib));
+        }
+        wchar_t computer[MAX_COMPUTERNAME_LENGTH + 1]{};
+        DWORD computer_length = static_cast<DWORD>(std::size(computer));
+        if (GetComputerNameW(computer, &computer_length)) text("host_name", {computer, computer_length});
+        wchar_t user[257]{};
+        DWORD user_length = static_cast<DWORD>(std::size(user));
+        if (GetUserNameW(user, &user_length) && user_length > 1) text("host_user", {user, user_length - 1});
+        winrt::handle token;
+        TOKEN_ELEVATION elevation{};
+        DWORD returned{};
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, token.put()) &&
+            GetTokenInformation(token.get(), TokenElevation, &elevation, sizeof(elevation), &returned)) {
+            lua_pushboolean(state, elevation.TokenIsElevated != 0);
+            lua_setfield(state, -2, "host_elevated");
+        }
+        return true;
+    }
+
     static int ConfigGet(lua_State* state) {
         auto& self = Self(state);
         const auto key = CheckString(state, 1);
@@ -2524,6 +2769,8 @@ private:
             {"on_state_change", [](lua_State* l) { Subscribe(l, 1, Self(l).callbacks_.lock_state); return 0; }},
             {"set_lock", SetLocalLock}, {"set_ime", SetIme}, {"use_lock_sync", UseLockSync}, {nullptr, nullptr}};
         static const luaL_Reg config[] = {{"get", ConfigGet}, {"set", ConfigSet}, {nullptr, nullptr}};
+        static const luaL_Reg sys[] = {{"begin_info", BeginSystemInfo}, {"poll_info", PollSystemInfo},
+            {"cancel_info", CancelSystemInfo}, {nullptr, nullptr}};
         static const luaL_Reg video[] = {{"set_bitrate", SetBitrate}, {nullptr, nullptr}};
         static const luaL_Reg fs[] = {
             {"roots", FsRoots}, {"home", FsHome}, {"list", FsList}, {"stat", FsStat},
@@ -2545,6 +2792,7 @@ private:
         if (manifest_.ui) Namespace(state, "ui", ui);
         if (manifest_.input) Namespace(state, "input", input);
         if (manifest_.config) Namespace(state, "config", config);
+        if (manifest_.sys && runtime_.host && manifest_.id == "ai-agent") Namespace(state, "sys", sys);
         if (manifest_.video) Namespace(state, "video", video);
         if (manifest_.fs) Namespace(state, "fs", fs);
         if (manifest_.pty) Namespace(state, "pty", pty);
@@ -2618,7 +2866,7 @@ private:
 };
 
 void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
-    std::vector<std::unique_ptr<LuaPlugin>>& plugins) {
+    std::vector<std::unique_ptr<LuaPlugin>>& plugins, bool diagnostics_only) {
     if (!IsPlainPath(root, true)) return;
     const bool restricted_host = runtime.host && [] {
         HANDLE opened{};
@@ -2639,6 +2887,8 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
             std::filesystem::path entry;
             auto manifest = ReadManifest(json_factory, directory.path(), runtime.host, entry);
             if (!manifest) continue;
+            if (diagnostics_only && (manifest->id != "ai-agent" || manifest->input || manifest->video ||
+                manifest->fs || manifest->pty || manifest->clipboard || manifest->file_clipboard)) continue;
             const bool local_overlay = manifest->overlay && !manifest->channel;
             if (local_overlay != runtime.local_overlay) continue;
             if (local_overlay && (runtime.host || manifest->clipboard || manifest->file_clipboard
@@ -2667,8 +2917,8 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
 
 struct PluginHost::Impl {
     Impl(bool host, SendFrame send, std::filesystem::path root, Notify notify, std::filesystem::path config_root,
-        bool local_overlay, std::shared_ptr<PluginOverlays> overlays)
-        : host(host), local_overlay(local_overlay), send(std::move(send)), root(std::move(root)),
+        bool local_overlay, std::shared_ptr<PluginOverlays> overlays, bool diagnostics_only)
+        : host(host), local_overlay(local_overlay), diagnostics_only(diagnostics_only), send(std::move(send)), root(std::move(root)),
           config_root(std::move(config_root)), overlays(overlays ? std::move(overlays) : std::make_shared<PluginOverlays>()),
           workspace(std::move(notify)) {
         winrt::check_pointer(wake.get());
@@ -2682,16 +2932,79 @@ struct PluginHost::Impl {
         if (worker.joinable()) worker.join();
     }
 
+    void SendAgentQueries() {
+        std::uint32_t cancel{}, request{};
+        AgentTool tool{};
+        {
+            const std::lock_guard lock(workspace.mutex);
+            cancel = std::exchange(workspace.cancel_agent_query, 0);
+            if (auto& query = workspace.local_agent_query; query && !query->sent) {
+                query->sent = true;
+                request = query->id;
+                tool = query->tool;
+            }
+        }
+        if (cancel) {
+            if (const auto frame = EncodePluginPacket({"ai-agent", "cancel_info", AgentHeader(cancel)})) send(*frame);
+        }
+        if (request) {
+            const auto frame = EncodePluginPacket({"ai-agent",
+                tool == AgentTool::screen_snapshot ? "request_screen" : "request_info", AgentHeader(request)});
+            if (!frame || !send(*frame)) {
+                const std::lock_guard lock(workspace.mutex);
+                if (auto& query = workspace.local_agent_query; query && query->id == request) {
+                    query->result.status = "unavailable";
+                }
+            }
+        }
+    }
+
+    bool OnAgentSummary(const PluginPacket& packet) {
+        if (host || packet.id != "ai-agent" || packet.payload.size() < agent_header_bytes) return false;
+        const auto id = AgentHeaderId(packet.payload);
+        if (!(id & local_agent_id_bit)) return false;
+        const std::lock_guard lock(workspace.mutex);
+        auto& query = workspace.local_agent_query;
+        if (!query || query->id != id || !query->sent || !query->result.status.empty()) return true;
+        const auto size = packet.payload.size() - agent_header_bytes;
+        if (query->tool == AgentTool::system_info && packet.type == "snapshot" && size && size <= agent_summary_limit) {
+            query->result = {"ok", std::string(packet.payload.substr(agent_header_bytes)), {}};
+        } else if (query->tool == AgentTool::screen_snapshot &&
+                (packet.type == "image_chunk" || packet.type == "image_last")) {
+            auto& image = query->result.image;
+            if (size <= agent_header_bytes || size > agent_header_bytes + agent_image_chunk ||
+                    AgentHeaderId(packet.payload.substr(agent_header_bytes)) != query->chunk ||
+                    image.size() + size - agent_header_bytes > agent_image_limit) {
+                query->result.status = "invalid_snapshot";
+                image.clear();
+                return true;
+            }
+            ++query->chunk;
+            image.append(packet.payload.substr(2 * agent_header_bytes));
+            if (packet.type == "image_last") {
+                if (ValidAgentImage(image)) query->result.status = "ok";
+                else {
+                    query->result.status = "invalid_snapshot";
+                    image.clear();
+                }
+            }
+        } else if (!size && (packet.type == "denied" || packet.type == "unavailable" ||
+            packet.type == "revoked" || packet.type == "expired" || packet.type == "busy" || packet.type == "cancelled")) {
+            query->result.status = packet.type;
+        }
+        return true;
+    }
+
     void Run(std::stop_token stop) noexcept {
         try {
             while (!stop.stop_requested() && !connected.load()) WaitForSingleObject(wake.get(), INFINITE);
             if (stop.stop_requested()) return;
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
-            PluginRuntime runtime(host, send, connected, workspace,
-                config_root.empty() ? DefaultPluginSettingsDirectory() : config_root, wake.get(), local_overlay, *overlays);
+            PluginRuntime runtime(host, send, connected, workspace, config_root.empty() ? DefaultPluginSettingsDirectory()
+                : config_root, wake.get(), local_overlay, *overlays, diagnostics_only);
             std::vector<std::unique_ptr<LuaPlugin>> plugins;
-            LoadPlugins(root.empty() ? PluginDirectory() : root, runtime, plugins);
+            LoadPlugins(root.empty() ? PluginDirectory() : root, runtime, plugins, diagnostics_only);
             if (local_overlay && plugins.empty()) return;
             for (const auto& plugin : plugins) {
                 if (connected.load()) plugin->ConnectionChanged(true);
@@ -2719,7 +3032,8 @@ struct PluginHost::Impl {
                         frames.pop_front();
                     }
                 }
-                if (const auto packet = DecodePluginPacket(frame); packet && connected.load()) {
+                if (!host && !local_overlay && connected.load()) SendAgentQueries();
+                if (const auto packet = DecodePluginPacket(frame); packet && connected.load() && !OnAgentSummary(*packet)) {
                     const auto plugin = std::ranges::find_if(plugins, [&](const auto& entry) { return entry->Info().id == packet->id; });
                     if (plugin != plugins.end()) (*plugin)->Receive(*packet);
                 }
@@ -2762,6 +3076,15 @@ struct PluginHost::Impl {
                 if (MsgWaitForMultipleObjectsEx(1, &event, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE) == WAIT_FAILED) break;
             }
             connected = false;
+            std::optional<AgentRequest> interrupted;
+            {
+                const std::lock_guard lock(workspace.mutex);
+                interrupted = std::exchange(workspace.agent_request, std::nullopt);
+            }
+            if (interrupted) {
+                RecordAgentAudit(runtime.config_root, interrupted->id, AgentAuditResult::disconnected,
+                    GetTickCount64() - interrupted->started, interrupted->tool);
+            }
             if (runtime.clipboard) runtime.clipboard->CancelWrite();
             if (runtime.file_clipboard) runtime.file_clipboard->Clear();
             for (const auto& plugin : plugins) plugin->ConnectionChanged(false);
@@ -2775,6 +3098,7 @@ struct PluginHost::Impl {
 
     const bool host;
     const bool local_overlay;
+    const bool diagnostics_only;
     const SendFrame send;
     const std::filesystem::path root;
     const std::filesystem::path config_root;
@@ -2788,9 +3112,9 @@ struct PluginHost::Impl {
 };
 
 PluginHost::PluginHost(bool host, SendFrame send, std::filesystem::path root, Notify notify,
-    std::filesystem::path config_root, bool local_overlay, std::shared_ptr<PluginOverlays> overlays)
+    std::filesystem::path config_root, bool local_overlay, std::shared_ptr<PluginOverlays> overlays, bool diagnostics_only)
     : impl_(std::make_unique<Impl>(host, std::move(send), std::move(root), std::move(notify),
-        std::move(config_root), local_overlay, std::move(overlays))) {}
+        std::move(config_root), local_overlay, std::move(overlays), diagnostics_only)) {}
 PluginHost::~PluginHost() { Stop(); }
 
 void PluginHost::SetConnected(bool connected) noexcept {
@@ -2855,6 +3179,76 @@ void PluginHost::Invoke(unsigned id) {
         if (!impl_->connected.load() || workspace.clicks.size() >= 16 ||
             std::ranges::find(workspace.menu, id, &PluginMenuItem::id) == workspace.menu.end()) return;
         workspace.clicks.push_back(id);
+    }
+    SetEvent(impl_->wake.get());
+}
+
+std::uint32_t PluginHost::PendingAgentApproval(AgentTool* tool) const {
+    const auto& workspace = impl_->workspace;
+    const std::lock_guard lock(workspace.mutex);
+    const auto& request = workspace.agent_request;
+    if (!impl_->host || !impl_->connected.load() || !request || request->decision != AgentRequest::Decision::waiting ||
+        GetTickCount64() - request->started >= agent_approval_timeout_ms) return 0;
+    if (tool) *tool = request->tool;
+    return request->id;
+}
+
+void PluginHost::DecideAgentApproval(std::uint32_t id, bool approved, std::string_view image) {
+    auto& workspace = impl_->workspace;
+    const std::lock_guard lock(workspace.mutex);
+    auto& request = workspace.agent_request;
+    if (impl_->host && impl_->connected.load() && request && request->id == id &&
+        request->decision == AgentRequest::Decision::waiting &&
+        GetTickCount64() - request->started < agent_approval_timeout_ms) {
+        if (approved && request->tool == AgentTool::screen_snapshot && ValidAgentImage(image)) {
+            request->image = image;
+        }
+        request->decision = approved ? AgentRequest::Decision::approved : AgentRequest::Decision::denied;
+    }
+}
+
+void PluginHost::RevokeAgentApproval(bool pause) {
+    auto& workspace = impl_->workspace;
+    const std::lock_guard lock(workspace.mutex);
+    workspace.agent_paused = pause;
+    if (workspace.agent_request) workspace.agent_request->decision = AgentRequest::Decision::revoked;
+}
+
+std::uint32_t PluginHost::RequestAgentSummary(AgentTool tool) {
+    if (impl_->host || impl_->local_overlay || !impl_->send ||
+        (tool == AgentTool::screen_snapshot && !impl_->diagnostics_only)) return 0;
+    auto& workspace = impl_->workspace;
+    std::uint32_t id{};
+    {
+        const std::lock_guard lock(workspace.mutex);
+        if (!impl_->connected.load() || workspace.local_agent_query) return 0;
+        static std::atomic_uint32_t next_id{1};
+        id = next_id.fetch_add(1, std::memory_order_relaxed) | local_agent_id_bit;
+        workspace.local_agent_query = LocalAgentQuery{id, false, tool, 0, {}};
+    }
+    SetEvent(impl_->wake.get());
+    return id;
+}
+
+std::optional<AgentSummary> PluginHost::TakeAgentSummary(std::uint32_t id) {
+    auto& workspace = impl_->workspace;
+    const std::lock_guard lock(workspace.mutex);
+    auto& query = workspace.local_agent_query;
+    if (!impl_->connected.load() || !query || query->id != id) return AgentSummary{"disconnected", {}, {}};
+    if (query->result.status.empty()) return std::nullopt;
+    auto result = std::move(query->result);
+    query.reset();
+    return result;
+}
+
+void PluginHost::CancelAgentSummary(std::uint32_t id) {
+    auto& workspace = impl_->workspace;
+    {
+        const std::lock_guard lock(workspace.mutex);
+        auto& query = workspace.local_agent_query;
+        if (!query || query->id != id) return;
+        if (query->sent && query->result.status.empty()) workspace.cancel_agent_query = id;
+        query.reset();
     }
     SetEvent(impl_->wake.get());
 }

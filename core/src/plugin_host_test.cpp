@@ -1,4 +1,5 @@
 #include "plugin_host.h"
+#include "agent_audit.h"
 #include "pty_session.h"
 
 #include <p2premote/plugin_protocol.h>
@@ -93,13 +94,14 @@ public:
         return ready.wait_for(lock, 3s, [&] { return CountLocked(event) >= count; });
     }
 
-    std::optional<std::string> WaitForType(std::string_view id, std::string_view type, std::chrono::milliseconds timeout = 3s) {
+    std::optional<std::string> WaitForType(std::string_view id, std::string_view type,
+        std::chrono::milliseconds timeout = 3s, std::string_view prefix = {}) {
         std::optional<std::string> payload;
         std::unique_lock lock(mutex);
         ready.wait_for(lock, timeout, [&] {
             for (const auto& frame : frames) {
                 const auto packet = DecodePluginPacket(frame);
-                if (packet && packet->id == id && packet->type == type) {
+                if (packet && packet->id == id && packet->type == type && packet->payload.starts_with(prefix)) {
                     payload.emplace(packet->payload);
                     return true;
                 }
@@ -1063,6 +1065,216 @@ void TestConnectionStatus(const std::filesystem::path& root) {
     Check(false, "Local overlay did not render without a peer plugin channel");
 }
 
+void TestAgentDiagnostics(const std::filesystem::path& root) {
+    Fixture fixture;
+    fixture.CopyPlugin(root / "ai-agent");
+    const auto config = fixture.root / "config";
+    const auto access = config / "ai-agent.host.json";
+    const auto log = config / "ai-agent.audit.jsonl";
+    Check(std::filesystem::create_directory(config), "Could not create diagnostics config fixture");
+    fixture.RemoveOnExit(config);
+    fixture.RemoveOnExit(access);
+    fixture.RemoveOnExit(log);
+
+    WireLog requests, replies;
+    PluginHost viewer(false, [&](std::string_view frame) { return requests.Send(frame); }, fixture.root, {}, config);
+    PluginHost host(true, [&](std::string_view frame) { return replies.Send(frame); }, fixture.root, {}, config);
+    viewer.SetConnected(true);
+    host.SetConnected(true);
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    std::vector<PluginMenuItem> menu;
+    do {
+        menu = viewer.Menu();
+        if (!menu.empty()) break;
+        std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    Check(menu.size() == 1 && menu.front().menu == "tools", "Diagnostics entry was not registered");
+
+    const auto diagnose = [&](unsigned sequence) {
+        const std::string request{static_cast<char>(sequence), '\0', '\0', '\0'};
+        const PluginPacket packet{"ai-agent", "request_info", request};
+        viewer.Invoke(menu.front().id);
+        Check(requests.Wait(packet), "Viewer did not request a system summary");
+        Deliver(host, packet);
+        return request;
+    };
+
+    const auto wait_approval = [&] {
+        const auto until = std::chrono::steady_clock::now() + 3s;
+        do {
+            if (const auto id = host.PendingAgentApproval()) return id;
+            std::this_thread::sleep_for(10ms);
+        } while (std::chrono::steady_clock::now() < until);
+        throw std::runtime_error("Host did not expose a local approval request");
+    };
+
+    const auto denied = diagnose(1);
+    Check(replies.Wait({"ai-agent", "denied", denied}), "Diagnostics were enabled without permission");
+    Deliver(viewer, {"ai-agent", "denied", denied});
+    Check(!replies.WaitForType("ai-agent", "snapshot", 20ms), "Denied host disclosed a snapshot");
+    Check(viewer.TakeUiCommands().empty(), "Denied request produced an export");
+
+    std::ofstream(access) << R"({"allow_host_access":true})";
+    std::this_thread::sleep_for(525ms);
+    const auto allowed = diagnose(2);
+    const auto approval = wait_approval();
+    host.DecideAgentApproval(approval - 1, true);
+    Check(!replies.WaitForType("ai-agent", "snapshot", 175ms) && host.PendingAgentApproval() == approval,
+        "Host used the wrong approval or disclosed information before approval");
+    host.DecideAgentApproval(approval, true);
+    Deliver(viewer, {"ai-agent", "snapshot", denied + "{}"});
+    const auto snapshot = replies.WaitForType("ai-agent", "snapshot");
+    Check(snapshot && snapshot->starts_with(allowed) && snapshot->find("\"windows_build\"") != std::string::npos &&
+        snapshot->find("\"memory_total_mib\"") != std::string::npos, "Authorized diagnostics lacked expected fields");
+    Deliver(viewer, {"ai-agent", "snapshot", *snapshot});
+    const auto ui_deadline = std::chrono::steady_clock::now() + 3s;
+    bool offered_export{};
+    do {
+        for (const auto& command : viewer.TakeUiCommands()) {
+            offered_export |= command.kind == "open" && command.json.find("\"save_json\"") != std::string::npos;
+        }
+        if (offered_export) break;
+        std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < ui_deadline);
+    Check(offered_export, "Authorized snapshot did not reach the viewer's export dialog");
+
+    std::this_thread::sleep_for(525ms);
+    const auto revoked = diagnose(3);
+    const auto revoked_id = wait_approval();
+    std::ofstream(access) << R"({"allow_host_access":false})";
+    host.RevokeAgentApproval(false);
+    host.DecideAgentApproval(revoked_id, true);
+    Check(replies.Wait({"ai-agent", "revoked", revoked}), "Host did not enforce revocation within the session");
+    Deliver(viewer, {"ai-agent", "revoked", revoked});
+
+    std::ofstream(access) << R"({"allow_host_access":true})";
+    std::this_thread::sleep_for(525ms);
+    const auto expires = diagnose(4);
+    wait_approval();
+    Check(replies.WaitForType("ai-agent", "expired", 17s) == expires && host.PendingAgentApproval() == 0,
+        "Unanswered approval did not expire");
+
+    const auto native_header = [](std::uint32_t id) {
+        return std::string{static_cast<char>(id), static_cast<char>(id >> 8),
+            static_cast<char>(id >> 16), static_cast<char>(id >> 24)};
+    };
+    const auto request_live = [&] {
+        const auto id = viewer.RequestAgentSummary();
+        Check(id != 0 && !viewer.RequestAgentSummary(), "Live diagnostics allowed overlapping queries");
+        const auto header = native_header(id);
+        const PluginPacket request{"ai-agent", "request_info", header};
+        Check(requests.Wait(request), "Live diagnostics did not send a request");
+        Deliver(host, request);
+        return id;
+    };
+
+    const auto live = request_live();
+    const auto live_header = native_header(live);
+    const auto live_approval = wait_approval();
+    Deliver(viewer, {"ai-agent", "snapshot", native_header(live ^ 1u) + "{}"});
+    Check(!viewer.TakeAgentSummary(live), "Live diagnostics returned a result before approval or for the wrong request");
+    host.DecideAgentApproval(live_approval, true);
+    const auto response = replies.WaitForType("ai-agent", "snapshot", 3s, live_header);
+    Check(response && response->find("\"host_elevated\"") != std::string::npos,
+        "Approved live diagnostics did not return the process elevation");
+    Deliver(viewer, {"ai-agent", "snapshot", *response});
+    std::optional<AgentSummary> live_result;
+    const auto live_deadline = std::chrono::steady_clock::now() + 3s;
+    do {
+        live_result = viewer.TakeAgentSummary(live);
+        if (live_result) break;
+        std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < live_deadline);
+    Check(live_result && live_result->status == "ok" && live_result->snapshot == response->substr(4),
+        "Approved live diagnostics did not reach the requesting API");
+
+    std::this_thread::sleep_for(525ms);
+    const auto abandoned = request_live();
+    const auto abandoned_header = native_header(abandoned);
+    wait_approval();
+    viewer.CancelAgentSummary(abandoned);
+    const PluginPacket cancel{"ai-agent", "cancel_info", abandoned_header};
+    Check(requests.Wait(cancel), "Cancelling live diagnostics did not notify the host");
+    Deliver(host, cancel);
+    Check(replies.Wait({"ai-agent", "cancelled", abandoned_header}) && !host.PendingAgentApproval() &&
+        !replies.WaitForType("ai-agent", "snapshot", 20ms, abandoned_header), "Host did not cancel the pending approval");
+
+    std::ifstream audit(log);
+    const std::string records((std::istreambuf_iterator<char>(audit)), {});
+    for (const auto* result : {"denied", "approved", "revoked", "expired", "cancelled"}) {
+        Check(records.find(std::string("\"result\":\"") + result + "\"") != std::string::npos,
+            "A diagnostics decision is missing from the persisted audit");
+    }
+    Check(records.find("memory_total_mib") == std::string::npos, "Audit log included diagnostic contents");
+    audit.close();
+    const auto rotated = config / "ai-agent.audit.previous.jsonl";
+    fixture.RemoveOnExit(rotated);
+    std::ofstream(log, std::ios::binary | std::ios::trunc) << std::string(256 * 1024, ' ');
+    Check(RecordAgentAudit(config, 9, AgentAuditResult::denied, 0) &&
+        std::filesystem::file_size(rotated) == 256 * 1024 && std::filesystem::file_size(log) < 256,
+        "Audit rotation did not preserve the previous log and bound the new one");
+    const auto old_size = std::filesystem::file_size(log);
+    std::filesystem::last_write_time(log, std::filesystem::file_time_type::clock::now() - 36h);
+    Check(RecordAgentAudit(config, 10, AgentAuditResult::denied, 0) &&
+        std::filesystem::file_size(rotated) == old_size, "Audit did not rotate at a UTC day boundary");
+
+    Check(!viewer.RequestAgentSummary(AgentTool::screen_snapshot), "Desktop session exposed screen tool");
+    WireLog screen_requests, screen_replies;
+    PluginHost screen_viewer(false, [&](std::string_view frame) { return screen_requests.Send(frame); },
+        fixture.root, {}, config, false, {}, true);
+    PluginHost screen_host(true, [&](std::string_view frame) { return screen_replies.Send(frame); },
+        fixture.root, {}, config, false, {}, true);
+    screen_viewer.SetConnected(true);
+    screen_host.SetConnected(true);
+    const auto request_screen = [&] {
+        const auto id = screen_viewer.RequestAgentSummary(AgentTool::screen_snapshot);
+        Check(id != 0, "Could not start screenshot query");
+        const auto header = native_header(id);
+        const PluginPacket request{"ai-agent", "request_screen", header};
+        Check(screen_requests.Wait(request), "Screenshot request did not reach the data channel");
+        Deliver(screen_host, request);
+        return id;
+    };
+    const auto screen_denied = request_screen();
+    const auto deny_header = native_header(screen_denied);
+    Check(screen_replies.Wait({"ai-agent", "denied", deny_header}) && !screen_host.PendingAgentApproval(),
+        "Screenshots were enabled without an independent opt-in");
+    Deliver(screen_viewer, {"ai-agent", "denied", deny_header});
+    screen_viewer.CancelAgentSummary(screen_denied);
+
+    std::ofstream(access) << R"({"allow_screen_snapshot":true})";
+    std::this_thread::sleep_for(525ms);
+    const auto screen_id = request_screen();
+    const auto image_header = native_header(screen_id);
+    AgentTool tool{};
+    std::uint32_t screen_approval{};
+    const auto screen_deadline = std::chrono::steady_clock::now() + 3s;
+    while (!(screen_approval = screen_host.PendingAgentApproval(&tool)) &&
+            std::chrono::steady_clock::now() < screen_deadline) {
+        std::this_thread::sleep_for(10ms);
+    }
+    Check(screen_approval && tool == AgentTool::screen_snapshot && !screen_viewer.TakeAgentSummary(screen_id) &&
+        !screen_replies.WaitForType("ai-agent", "image_last", 20ms), "Screenshot escaped the approval gate");
+    constexpr char pixel[] =
+        "\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x04\0\0\0\xb5\x1c\x0c\x02"
+        "\0\0\0\x0bIDAT\x78\xda\x63\x64\xf8\x0f\0\x01\x05\x01\x01\x27\x18\xe3\x66\0\0\0\0IEND\xae\x42\x60\x82";
+    const std::string image(pixel, sizeof(pixel) - 1);
+    screen_host.DecideAgentApproval(screen_approval, true, image);
+    Check(screen_replies.Wait({"ai-agent", "image_last", image_header + native_header(0) + image}),
+        "Screenshot approval did not send the image");
+    Deliver(screen_viewer, {"ai-agent", "image_chunk", image_header + native_header(0) + image.substr(0, 16)});
+    Deliver(screen_viewer, {"ai-agent", "image_last", image_header + native_header(1) + image.substr(16)});
+    std::optional<AgentSummary> screenshot;
+    const auto image_deadline = std::chrono::steady_clock::now() + 3s;
+    do {
+        screenshot = screen_viewer.TakeAgentSummary(screen_id);
+        if (screenshot) break;
+        std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < image_deadline);
+    Check(screenshot && screenshot->status == "ok" && screenshot->image == image,
+        "Approved screenshot was not assembled by the requesting API");
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -1082,6 +1294,10 @@ int wmain(int argc, wchar_t** argv) {
         if (argc == 3 && std::wstring_view(argv[1]) == L"--file-clipboard") return TestFileClipboard(argv[2]);
         if (argc == 3 && std::wstring_view(argv[1]) == L"--connection-status") {
             TestConnectionStatus(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::wstring_view(argv[1]) == L"--ai-agent") {
+            TestAgentDiagnostics(argv[2]);
             return 0;
         }
         if (argc == 2) return TestClipboard(argv[1]);

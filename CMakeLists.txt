@@ -32,12 +32,12 @@ target_compile_features(plugin_protocol PUBLIC cxx_std_20)
 target_compile_options(plugin_protocol PRIVATE /W4 /permissive- /utf-8)
 
 include(cmake/lua-target.cmake)
-add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp core/src/file_clipboard.cpp core/src/plugin_settings.cpp core/src/pty_session.cpp)
+add_library(plugin_host STATIC core/src/plugin_host.cpp core/src/clipboard_bridge.cpp core/src/file_clipboard.cpp core/src/plugin_settings.cpp core/src/pty_session.cpp core/src/agent_audit.cpp)
 target_include_directories(plugin_host PUBLIC core/include)
 target_compile_features(plugin_host PRIVATE cxx_std_20)
 target_compile_definitions(plugin_host PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(plugin_host PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(plugin_host PUBLIC input_protocol PRIVATE plugin_protocol p2premote_lua bcrypt user32 imm32 shell32 ole32 windowsapp)
+target_link_libraries(plugin_host PUBLIC input_protocol PRIVATE plugin_protocol p2premote_lua advapi32 bcrypt user32 imm32 shell32 ole32 windowsapp)
 
 add_library(core STATIC
     core/src/audio_engine.cpp
@@ -103,7 +103,7 @@ add_custom_target(p2premote_minirtc_runtime
 add_dependencies(p2premote p2premote_minirtc_runtime)
 
 set(plugin_assets)
-set(P2PREMOTE_BUILTIN_PLUGINS clipboard-sync file-clipboard shortcut-macros keyboard-sync adaptive-quality file-transfer remote-terminal connection-status session-stopwatch)
+set(P2PREMOTE_BUILTIN_PLUGINS clipboard-sync file-clipboard shortcut-macros keyboard-sync adaptive-quality file-transfer remote-terminal connection-status session-stopwatch ai-agent)
 foreach(plugin IN LISTS P2PREMOTE_BUILTIN_PLUGINS)
     set(plugin_dir "${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}")
     set(plugin_output "$<TARGET_FILE_DIR:p2premote>/plugins/${plugin}")
@@ -119,6 +119,20 @@ add_custom_target(p2premote_plugins
     VERBATIM)
 add_dependencies(p2premote p2premote_plugins)
 add_dependencies(p2premote_core p2premote_minirtc_runtime p2premote_plugins)
+
+add_library(agent_snapshot STATIC agent/snapshot.cpp agent/live_client.cpp)
+target_compile_features(agent_snapshot PUBLIC cxx_std_20)
+target_link_libraries(agent_snapshot PUBLIC windowsapp ole32)
+add_executable(p2premote_mcp agent/mcp_main.cpp)
+add_executable(p2p_cli agent/cli_main.cpp)
+set_target_properties(p2p_cli PROPERTIES OUTPUT_NAME p2p-cli)
+foreach(target p2premote_mcp p2p_cli)
+    target_link_libraries(${target} PRIVATE agent_snapshot)
+endforeach()
+foreach(target agent_snapshot p2premote_mcp p2p_cli)
+    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHsc)
+endforeach()
 
 if(P2PREMOTE_BUILD_QT)
     include(cmake/qt-frontend.cmake)
@@ -138,6 +152,8 @@ add_dependencies(idle_scroll_test p2premote_minirtc_runtime)
 add_test(NAME idle_scroll_test COMMAND idle_scroll_test)
 add_test(NAME continuous_scroll_test COMMAND idle_scroll_test --continuous)
 add_test(NAME encoder_backlog_test COMMAND idle_scroll_test --encoder-backlog)
+add_test(NAME diagnostics_transport_test COMMAND idle_scroll_test --diagnostics-only)
+set_tests_properties(diagnostics_transport_test PROPERTIES LABELS "loopback" TIMEOUT 12)
 set_tests_properties(idle_scroll_test continuous_scroll_test encoder_backlog_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 60
     SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
@@ -174,7 +190,9 @@ add_test(NAME office_plugin_test COMMAND plugin_host_test --office "${CMAKE_CURR
 add_test(NAME file_transfer_plugin_test COMMAND plugin_host_test --file-transfer "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 add_test(NAME remote_terminal_plugin_test COMMAND plugin_host_test --remote-terminal "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 add_test(NAME connection_status_plugin_test COMMAND plugin_host_test --connection-status "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
+add_test(NAME agent_diagnostics_plugin_test COMMAND plugin_host_test --ai-agent "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 set_tests_properties(connection_status_plugin_test PROPERTIES TIMEOUT 10)
+set_tests_properties(agent_diagnostics_plugin_test PROPERTIES TIMEOUT 28)
 add_executable(connection_overlay_test viewer/connection_overlay_test.cpp)
 target_link_libraries(connection_overlay_test PRIVATE stream_window comctl32)
 target_compile_options(connection_overlay_test PRIVATE /W4 /permissive- /utf-8 /EHsc)

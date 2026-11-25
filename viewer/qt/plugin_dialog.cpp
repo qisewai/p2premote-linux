@@ -8,6 +8,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QFileDialog>
 #include <QFrame>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -17,8 +18,11 @@
 #include <QJsonValue>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
+#include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSaveFile>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
@@ -328,6 +332,25 @@ private:
                 });
             }
             return slider;
+        }
+
+        if (type == QStringLiteral("save_json")) {
+            const auto object = node.value(QStringLiteral("value")).toObject();
+            const auto json = QJsonDocument(object).toJson(QJsonDocument::Indented);
+            if (object.isEmpty() || json.size() > 4096) return nullptr;
+            auto* button = new QPushButton(node.value(QStringLiteral("text")).toString(QStringLiteral("导出 JSON…")), parent);
+            button->setAutoDefault(false);
+            connect(button, &QPushButton::clicked, this, [this, json] {
+                const QPointer<QWidget> dialog(this);
+                const auto path = QFileDialog::getSaveFileName(this, QStringLiteral("导出插件数据"),
+                    QStringLiteral("p2premote-diagnostics.json"), QStringLiteral("JSON 文件 (*.json)"));
+                if (!dialog || path.isEmpty()) return;
+                QSaveFile output(path);
+                if (!output.open(QIODevice::WriteOnly) || output.write(json) != json.size() || !output.commit()) {
+                    QMessageBox::warning(this, QStringLiteral("导出失败"), output.errorString());
+                }
+            });
+            return button;
         }
 
         if (type == QStringLiteral("button")) {

@@ -1,4 +1,4 @@
-find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets Network)
 
 set(P2PREMOTE_GHOSTTY_VT_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/out/ghostty-vt/ghostty-vt-1.0.1-x86_64-windows-gnu"
@@ -13,8 +13,11 @@ if(NOT TARGET ghostty-vt::ghostty-vt)
 endif()
 
 add_executable(p2premote_qt WIN32
+    agent/snapshot.cpp
     viewer/qt/main.cpp
     viewer/qt/account_window.cpp
+    viewer/qt/agent_broker.cpp
+    viewer/qt/agent_broker.h
     viewer/qt/app_settings.cpp
     viewer/qt/app_settings.h
     viewer/qt/app_theme.cpp
@@ -43,7 +46,7 @@ set_target_properties(p2premote_qt PROPERTIES
 target_compile_features(p2premote_qt PRIVATE cxx_std_20)
 target_compile_definitions(p2premote_qt PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(p2premote_qt PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(p2premote_qt PRIVATE p2premote_core Qt6::Widgets ghostty-vt::ghostty-vt advapi32 crypt32 dwmapi shell32 windowsapp)
+target_link_libraries(p2premote_qt PRIVATE p2premote_core Qt6::Widgets Qt6::Network ghostty-vt::ghostty-vt advapi32 crypt32 dwmapi shell32 windowsapp)
 target_link_options(p2premote_qt PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 set_property(TARGET p2premote_qt APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 
@@ -67,7 +70,18 @@ add_dependencies(terminal_widget_test p2premote_qt)
 add_test(NAME terminal_widget_test COMMAND terminal_widget_test)
 set_tests_properties(terminal_widget_test PROPERTIES TIMEOUT 10)
 
-install(TARGETS p2premote_qt p2premote p2premote_service p2premote_core RUNTIME DESTINATION .)
+add_executable(agent_broker_test viewer/qt/agent_broker_test.cpp viewer/qt/agent_broker.cpp agent/snapshot.cpp)
+set_target_properties(agent_broker_test PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+target_compile_features(agent_broker_test PRIVATE cxx_std_20)
+target_compile_definitions(agent_broker_test PRIVATE P2PREMOTE_CORE_EXPORTS UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(agent_broker_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_include_directories(agent_broker_test PRIVATE core/include)
+target_link_libraries(agent_broker_test PRIVATE Qt6::Network windowsapp)
+add_dependencies(agent_broker_test p2p_cli p2premote_mcp)
+add_test(NAME agent_broker_test COMMAND agent_broker_test "$<TARGET_FILE:p2p_cli>" "$<TARGET_FILE:p2premote_mcp>")
+set_tests_properties(agent_broker_test PROPERTIES TIMEOUT 30)
+
+install(TARGETS p2premote_qt p2premote p2premote_service p2premote_core p2premote_mcp p2p_cli RUNTIME DESTINATION .)
 install(FILES "${P2PREMOTE_MINIRTC_DIR}/p2premote_minirtc.dll" DESTINATION .)
 install(FILES "$<TARGET_FILE:ghostty-vt::ghostty-vt>" DESTINATION .)
 get_target_property(ghostty_vt_dll ghostty-vt::ghostty-vt IMPORTED_LOCATION)

@@ -23,6 +23,9 @@ func TestMiniRTCNegotiationRequiresApproval(t *testing.T) {
 	if h.relay(r, host, message{Type: "accept"}) {
 		t.Fatal("host approved without explicit control/view permission")
 	}
+	if h.relay(r, host, message{Type: "accept", Payload: "diagnostics"}) {
+		t.Fatal("desktop room accepted a different mode")
+	}
 	if !h.relay(r, host, message{Type: "accept", Payload: "view"}) {
 		t.Fatal("host could not approve MiniRTC")
 	}
@@ -52,5 +55,33 @@ func TestMiniRTCNegotiationRequiresApproval(t *testing.T) {
 	if !h.relay(r, viewer, answer) || r.stage != "answered" ||
 		h.relay(r, viewer, message{Type: "minirtc", Payload: `{"type":"login","status":"success"}`}) {
 		t.Fatal("incorrect answer or unsupported message accepted")
+	}
+}
+
+func TestDiagnosticsRoomDoesNotGrantDesktop(t *testing.T) {
+	host, viewer := &client{out: make(chan message, 1)}, &client{out: make(chan message, 1)}
+	r := &room{deviceID: "device", host: host, viewer: viewer, stage: "requested", diagnostics: true}
+	h := &hub{deviceHosts: map[string]*room{r.deviceID: r}}
+	for _, mode := range []string{"control", "view"} {
+		if h.relay(r, host, message{Type: "accept", Payload: mode}) {
+			t.Fatalf("diagnostics room accepted %q", mode)
+		}
+	}
+	if !h.relay(r, host, message{Type: "accept", Payload: "diagnostics"}) {
+		t.Fatal("host could not accept diagnostics")
+	}
+}
+
+func TestDiagnosticRejectionKeepsDesktopListener(t *testing.T) {
+	host, declined := &client{out: make(chan message, 1)}, &client{out: make(chan message, 1)}
+	r := &room{deviceID: "device", host: host, viewer: declined, stage: "requested", diagnostics: true}
+	h := &hub{deviceHosts: map[string]*room{r.deviceID: r}}
+	if h.relay(r, declined, message{Type: "reject"}) ||
+		!h.relay(r, host, message{Type: "reject"}) || (<-declined.out).Type != "error" {
+		t.Fatal("diagnostics rejection did not come from the host")
+	}
+	h.leave(r, declined, false)
+	if !h.contains(r) || r.stage != "waiting" || r.viewer != nil || r.diagnostics {
+		t.Fatal("diagnostics rejection removed the desktop listener")
 	}
 }

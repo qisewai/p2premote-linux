@@ -159,7 +159,10 @@ local id = p2p.ui.add_menu({
 - `mode: "embed"` 将卡片加入 `appearance`、`general` 或 `stream-audio`。
 - `mode: "page"` 创建功能页，需填写自定义 `page` ID 和 `page_title`。相同 ID 的卡片共用一页，按 `order` 排序。首张卡片确定页面的标题和导航分组。导航默认归入「软件设置」，也可指定「插件与扩展」。`section` 省略时使用插件名称。
 - 「插件总览」的「前往配置」可定位到对应卡片。字段支持 `bool`、`string`、`int`、`number` 和 `select`。
-- 设置页与 Lua 共用 `%LOCALAPPDATA%\P2PRemote\plugin-config\<id>.viewer.json`，被控端使用 `<id>.host.json`。每份 JSON 上限 16 KiB。
+- `settings_ui.role` 取 `viewer`（默认）或 `host`，与清单中的角色对应。配置写入 `%LOCALAPPDATA%\P2PRemote\plugin-config\<id>.viewer.json` 或 `<id>.host.json`。每份 JSON 上限 16 KiB。
+- `ai-agent` 被控插件声明 `sys` 权限后，可用 `p2p.sys.begin_info()` 创建一条本机诊断审批，再用 `p2p.sys.poll_info(id)` 读取结果。内置插件在纯数据会话中可为这两个函数的最后一个参数传入 `true`，请求一次须经单独授权的 PNG 截图。本机授权开关开启、审批获准且审计成功时才返回结果。主控端停止共享时可用 `p2p.sys.cancel_info(id)` 取消尚未返回的请求。
+- 主控插件可在清单中用 `agent_reports` 注册 MCP 只读报告，从已审批的系统摘要选取指定字段。清单格式见 [AI Agent 使用说明](ai-agent-design.md)。
+- 插件界面的 `save_json` 控件接收 `value` 对象。用户点击按钮并选定本地路径后，Qt 导出 JSON（上限 4 KiB）。
 
 ### Phase 3（后续增量扩展）
 

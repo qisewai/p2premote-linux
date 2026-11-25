@@ -29,7 +29,8 @@ public:
     using Notify = std::function<void()>;
 
     PluginHost(bool host, SendFrame send, std::filesystem::path root = {}, Notify notify = {},
-        std::filesystem::path config_root = {}, bool local_overlay = false, std::shared_ptr<PluginOverlays> overlays = {});
+        std::filesystem::path config_root = {}, bool local_overlay = false, std::shared_ptr<PluginOverlays> overlays = {},
+        bool diagnostics_only = false);
     ~PluginHost();
     PluginHost(const PluginHost&) = delete;
     PluginHost& operator=(const PluginHost&) = delete;
@@ -44,6 +45,12 @@ public:
     bool HasMenu() const;
     std::vector<PluginMenuItem> Menu() const;
     void Invoke(unsigned id);
+    std::uint32_t PendingAgentApproval(AgentTool* tool = nullptr) const;
+    void DecideAgentApproval(std::uint32_t id, bool approved, std::string_view image = {});
+    void RevokeAgentApproval(bool pause);
+    std::uint32_t RequestAgentSummary(AgentTool tool = AgentTool::system_info);
+    std::optional<AgentSummary> TakeAgentSummary(std::uint32_t id);
+    void CancelAgentSummary(std::uint32_t id);
     std::vector<PluginAction> TakeActions();
     std::vector<PluginUiCommand> TakeUiCommands();
     void SendUiEvent(PluginUiEvent event);

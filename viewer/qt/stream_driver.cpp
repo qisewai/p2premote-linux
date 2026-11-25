@@ -24,9 +24,9 @@ void runWhile(QTimer& timer, bool running) {
 } // namespace
 
 StreamDriver::StreamDriver(p2p_account* account, bool host, const wchar_t* device, void* video_parent,
-    const LaunchOptions& options, QObject* parent) : QObject(parent) {
+    const LaunchOptions& options, QObject* parent, bool diagnostics) : QObject(parent) {
     const p2p_connection_options_v1 settings{
-        options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, host};
+        options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, host, diagnostics};
     stream_.reset(p2p_stream_create(account, host, device, video_parent, &settings));
     if (!stream_) return;
 

@@ -8,7 +8,10 @@
 #include <QWidget>
 
 #include <vector>
+#include <memory>
 
+class AgentBroker;
+class FramelessDialog;
 class QFrame;
 class QHBoxLayout;
 class QLabel;
@@ -28,7 +31,8 @@ public:
     ~RemoteWindow() override;
 
     void openSession(p2p_account* account, const QString& device, const QString& name,
-        const LaunchOptions& options);
+        const LaunchOptions& options, bool diagnostics = false);
+    void stopAgentSharing();
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -39,7 +43,7 @@ protected:
 private:
     RemoteSessionTab* currentSession() const;
     RemoteSessionTab* sessionAt(int index) const;
-    int findSession(const QString& device) const;
+    int findSession(const QString& device, bool diagnostics) const;
     void onTabChanged(int index);
     void onTabMoved(int from, int to);
     void closeTab(int index);
@@ -54,6 +58,7 @@ private:
     void showDisplayMenu();
     void showAudioMenu();
     void showActionsMenu();
+    void shareAgentDiagnostics();
 
     QFrame* shell_{};
     QVBoxLayout* layout_{};
@@ -69,6 +74,10 @@ private:
     QFrame* statusbar_{};
     QLabel* status_text_{};
     QPointer<SettingsDialog> settings_dialog_;
+    QPointer<FramelessDialog> agent_dialog_;
+    QPointer<RemoteSessionTab> agent_target_;
+    std::unique_ptr<AgentBroker> agent_broker_;
+    p2p_account* account_{};
     QTimer hover_;
     bool fullscreen_mode_{};
     bool was_maximized_{};

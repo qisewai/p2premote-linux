@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QMap>
 #include <QObject>
 #include <QPair>
 #include <QString>
@@ -57,12 +58,14 @@ struct PluginSettingSpec {
     QStringList roles;
     QStringList permissions;
     QVector<PluginSettingField> fields;
+    QMap<QString, QStringList> agent_reports;
     Placement placement{Placement::none};
     QString page;
     QString page_title;
     QString section;
     int order{50};
     bool extension_page{};
+    bool host_config{};
 };
 
 class AppSettings final : public QObject {
@@ -78,8 +81,8 @@ public:
     static QString pluginsDirectory();
     static QString pluginConfigDirectory();
     static QVector<PluginSettingSpec> discoverPlugins();
-    static QJsonObject loadPluginConfig(const QString& plugin_id);
-    static bool savePluginConfig(const QString& plugin_id, const QJsonObject& config);
+    static QJsonObject loadPluginConfig(const QString& plugin_id, bool host = false);
+    static bool savePluginConfig(const QString& plugin_id, const QJsonObject& config, bool host);
     static std::optional<bool> overlayVisibility(const QString& plugin_id);
     static void setOverlayVisibility(const QString& plugin_id, bool visible);
 

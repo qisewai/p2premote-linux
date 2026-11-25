@@ -140,6 +140,23 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
             if (p.isString()) spec.permissions.append(p.toString());
         }
 
+        if (spec.enabled && spec.roles.contains(QStringLiteral("viewer"))) {
+            const auto reports = obj.value(QStringLiteral("agent_reports")).toArray();
+            for (const auto& value : reports) {
+                if (spec.agent_reports.size() == 8) break;
+                const auto report = value.toObject();
+                const auto key = report.value(QStringLiteral("id")).toString();
+                if (!isValidPluginId(key) || key.size() > 24 || key.contains(QLatin1Char('_'))) continue;
+                const auto name = QStringLiteral("plugin_%1_%2").arg(spec.id, key);
+                if (name.size() > 64 || spec.agent_reports.contains(name)) continue;
+                QStringList fields;
+                const auto requested = report.value(QStringLiteral("fields")).toArray();
+                if (requested.isEmpty() || requested.size() > 8) continue;
+                for (const auto& field : requested) fields.append(field.toString());
+                spec.agent_reports.insert(name, fields);
+            }
+        }
+
         const auto ui = obj.value(QStringLiteral("settings_ui")).toObject();
         const auto mode = ui.value(QStringLiteral("mode")).toString();
         const auto page = ui.value(QStringLiteral("page")).toString();
@@ -160,8 +177,11 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
         if (spec.section.isEmpty()) spec.section = spec.name;
         spec.order = std::clamp(ui.value(QStringLiteral("order")).toInt(50), -10000, 10000);
         spec.extension_page = group == QStringLiteral("插件与扩展");
+        const auto role = ui.value(QStringLiteral("role")).toString(QStringLiteral("viewer"));
+        spec.host_config = role == QStringLiteral("host");
 
-        const auto settings = spec.placement == PluginSettingSpec::Placement::none || !spec.roles.contains(QStringLiteral("viewer"))
+        const auto settings = spec.placement == PluginSettingSpec::Placement::none ||
+            (role != QStringLiteral("viewer") && !spec.host_config) || !spec.roles.contains(role)
             ? QJsonArray{} : obj.value(QStringLiteral("settings")).toArray();
         for (const auto& item : settings) {
             if (!item.isObject()) continue;
@@ -197,20 +217,22 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
     return result;
 }
 
-QJsonObject AppSettings::loadPluginConfig(const QString& plugin_id) {
+QJsonObject AppSettings::loadPluginConfig(const QString& plugin_id, bool host) {
     if (!isValidPluginId(plugin_id)) return {};
     const auto dir = pluginConfigDirectory();
     if (dir.isEmpty()) return {};
-    QFile file(QDir(dir).filePath(plugin_id + QStringLiteral(".viewer.json")));
+    const auto extension = host ? QStringLiteral(".host.json") : QStringLiteral(".viewer.json");
+    QFile file(QDir(dir).filePath(plugin_id + extension));
     if (!file.open(QIODevice::ReadOnly)) return {};
     const auto doc = QJsonDocument::fromJson(file.read(16 * 1024));
     return doc.isObject() ? doc.object() : QJsonObject{};
 }
 
-bool AppSettings::savePluginConfig(const QString& plugin_id, const QJsonObject& updates) {
+bool AppSettings::savePluginConfig(const QString& plugin_id, const QJsonObject& updates, bool host) {
     const auto data = QJsonDocument(updates).toJson(QJsonDocument::Compact);
-    if (p2p_plugin_update_viewer_config(plugin_id.toUtf8().constData(), data.constData()) != P2P_OK) return false;
-    emit instance().pluginConfigChanged(plugin_id);
+    const auto role = host ? P2P_PLUGIN_CONFIG_HOST : P2P_PLUGIN_CONFIG_VIEWER;
+    if (p2p_plugin_update_config(plugin_id.toUtf8().constData(), role, data.constData()) != P2P_OK) return false;
+    if (!host) emit instance().pluginConfigChanged(plugin_id);
     return true;
 }
 

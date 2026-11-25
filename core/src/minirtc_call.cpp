@@ -32,7 +32,7 @@ constexpr char cursor_name[] = "cursor";
 constexpr char plugin_name[] = "plugin";
 
 struct SdpChannels {
-    bool control{}, data_srtp{}, fingerprint{}, plugin{};
+    bool control{}, data_srtp{}, fingerprint{}, plugin{}, other_sender{};
 };
 
 SdpChannels ReadSdpChannels(std::wstring_view sdp) noexcept {
@@ -46,6 +46,7 @@ SdpChannels ReadSdpChannels(std::wstring_view sdp) noexcept {
         if (line.starts_with(L"a=ssrc:")) {
             channels.control |= line.ends_with(L" name:control-v3");
             channels.plugin |= line.ends_with(L" name:plugin");
+            channels.other_sender |= !line.ends_with(L" name:plugin");
         }
         if (end == std::wstring_view::npos) break;
         sdp.remove_prefix(end + 1);
@@ -191,8 +192,9 @@ bool MiniRtcCall::Available(const ConnectionOptions& options) {
 }
 
 MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const ConnectionOptions& options,
-    bool allow_input, unsigned frame_rate, ID3D11Device* device, std::shared_ptr<PluginOverlays> overlays)
-    : host_(host), allow_input_(allow_input), events_(std::move(events)), api_(NativeApi()), ice_(options.ice_servers) {
+    bool allow_input, unsigned frame_rate, ID3D11Device* device, std::shared_ptr<PluginOverlays> overlays, bool diagnostics)
+    : host_(host), allow_input_(allow_input && !diagnostics), diagnostics_(diagnostics), events_(std::move(events)),
+      api_(NativeApi()), ice_(options.ice_servers) {
     device_.copy_from(device);
     if (!api_) throw std::runtime_error("MiniRTC 模块缺失或版本不匹配，请更新程序目录中的 p2premote_minirtc.dll");
     if (!Available(options)) throw std::runtime_error("当前 MiniRTC 模块不支持 turns: 协议");
@@ -210,19 +212,21 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
     ConfigureMiniRtcDesktopVideo(params, frame_rate);
     params.hardware_acceleration = device_ != nullptr;
     params.windows_d3d11_device = device_.get();
-    params.native_video_output = !host_;
+    params.native_video_output = !host_ && !diagnostics_;
     params.on_signal_status = [](SignalStatus, const char*, size_t, void*) {};
     params.on_connection_status = Status;
-    params.on_receive_video_frame = Video;
-    params.on_receive_audio_buffer = Audio;
+    if (!diagnostics_) {
+        params.on_receive_video_frame = Video;
+        params.on_receive_audio_buffer = Audio;
+    }
     params.on_receive_data_buffer = Data;
     params.on_net_status_report = Network;
-    if (allow_input_) {
+    if (allow_input_ || diagnostics_) {
         try {
             plugins_ = std::make_unique<PluginHost>(host_, [this](std::string_view frame) {
                 return connected_.load() && api_->send_reliable(peer_, frame.data(), frame.size(), plugin_name) == 0;
             }, std::filesystem::path{}, [events = events_] { events->Notify(); }, std::filesystem::path{}, false,
-                std::move(overlays));
+                std::move(overlays), diagnostics_);
         } catch (...) {
             OutputDebugStringW(L"P2PRemote: could not start plugin worker\n");
         }
@@ -233,14 +237,15 @@ MiniRtcCall::MiniRtcCall(bool host, std::shared_ptr<StreamEvents> events, const 
         plugins_.reset();
         OutputDebugStringW(L"P2PRemote: could not register plugin channel\n");
     }
-    if (peer && NativeAudioApi().add_audio) {
+    if (peer && !diagnostics_ && NativeAudioApi().add_audio) {
         const char* outgoing_audio = host_ ? desktop_audio_name : mic_audio_name;
         if (NativeAudioApi().add_audio(peer.get(), outgoing_audio) != 0) {
             OutputDebugStringW(L"P2PRemote: could not register audio stream\n");
         }
     }
-    if (!peer || api_->add_video(peer.get(), video_name) != 0 || api_->add_data(peer.get(), controls_name, true) != 0 ||
-        api_->add_data(peer.get(), motion_name, false) != 0 || api_->add_data(peer.get(), cursor_name, true) != 0 ||
+    if (!peer || (diagnostics_ ? !plugins_ :
+        api_->add_video(peer.get(), video_name) != 0 || api_->add_data(peer.get(), controls_name, true) != 0 ||
+        api_->add_data(peer.get(), motion_name, false) != 0 || api_->add_data(peer.get(), cursor_name, true) != 0) ||
         api_->init(peer.get(), SignalOut, this) != 0 || (!host_ && api_->join(peer.get(), "host") != 0)) {
         throw std::runtime_error("MiniRTC 初始化失败");
     }
@@ -273,7 +278,7 @@ void MiniRtcCall::SendWorkspaceMessage(std::string_view kind) noexcept {
 }
 
 void MiniRtcCall::ProbeWorkspace() noexcept {
-    if (!workspace_running_.load()) return;
+    if (diagnostics_ || !workspace_running_.load()) return;
     if (host_) {
         if (workspace_reply_pending_.exchange(false)) SendWorkspaceMessage("ready");
         return;
@@ -306,7 +311,8 @@ void MiniRtcCall::ReceiveSignal(const std::string& payload) {
     if (kind == L"offer" || kind == L"answer") {
         const auto sdp = message.GetNamedString(L"sdp", L"");
         const auto channels = ReadSdpChannels(sdp);
-        if (!channels.control || !channels.data_srtp || !channels.fingerprint) {
+        if (!channels.data_srtp || !channels.fingerprint ||
+                (diagnostics_ ? !channels.plugin || channels.other_sender : !channels.control)) {
             throw std::runtime_error("对端会话协议不匹配，请将主控端和被控端更新为同一版本");
         }
         plugin_transport_.store(channels.plugin);
@@ -375,6 +381,7 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
     auto& self = *static_cast<MiniRtcCall*>(context);
     if (!data || !source || !self.connected_.load()) return;
     const std::string_view label(source, source_size);
+    if (self.diagnostics_ && label != plugin_name) return;
     if (label == controls_name || (self.host_ && label == motion_name)) {
         const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(data), size);
         const auto input = DecodeInput(bytes);
@@ -410,7 +417,7 @@ void MiniRtcCall::Data(const char* data, size_t size, const char*, size_t, const
     } else if (self.plugins_ && label == plugin_name && self.workspace_running_.load()) {
         const std::string_view frame(data, size);
         const auto packet = DecodePluginPacket(frame);
-        if (!packet) return;
+        if (!packet || (self.diagnostics_ && packet->id != "ai-agent")) return;
         if (packet->id != workspace_protocol_id) {
             self.plugins_->Receive(frame);
         } else if (packet->payload == "1") {

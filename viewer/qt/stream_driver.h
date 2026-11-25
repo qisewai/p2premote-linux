@@ -23,7 +23,7 @@ class StreamDriver final : public QObject {
 
 public:
     StreamDriver(p2p_account* account, bool host, const wchar_t* device, void* video_parent,
-        const LaunchOptions& options, QObject* parent);
+        const LaunchOptions& options, QObject* parent, bool diagnostics = false);
     ~StreamDriver() override;
 
     p2p_stream* handle() const { return stream_.get(); }
