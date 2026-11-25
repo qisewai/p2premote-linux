@@ -9,8 +9,9 @@
 
 namespace {
 
+constexpr size_t sample_frame_bytes = PcmRingBuffer::channels * sizeof(std::int16_t);
 constexpr qsizetype frame_bytes = static_cast<qsizetype>(PcmRingBuffer::frame_samples * sizeof(std::int16_t));
-constexpr pa_sample_spec sample_spec{PA_SAMPLE_S16LE, 48'000, 1};
+constexpr pa_sample_spec sample_spec{PA_SAMPLE_S16LE, 48'000, static_cast<uint8_t>(PcmRingBuffer::channels)};
 constexpr auto default_value = static_cast<uint32_t>(-1);
 
 void closeStream(pa_stream*& stream) {
@@ -101,13 +102,13 @@ struct ViewerAudio::Impl {
     }
 
     void writePlayback(pa_stream* stream, size_t nbytes) {
-        size_t remaining = nbytes - (nbytes % sizeof(std::int16_t));
+        size_t remaining = nbytes - (nbytes % sample_frame_bytes);
         const float vol = gain.load(std::memory_order_relaxed);
-        while (remaining >= sizeof(std::int16_t)) {
+        while (remaining >= sample_frame_bytes) {
             void* dst{};
             size_t chunk = remaining;
-            if (pa_stream_begin_write(stream, &dst, &chunk) < 0 || !dst || chunk < sizeof(std::int16_t)) break;
-            chunk -= chunk % sizeof(std::int16_t);
+            if (pa_stream_begin_write(stream, &dst, &chunk) < 0 || !dst || chunk < sample_frame_bytes) break;
+            chunk -= chunk % sample_frame_bytes;
             playback_ring.pop(static_cast<std::int16_t*>(dst), chunk / sizeof(std::int16_t), vol);
             if (pa_stream_write(stream, dst, chunk, nullptr, 0, PA_SEEK_RELATIVE) < 0) break;
             remaining -= chunk;
@@ -157,7 +158,7 @@ void ViewerAudio::configure(bool speaker, bool mic, float volume) {
 }
 
 void ViewerAudio::play(const char* pcm, std::size_t size) {
-    if (!pcm || size < sizeof(std::int16_t) || (size % sizeof(std::int16_t)) != 0) return;
+    if (!pcm || size < sample_frame_bytes || (size % sample_frame_bytes) != 0) return;
     if (!impl_->speaker_enabled.load(std::memory_order_acquire)) return;
     impl_->playback_ring.push(reinterpret_cast<const std::int16_t*>(pcm), size / sizeof(std::int16_t));
 }

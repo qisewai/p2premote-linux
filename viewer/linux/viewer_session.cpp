@@ -648,7 +648,7 @@ void ViewerSession::receiveData(const char* data, size_t size, const char*, size
 
 void ViewerSession::receiveAudio(const char* data, size_t size, const char*, size_t, const char* source,
     size_t source_size, void* context) {
-    if (!data || !source || !size || size > 4096 || std::string_view(source, source_size) != desktop_audio_stream) return;
+    if (!data || !source || !size || size > 8192 || std::string_view(source, source_size) != desktop_audio_stream) return;
     auto& peer = *static_cast<PeerContext*>(context);
     std::shared_ptr<ViewerAudio> sound;
     {

@@ -161,11 +161,12 @@ winrt::com_ptr<IAudioClient> TryActivateProcessLoopback() {
 
 AudioRingBuffer::AudioRingBuffer(std::size_t capacity_samples, std::size_t prebuffer_samples,
     std::size_t trim_target_samples)
-    : buffer_(std::max<std::size_t>(capacity_samples, audio_frame_samples * 4), 0),
-      prebuffer_samples_(std::min(prebuffer_samples, buffer_.size())),
-      trim_target_samples_(std::min(trim_target_samples, buffer_.size())) {}
+    : buffer_(std::max<std::size_t>(capacity_samples - (capacity_samples % audio_channels), audio_frame_samples * 4), 0),
+      prebuffer_samples_(std::min(prebuffer_samples - (prebuffer_samples % audio_channels), buffer_.size())),
+      trim_target_samples_(std::min(trim_target_samples - (trim_target_samples % audio_channels), buffer_.size())) {}
 
 void AudioRingBuffer::Push(const std::int16_t* samples, std::size_t count) {
+    count -= count % audio_channels;
     if (!samples || !count) return;
     const std::lock_guard lock(mutex_);
     if (count >= buffer_.size()) {
@@ -173,7 +174,8 @@ void AudioRingBuffer::Push(const std::int16_t* samples, std::size_t count) {
         count = trim_target_samples_;
         read_pos_ = write_pos_ = count_ = 0;
     } else if (count_ + count > buffer_.size()) {
-        const std::size_t keep = std::min(count_, trim_target_samples_ > count ? trim_target_samples_ - count : 0);
+        std::size_t keep = std::min(count_, trim_target_samples_ > count ? trim_target_samples_ - count : 0);
+        keep -= keep % audio_channels;
         const std::size_t drop = count_ - keep;
         read_pos_ = (read_pos_ + drop) % buffer_.size();
         count_ = keep;
@@ -488,7 +490,8 @@ struct AudioPlayer::Impl {
 
             const bool is_muted = muted.load(std::memory_order_acquire);
             const float vol = is_muted ? 0.0f : volume.load(std::memory_order_acquire);
-            const auto popped = ring.Pop(reinterpret_cast<std::int16_t*>(out), available, vol);
+            const auto popped = ring.Pop(reinterpret_cast<std::int16_t*>(out),
+                static_cast<std::size_t>(available) * audio_channels, vol);
             const DWORD release_flags = (is_muted || popped == 0) ? AUDCLNT_BUFFERFLAGS_SILENT : 0;
             render->ReleaseBuffer(available, release_flags);
         }
@@ -512,7 +515,9 @@ AudioPlayer::AudioPlayer(Target target, bool allow_speaker_fallback)
 AudioPlayer::~AudioPlayer() = default;
 
 void AudioPlayer::PushPcm(const char* data, std::size_t size) {
-    if (!data || size < sizeof(std::int16_t)) return;
+    const std::size_t stride = audio_channels * sizeof(std::int16_t);
+    size -= size % stride;
+    if (!data || size < stride) return;
     impl_->ring.Push(reinterpret_cast<const std::int16_t*>(data), size / sizeof(std::int16_t));
 }
 

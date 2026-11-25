@@ -12,10 +12,11 @@
 namespace p2premote {
 
 inline constexpr std::uint32_t audio_sample_rate = 48'000;
-inline constexpr std::uint16_t audio_channels = 1;
+inline constexpr std::uint16_t audio_channels = 2;
 inline constexpr std::uint16_t audio_bits_per_sample = 16;
-inline constexpr std::size_t audio_frame_samples = 480; // 10 ms at 48 kHz
-inline constexpr std::size_t audio_frame_bytes = audio_frame_samples * sizeof(std::int16_t); // 960 bytes
+inline constexpr std::size_t audio_frame_samples_per_channel = 480; // 10 ms at 48 kHz
+inline constexpr std::size_t audio_frame_samples = audio_frame_samples_per_channel * audio_channels; // 960 interleaved samples
+inline constexpr std::size_t audio_frame_bytes = audio_frame_samples * sizeof(std::int16_t); // 1920 bytes
 
 class AudioRingBuffer {
 public:

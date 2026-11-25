@@ -1,0 +1,73 @@
+diff --git a/src/media/audio/encode/audio_encoder.cpp b/src/media/audio/encode/audio_encoder.cpp
+index 734f8b0..ce2a83e 100644
+--- a/src/media/audio/encode/audio_encoder.cpp
++++ b/src/media/audio/encode/audio_encoder.cpp
+@@ -29,23 +29,27 @@ int AudioEncoder::Init(const MediaCodecConfig& config) {
+   }
+   int err;
+   opus_encoder_ = opus_encoder_create(sample_rate_, channel_num_,
+-                                      OPUS_APPLICATION_VOIP, &err);
++                                      OPUS_APPLICATION_AUDIO, &err);
+   if (err != OPUS_OK || opus_encoder_ == nullptr) {
+     LOG_ERROR("Create opus encoder failed: {}", opus_strerror(err));
+     return -1;
+   }
+ 
++  const opus_int32 target_bitrate = channel_num_ >= 2 ? 128000 : 96000;
+   if (opus_encoder_ctl(opus_encoder_, OPUS_SET_LSB_DEPTH(16)) != OPUS_OK ||
+       opus_encoder_ctl(opus_encoder_, OPUS_SET_EXPERT_FRAME_DURATION(
+                                           OPUS_FRAMESIZE_10_MS)) != OPUS_OK ||
++      opus_encoder_ctl(opus_encoder_,
++                       OPUS_SET_BANDWIDTH(OPUS_BANDWIDTH_FULLBAND)) !=
++          OPUS_OK ||
++      opus_encoder_ctl(opus_encoder_, OPUS_SET_BITRATE(target_bitrate)) !=
++          OPUS_OK ||
+       opus_encoder_ctl(opus_encoder_,
+                        OPUS_SET_INBAND_FEC(config.audio_fec_enabled ? 1 : 0)) !=
+           OPUS_OK ||
+       opus_encoder_ctl(opus_encoder_, OPUS_SET_PACKET_LOSS_PERC(
+-                                          config.audio_fec_enabled ? 10 : 0)) !=
+-          OPUS_OK ||
+-      (config.audio_fec_enabled &&
+-       opus_encoder_ctl(opus_encoder_, OPUS_SET_BITRATE(32000)) != OPUS_OK)) {
++                                          config.audio_fec_enabled ? 5 : 0)) !=
++          OPUS_OK) {
+     LOG_ERROR("Failed configuring Opus FEC / frame duration");
+     opus_encoder_destroy(opus_encoder_);
+     opus_encoder_ = nullptr;
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+index d151b7f..b31445c 100644
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -2988,7 +2988,7 @@ int IceTransportController::CreateStreamCodecs(
+         }
+       } else if (context->type == StreamType::kAudio) {
+         if (!context->codec) {
+-          context->codec = std::make_shared<AudioEncoder>(48000, 1, 480);
++          context->codec = std::make_shared<AudioEncoder>(48000, 2, 480);
+           if (!context->codec || 0 != context->codec->Init(media_config_)) {
+             LOG_ERROR("Audio encoder [{}] init failed", channel_name);
+             return -1;
+@@ -3036,7 +3036,7 @@ int IceTransportController::CreateStreamCodecs(
+             video_receiver_init_first_time = false;
+           }
+         } else if (context->type == StreamType::kAudio) {
+-          context->codec = std::make_shared<AudioDecoder>(48000, 1, 480);
++          context->codec = std::make_shared<AudioDecoder>(48000, 2, 480);
+           if (!context->codec || 0 != context->codec->Init()) {
+             LOG_ERROR("Audio decoder [{}] init failed", channel_name);
+             return -1;
+@@ -3831,10 +3831,10 @@ void IceTransportController::UpdateFecProtection() {
+       if (c->type == StreamType::kData)
+         ++data;
+     }
+-    // Audio currently bypasses the video pacer. Reserve its 32 kbit/s Opus
+-    // payload plus 100 RTP packets/s headers conservatively, per active stream.
++    // Audio currently bypasses the video pacer. Reserve its 128 kbit/s stereo
++    // Opus payload plus 100 RTP packets/s headers conservatively, per active stream.
+     const int64_t other =
+-        int64_t(audio) * 64000 + (data ? target_bitrate_ / 10 : 0);
++        int64_t(audio) * 160000 + (data ? target_bitrate_ / 10 : 0);
+     int64_t video_budget = std::max<int64_t>(0, target_bitrate_ - other);
+     const int limit = video_bitrate_limit_bps_;
+     if (limit > 0) video_budget = std::min<int64_t>(video_budget, limit);

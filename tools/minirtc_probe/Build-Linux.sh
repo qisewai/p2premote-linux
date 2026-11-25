@@ -15,6 +15,7 @@ patches=(
     "$tools_dir/DesktopIdleResume.patch"
     "$tools_dir/RecoveredPacketOrdering.patch"
     "$tools_dir/TrafficStats.patch"
+    "$tools_dir/AudioQuality.patch"
     "$tools_dir/LinuxFastIce.patch"
 )
 
