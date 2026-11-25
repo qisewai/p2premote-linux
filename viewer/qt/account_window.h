@@ -4,6 +4,7 @@
 #include "remote_window.h"
 #include "service_control.h"
 
+#include <QElapsedTimer>
 #include <QPointer>
 #include <QWidget>
 
@@ -44,32 +45,30 @@ protected:
 
 private:
     enum class Request { none, login, devices, add_device, remove_device, logout };
-    enum class SelectionKind { none, lan, cloud };
 
-    struct SelectedTarget {
-        SelectionKind kind{SelectionKind::none};
-        QString id;       // LAN: ip address; Cloud: device id
+    struct SelectedDevice {
+        QString id;
         QString name;
         QString state;    // "online" | "busy" | "offline"
-        QString subtitle; // LAN: IP; Cloud: platform
-        std::uint16_t port{P2P_LAN_DEFAULT_PORT};
+        QString platform;
         bool is_self{};
+        bool valid() const { return !id.isEmpty(); }
     };
 
     QWidget* makeSidebar(QWidget* parent);
-    QWidget* makeUnattendedBanner(QWidget* parent);
+    QWidget* makeLocalPage(QWidget* parent);
     QWidget* makeDetailPage(QWidget* parent);
-    QWidget* makeWelcomePage(QWidget* parent);
-    QWidget* makeLoginPage(QWidget* parent);
+    void makeLoginPopup();
     void makeTray();
     void restore();
     void quit();
     void openSettings();
-    void setStatus(const QString& text);
+    void setStatus(const QString& text, bool persistent = false);
     void updateControls();
-    void updateUnattendedBanner();
+    void updateLocalPage();
+    void updateLocalAddresses();
     void updateDetailView();
-    void showLoginPage();
+    void showLoginPopup();
     void showAccountMenu();
     void loadCredentials();
     void signIn(bool create);
@@ -83,13 +82,12 @@ private:
     void toggleReceiving();
     void startReceiving();
     void stopReceiving();
-    void setUnattendedEnabled(bool enabled);
+    void setLanAllowEnabled(bool enabled);
     void startLanReceiving(const QString& override_code = {}, std::uint16_t port = P2P_LAN_DEFAULT_PORT);
     void stopLanReceiving();
-    void editUnattendedCode();
-    void copyUnattendedInfo();
-    void refreshLanPeers();
-    void openLanConnectDialog(const QString& prefill_host = {}, const QString& prefill_name = {});
+    void editLanAccessCode();
+    void copyLanConnectionInfo();
+    void openLanConnectDialog();
     void connectSelectedDevice(bool diagnostics = false);
     void showAgentApproval(std::uint32_t id, int tool, std::uint64_t generation, void* monitor);
     std::uint32_t clearAgentApproval();
@@ -106,26 +104,26 @@ private:
     uint64_t host_generation_{};
     std::unique_ptr<HostSession> lan_host_;
     uint64_t lan_host_generation_{};
-    std::unique_ptr<p2p_lan_scanner, decltype(&p2p_lan_scanner_destroy)> lan_scanner_{nullptr, p2p_lan_scanner_destroy};
-    QTimer lan_scan_timer_;
     QString lan_host_code_;
     std::uint16_t lan_host_port_{P2P_LAN_DEFAULT_PORT};
-    bool lan_code_visible_{};
+    bool lan_code_visible_{true};
     QString lan_host_status_text_;
     bool lan_host_controlled_{};
 
     QPointer<RemoteWindow> viewer_;
     QPointer<SettingsDialog> settings_dialog_;
     TitleBar* title_bar_{};
-    ToggleSwitch* unattended_switch_{};
     QPushButton* account_btn_{};
     QWinEventNotifier account_event_;
     QTimer refresh_;
+    QTimer status_clear_timer_;
     Request request_{Request::none};
+    bool add_device_after_refresh_{};
     std::optional<Credentials> pending_;
     std::optional<Credentials> active_credentials_;
     HostServiceInfo service_info_;
     QTimer service_refresh_;
+    QElapsedTimer service_status_age_;
     std::jthread service_status_thread_;
     std::uint64_t service_status_generation_{};
     std::uint32_t agent_prompt_id_{};
@@ -136,41 +134,48 @@ private:
     QString loaded_server_;
     bool hotkey_{};
     bool quitting_{};
-    SelectedTarget selected_;
+    bool viewing_local_{true};
+    SelectedDevice selected_;
 
     // Left sidebar
-    QListWidget* lan_list_{};
+    QPushButton* local_nav_btn_{};
     QListWidget* cloud_list_{};
     QPushButton* cloud_refresh_btn_{};
-    QPushButton* cloud_login_sidebar_btn_{};
 
     // Right stage
-    QFrame* unattended_banner_{};
-    QLabel *unattended_pill_{}, *unattended_ip_label_{}, *unattended_code_label_{};
-    QPushButton *unattended_toggle_code_btn_{}, *unattended_copy_btn_{}, *unattended_edit_btn_{};
-    QComboBox* screens_{};
     QStackedWidget* right_stack_{};
-    QWidget *detail_page_{}, *welcome_page_{}, *login_page_{};
+    QWidget *local_page_{}, *detail_page_{};
 
-    // Detail page widgets
+    // Local machine page widgets
+    QLabel *local_title_{}, *local_status_pill_{};
+    QFrame* local_lan_card_{};
+    ToggleSwitch* lan_allow_switch_{};
+    QLabel* local_lan_desc_{};
+    QWidget *lan_info_area_{}, *lan_off_hint_{};
+    QLabel *local_ip_value_{}, *local_ip_extra_{}, *local_code_value_{};
+    QPushButton *lan_toggle_code_btn_{}, *lan_copy_btn_{}, *lan_edit_btn_{};
+    QComboBox* screens_{};
+    QLabel *local_summary_ip_{}, *local_summary_display_{}, *privilege_status_{};
+    QWidget* cloud_host_section_{};
+    QLabel *cloud_host_status_{}, *cloud_guest_hint_{};
+    QPushButton *add_device_{}, *receive_{}, *service_button_{}, *elevate_button_{};
+
+    // Remote detail page widgets
     QLabel *detail_status_pill_{}, *detail_name_{};
     QPushButton* detail_more_btn_{};
     DeviceHeroWidget* hero_widget_{};
     QPushButton *strip_btn_1_{}, *strip_btn_2_{}, *strip_btn_3_{};
-    QFrame* cloud_host_card_{};
-    QLabel *cloud_host_status_{}, *privilege_status_{};
-    QPushButton *add_device_{}, *receive_{}, *service_button_{}, *elevate_button_{};
 
-    // Welcome page widgets
-    QPushButton* welcome_login_btn_{};
-
-    // Login page widgets
+    // Login popup menu widgets
+    QFrame* login_popup_{};
+    QLabel* login_popup_status_{};
+    QElapsedTimer login_popup_closed_;
     QLineEdit *server_{}, *user_{}, *password_{};
     QCheckBox* remember_{};
     QPushButton *login_{}, *register_{};
 
     QLabel* status_{};
     QSystemTrayIcon* tray_{};
-    QAction* tray_unattended_{};
+    QAction* tray_lan_allow_{};
     QAction* tray_receive_{};
 };

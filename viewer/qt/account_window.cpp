@@ -3,6 +3,7 @@
 #include "app_theme.h"
 #include "frameless_chrome.h"
 #include "settings_dialog.h"
+#include "single_instance.h"
 
 #include <QAbstractButton>
 #include <QApplication>
@@ -32,6 +33,7 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QRandomGenerator>
+#include <QScreen>
 #include <QSettings>
 #include <QShowEvent>
 #include <QSignalBlocker>
@@ -57,6 +59,8 @@
 namespace {
 
 constexpr int stop_hotkey = 1;
+constexpr int service_poll_interval_ms = 1500;
+constexpr int service_status_grace_ms = 2 * service_poll_interval_ms;
 constexpr int device_state_role = Qt::UserRole + 1;
 constexpr int device_name_role = Qt::UserRole + 2;
 constexpr int lan_port_role = Qt::UserRole + 3;
@@ -64,11 +68,26 @@ constexpr int device_platform_role = Qt::UserRole + 4;
 
 QString winText(const wchar_t* text) { return text ? QString::fromWCharArray(text) : QString{}; }
 
-QLabel* heading(const QString& text, QWidget* parent) {
-    auto* label = new QLabel(text, parent);
-    label->setObjectName(QStringLiteral("heading"));
-    label->setTextFormat(Qt::PlainText);
-    return label;
+bool setStyledProperty(QWidget* widget, const char* name, const QVariant& value) {
+    if (widget->property(name) == value) return false;
+    widget->setProperty(name, value);
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+    widget->update();
+    return true;
+}
+
+QString localComputerName() {
+    wchar_t buf[256]{};
+    DWORD size = static_cast<DWORD>(std::size(buf));
+    if (GetComputerNameExW(ComputerNamePhysicalDnsHostname, buf, &size) && size > 0) {
+        return QString::fromWCharArray(buf, static_cast<qsizetype>(size));
+    }
+    size = static_cast<DWORD>(std::size(buf));
+    if (GetComputerNameW(buf, &size) && size > 0) {
+        return QString::fromWCharArray(buf, static_cast<qsizetype>(size));
+    }
+    return QStringLiteral("此电脑");
 }
 
 QString generateDefaultAccessCode() {
@@ -218,13 +237,13 @@ QByteArray captureAgentScreen(void* monitor) {
 
 class ToggleSwitch final : public QAbstractButton {
 public:
-    explicit ToggleSwitch(const QString& label, QWidget* parent = nullptr)
+    explicit ToggleSwitch(const QString& label = {}, QWidget* parent = nullptr)
         : QAbstractButton(parent), label_(label) {
         setCheckable(true);
         setAttribute(Qt::WA_Hover, true);
         setFocusPolicy(Qt::NoFocus);
         setCursor(Qt::PointingHandCursor);
-        setFixedHeight(26);
+        setFixedHeight(label_.isEmpty() ? 26 : 26);
         updateWidth();
     }
 
@@ -247,37 +266,45 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
 
-        const qreal track_w = 34.0;
-        const qreal track_h = 18.0;
+        const bool standalone = label_.isEmpty();
+        const qreal track_w = standalone ? 46.0 : 36.0;
+        const qreal track_h = standalone ? 24.0 : 20.0;
         const qreal track_y = (height() - track_h) / 2.0;
-        const QRectF track(width() - track_w - 2.0, track_y, track_w, track_h);
+        const QRectF track(width() - track_w - 1.0, track_y, track_w, track_h);
 
-        QFont f = font();
-        f.setPixelSize(std::max(12, theme.font_size - 1));
-        f.setWeight(isChecked() ? QFont::DemiBold : QFont::Normal);
-        p.setFont(f);
-        p.setPen(QColor(isChecked() || hovered_ ? theme.text : theme.text_secondary));
-        p.drawText(QRectF(4.0, 0.0, track.left() - 10.0, height()),
-            Qt::AlignVCenter | Qt::AlignRight, label_);
+        if (!standalone) {
+            QFont f = font();
+            f.setPixelSize(std::max(12, theme.font_size - 1));
+            f.setWeight(isChecked() ? QFont::DemiBold : QFont::Normal);
+            p.setFont(f);
+            p.setPen(QColor(isChecked() || hovered_ ? theme.text : theme.text_secondary));
+            p.drawText(QRectF(4.0, 0.0, track.left() - 10.0, height()),
+                Qt::AlignVCenter | Qt::AlignRight, label_);
+        }
 
         QColor track_color = isChecked()
             ? QColor(hovered_ ? theme.accent_hover : theme.accent)
-            : (theme.is_dark ? QColor(255, 255, 255, hovered_ ? 55 : 36) : QColor(0, 0, 0, hovered_ ? 58 : 40));
+            : (theme.is_dark ? QColor(255, 255, 255, hovered_ ? 64 : 42) : QColor(0, 0, 0, hovered_ ? 64 : 44));
         p.setPen(Qt::NoPen);
         p.setBrush(track_color);
         p.drawRoundedRect(track, track_h / 2.0, track_h / 2.0);
 
-        const qreal knob = 14.0;
-        const qreal kx = isChecked() ? (track.right() - knob - 2.0) : (track.left() + 2.0);
-        const qreal ky = track.top() + (track_h - knob) / 2.0;
+        const qreal pad = standalone ? 3.0 : 2.5;
+        const qreal knob = track_h - pad * 2.0;
+        const qreal kx = isChecked() ? (track.right() - knob - pad) : (track.left() + pad);
+        const qreal ky = track.top() + pad;
         p.setBrush(QColor(Qt::white));
         p.drawEllipse(QRectF(kx, ky, knob, knob));
     }
 
 private:
     void updateWidth() {
-        const int text_w = fontMetrics().horizontalAdvance(label_);
-        setFixedWidth(text_w + 50);
+        if (label_.isEmpty()) {
+            setFixedWidth(48);
+        } else {
+            const int text_w = fontMetrics().horizontalAdvance(label_);
+            setFixedWidth(text_w + 52);
+        }
     }
 
     QString label_;
@@ -296,6 +323,7 @@ public:
 
         subtitle_ = new QLabel(this);
         subtitle_->setAlignment(Qt::AlignCenter);
+        subtitle_->setWordWrap(true);
         subtitle_->setStyleSheet(QStringLiteral("color: rgba(255,255,255,0.86); font-size: 13px; background: transparent;"));
         layout->addWidget(subtitle_);
 
@@ -651,8 +679,8 @@ AccountWindow::AccountWindow(LaunchOptions options)
     : QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint), options_(std::move(options)) {
     account_.reset(p2p_account_create());
     setWindowTitle(QStringLiteral("P2P Remote"));
-    resize(920, 620);
-    setMinimumSize(780, 520);
+    resize(960, 640);
+    setMinimumSize(820, 540);
 
     lan_host_code_ = readLanSecret(QStringLiteral("HostAccessCode"));
 
@@ -666,24 +694,23 @@ AccountWindow::AccountWindow(LaunchOptions options)
     shell_layout->setContentsMargins(1, 1, 1, 1);
     shell_layout->setSpacing(0);
 
-    // Top TitleBar with Unattended Mode toggle switch + Account button
+    // Top TitleBar with Account dropdown button
     title_bar_ = new TitleBar(this, QStringLiteral("P2P Remote"), true, true, shell);
 
-    unattended_switch_ = new ToggleSwitch(QStringLiteral("无人值守"), title_bar_);
-    unattended_switch_->setToolTip(QStringLiteral("开启后本机进入局域网无人值守模式并显示固定被控码"));
-    connect(unattended_switch_, &QAbstractButton::toggled, this, &AccountWindow::setUnattendedEnabled);
-    title_bar_->addToolWidget(unattended_switch_);
-
-    auto* sep = new QFrame(title_bar_);
-    sep->setObjectName(QStringLiteral("titleSeparator"));
-    title_bar_->addToolWidget(sep);
-
-    account_btn_ = new QPushButton(QStringLiteral("登录账号"), title_bar_);
+    account_btn_ = new QPushButton(QStringLiteral("登录账号 ▾"), title_bar_);
     account_btn_->setObjectName(QStringLiteral("titleToolBtn"));
     account_btn_->setFocusPolicy(Qt::NoFocus);
     connect(account_btn_, &QPushButton::clicked, this, [this] {
-        if (p2p_account_signed_in(account_.get())) showAccountMenu();
-        else showLoginPage();
+        if (p2p_account_signed_in(account_.get())) {
+            showAccountMenu();
+            return;
+        }
+        if (login_popup_ && login_popup_->isVisible()) {
+            login_popup_->hide();
+            return;
+        }
+        if (login_popup_closed_.isValid() && login_popup_closed_.elapsed() < 200) return;
+        showLoginPopup();
     });
     title_bar_->addToolWidget(account_btn_);
     shell_layout->addWidget(title_bar_);
@@ -698,20 +725,17 @@ AccountWindow::AccountWindow(LaunchOptions options)
 
     auto* right_pane = new QWidget(workspace);
     auto* right_layout = new QVBoxLayout(right_pane);
-    right_layout->setContentsMargins(26, 18, 26, 14);
+    right_layout->setContentsMargins(28, 22, 28, 16);
     right_layout->setSpacing(14);
 
-    right_layout->addWidget(makeUnattendedBanner(right_pane));
-
     right_stack_ = new QStackedWidget(right_pane);
+    local_page_ = makeLocalPage(right_stack_);
     detail_page_ = makeDetailPage(right_stack_);
-    welcome_page_ = makeWelcomePage(right_stack_);
-    login_page_ = makeLoginPage(right_stack_);
+    right_stack_->addWidget(local_page_);
     right_stack_->addWidget(detail_page_);
-    right_stack_->addWidget(welcome_page_);
-    right_stack_->addWidget(login_page_);
-    right_stack_->setCurrentWidget(welcome_page_);
+    right_stack_->setCurrentWidget(local_page_);
     right_layout->addWidget(right_stack_, 1);
+    makeLoginPopup();
 
     status_ = new QLabel(right_pane);
     status_->setObjectName(QStringLiteral("status"));
@@ -735,17 +759,18 @@ AccountWindow::AccountWindow(LaunchOptions options)
     refresh_.setInterval(3000);
     connect(&refresh_, &QTimer::timeout, this, &AccountWindow::refresh);
 
-    // Always run lightweight LAN auto-discovery so nearby hosts show up immediately in sidebar
-    lan_scanner_.reset(p2p_lan_scanner_create());
-    if (lan_scanner_) p2p_lan_scanner_probe(lan_scanner_.get());
-    lan_scan_timer_.setInterval(2000);
-    connect(&lan_scan_timer_, &QTimer::timeout, this, &AccountWindow::refreshLanPeers);
-    lan_scan_timer_.start();
+    status_clear_timer_.setSingleShot(true);
+    status_clear_timer_.setInterval(5000);
+    connect(&status_clear_timer_, &QTimer::timeout, this, [this] {
+        if (status_) status_->hide();
+    });
 
     connect(&AppSettings::instance(), &AppSettings::changed, this, [this](const AppSettingsData&) {
-        refreshLanPeers();
         fillDevices();
-        if (unattended_switch_) unattended_switch_->update();
+        if (local_nav_btn_ && local_status_pill_) {
+            local_nav_btn_->setIcon(makeSidebarDeviceIcon(local_status_pill_->property("state").toString()));
+        }
+        if (lan_allow_switch_) lan_allow_switch_->update();
         if (hero_widget_) hero_widget_->update();
     });
 
@@ -753,10 +778,10 @@ AccountWindow::AccountWindow(LaunchOptions options)
     elevated_ = isProcessElevated();
     refreshServiceStatus();
     connect(&service_refresh_, &QTimer::timeout, this, &AccountWindow::refreshServiceStatus);
-    service_refresh_.start(1500);
+    service_refresh_.start(service_poll_interval_ms);
     refreshScreens();
     loadCredentials();
-    refreshLanPeers();
+    fillDevices();
     updateControls();
 }
 
@@ -770,7 +795,7 @@ AccountWindow::~AccountWindow() {
 QWidget* AccountWindow::makeSidebar(QWidget* parent) {
     auto* sidebar = new QFrame(parent);
     sidebar->setObjectName(QStringLiteral("navSidebar"));
-    sidebar->setFixedWidth(232);
+    sidebar->setFixedWidth(236);
 
     auto* root = new QVBoxLayout(sidebar);
     root->setContentsMargins(0, 0, 0, 0);
@@ -781,34 +806,38 @@ QWidget* AccountWindow::makeSidebar(QWidget* parent) {
     nav->setContentsMargins(10, 12, 10, 10);
     nav->setSpacing(6);
 
-    // Section 1: 局域网设备 (auto-discovery)
-    auto* lan_hdr = new QHBoxLayout;
-    lan_hdr->setContentsMargins(0, 0, 0, 0);
-    auto* lan_lbl = new QLabel(QStringLiteral("局域网设备"), nav_body);
-    lan_lbl->setObjectName(QStringLiteral("sidebarSection"));
-    lan_hdr->addWidget(lan_lbl, 1);
-    auto* lan_refresh = new QPushButton(QStringLiteral("↻"), nav_body);
-    lan_refresh->setObjectName(QStringLiteral("sidebarIconBtn"));
-    lan_refresh->setToolTip(QStringLiteral("重新扫描局域网设备"));
-    lan_refresh->setFocusPolicy(Qt::NoFocus);
-    connect(lan_refresh, &QPushButton::clicked, this, [this] {
-        if (lan_scanner_) p2p_lan_scanner_probe(lan_scanner_.get());
-        refreshLanPeers();
-        setStatus(QStringLiteral("正在扫描局域网在线设备…"));
+    // Standalone top navigation item: 本机 (independent of cloud login)
+    local_nav_btn_ = new QPushButton(QStringLiteral("本机"), nav_body);
+    local_nav_btn_->setObjectName(QStringLiteral("sidebarNavItem"));
+    local_nav_btn_->setCheckable(true);
+    local_nav_btn_->setChecked(true);
+    local_nav_btn_->setFocusPolicy(Qt::NoFocus);
+    local_nav_btn_->setIconSize(QSize(28, 18));
+    local_nav_btn_->setIcon(makeSidebarDeviceIcon(QStringLiteral("offline"), false));
+    local_nav_btn_->setToolTip(localComputerName());
+    connect(local_nav_btn_, &QPushButton::clicked, this, [this] {
+        viewing_local_ = true;
+        selected_ = {};
+        if (local_nav_btn_) local_nav_btn_->setChecked(true);
+        if (cloud_list_) {
+            const QSignalBlocker b(cloud_list_);
+            cloud_list_->clearSelection();
+            cloud_list_->setCurrentRow(-1);
+        }
+        right_stack_->setCurrentWidget(local_page_);
+        updateControls();
     });
-    lan_hdr->addWidget(lan_refresh);
-    nav->addLayout(lan_hdr);
+    nav->addWidget(local_nav_btn_);
 
-    lan_list_ = new QListWidget(nav_body);
-    lan_list_->setObjectName(QStringLiteral("sidebarList"));
-    lan_list_->setIconSize(QSize(28, 18));
-    lan_list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    lan_list_->setMaximumHeight(185);
-    nav->addWidget(lan_list_);
+    auto* nav_div = new QFrame(nav_body);
+    nav_div->setObjectName(QStringLiteral("divider"));
+    nav->addSpacing(2);
+    nav->addWidget(nav_div);
+    nav->addSpacing(2);
 
-    // Section 2: 我的设备 (Cloud account)
+    // Cloud account section: 我的设备 (strictly cloud-bound devices after sign-in)
     auto* cloud_hdr = new QHBoxLayout;
-    cloud_hdr->setContentsMargins(0, 8, 0, 0);
+    cloud_hdr->setContentsMargins(0, 0, 0, 0);
     auto* cloud_lbl = new QLabel(QStringLiteral("我的设备"), nav_body);
     cloud_lbl->setObjectName(QStringLiteral("sidebarSection"));
     cloud_hdr->addWidget(cloud_lbl, 1);
@@ -826,22 +855,16 @@ QWidget* AccountWindow::makeSidebar(QWidget* parent) {
     cloud_list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     nav->addWidget(cloud_list_, 1);
 
-    cloud_login_sidebar_btn_ = new QPushButton(QStringLiteral("登录云端账号…"), nav_body);
-    cloud_login_sidebar_btn_->setObjectName(QStringLiteral("sidebarActionBtn"));
-    cloud_login_sidebar_btn_->setFocusPolicy(Qt::NoFocus);
-    connect(cloud_login_sidebar_btn_, &QPushButton::clicked, this, &AccountWindow::showLoginPage);
-    nav->addWidget(cloud_login_sidebar_btn_);
-
-    // Section 3: 远程协助 / 直连入口
+    // Second Section: 远程直连 (LAN discovery + direct connect in dedicated dialog)
     auto* direct_lbl = new QLabel(QStringLiteral("远程直连"), nav_body);
     direct_lbl->setObjectName(QStringLiteral("sidebarSection"));
     nav->addSpacing(6);
     nav->addWidget(direct_lbl);
 
-    auto* direct_btn = new QPushButton(QStringLiteral("＋  IP 局域网直连…"), nav_body);
+    auto* direct_btn = new QPushButton(QStringLiteral("＋  局域网直连…"), nav_body);
     direct_btn->setObjectName(QStringLiteral("sidebarActionBtn"));
     direct_btn->setFocusPolicy(Qt::NoFocus);
-    connect(direct_btn, &QPushButton::clicked, this, [this] { openLanConnectDialog(); });
+    connect(direct_btn, &QPushButton::clicked, this, &AccountWindow::openLanConnectDialog);
     nav->addWidget(direct_btn);
 
     auto* audit_btn = new QPushButton(QStringLiteral("AI Agent 诊断记录"), nav_body);
@@ -864,48 +887,23 @@ QWidget* AccountWindow::makeSidebar(QWidget* parent) {
     footer_layout->addWidget(settings_btn);
     root->addWidget(footer);
 
-    // Selection wiring (mutually exclusive between LAN list & Cloud list)
-    connect(lan_list_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
-        if (!item || !(item->flags() & Qt::ItemIsSelectable)) return;
-        const QSignalBlocker b(cloud_list_);
-        cloud_list_->clearSelection();
-        cloud_list_->setCurrentItem(nullptr);
-        selected_ = {
-            SelectionKind::lan,
-            item->data(Qt::UserRole).toString(),
-            item->data(device_name_role).toString(),
-            item->data(device_state_role).toString(),
-            item->data(Qt::UserRole).toString(),
-            static_cast<std::uint16_t>(item->data(lan_port_role).toInt()),
-            false
-        };
-        right_stack_->setCurrentWidget(detail_page_);
-        updateDetailView();
-    });
-    connect(lan_list_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
-        if (!item || !(item->flags() & Qt::ItemIsSelectable)) return;
-        connectSelectedDevice(false);
-    });
     connect(cloud_list_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
         if (!item || !(item->flags() & Qt::ItemIsSelectable)) return;
-        const QSignalBlocker b(lan_list_);
-        lan_list_->clearSelection();
-        lan_list_->setCurrentItem(nullptr);
         const auto id = item->data(Qt::UserRole).toString();
         const auto local = winText(p2p_account_device_id(account_.get()));
         const bool is_self = !id.isEmpty() &&
             (id == local || (service_info_.running && id == service_info_.device_id));
+        viewing_local_ = false;
+        if (local_nav_btn_) local_nav_btn_->setChecked(false);
         selected_ = {
-            SelectionKind::cloud,
             id,
             item->data(device_name_role).toString(),
             item->data(device_state_role).toString(),
             item->data(device_platform_role).toString(),
-            0,
             is_self
         };
         right_stack_->setCurrentWidget(detail_page_);
-        updateDetailView();
+        updateControls();
     });
     connect(cloud_list_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
         if (!item || !(item->flags() & Qt::ItemIsSelectable)) return;
@@ -915,63 +913,255 @@ QWidget* AccountWindow::makeSidebar(QWidget* parent) {
     return sidebar;
 }
 
-QWidget* AccountWindow::makeUnattendedBanner(QWidget* parent) {
-    unattended_banner_ = new QFrame(parent);
-    unattended_banner_->setObjectName(QStringLiteral("unattendedBanner"));
-    auto* row = new QHBoxLayout(unattended_banner_);
-    row->setContentsMargins(14, 10, 12, 10);
-    row->setSpacing(10);
+QWidget* AccountWindow::makeLocalPage(QWidget* parent) {
+    auto* page = new QWidget(parent);
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(18);
 
-    unattended_pill_ = new QLabel(QStringLiteral("● 无人值守"), unattended_banner_);
-    unattended_pill_->setObjectName(QStringLiteral("statusPill"));
-    unattended_pill_->setProperty("state", QStringLiteral("online"));
-    row->addWidget(unattended_pill_);
+    // Top Header: Local computer name + 本机 tag + live status pill + quick connect CTA
+    auto* hdr = new QHBoxLayout;
+    hdr->setSpacing(10);
+    local_title_ = new QLabel(localComputerName(), page);
+    local_title_->setObjectName(QStringLiteral("deviceTitle"));
+    local_title_->setTextFormat(Qt::PlainText);
+    hdr->addWidget(local_title_);
 
-    unattended_ip_label_ = new QLabel(unattended_banner_);
-    unattended_ip_label_->setTextFormat(Qt::PlainText);
-    unattended_ip_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    row->addWidget(unattended_ip_label_);
+    auto* self_tag = new QLabel(QStringLiteral("本机"), page);
+    self_tag->setObjectName(QStringLiteral("selfTag"));
+    hdr->addWidget(self_tag);
 
-    auto* code_title = new QLabel(QStringLiteral("被控码"), unattended_banner_);
-    code_title->setObjectName(QStringLiteral("muted"));
-    row->addWidget(code_title);
+    local_status_pill_ = new QLabel(QStringLiteral("● 未开启被控"), page);
+    local_status_pill_->setObjectName(QStringLiteral("statusPill"));
+    local_status_pill_->setProperty("state", QStringLiteral("offline"));
+    hdr->addWidget(local_status_pill_);
 
-    unattended_code_label_ = new QLabel(unattended_banner_);
-    unattended_code_label_->setObjectName(QStringLiteral("codeBadge"));
-    unattended_code_label_->setTextFormat(Qt::PlainText);
-    unattended_code_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    row->addWidget(unattended_code_label_);
+    hdr->addStretch(1);
 
-    unattended_toggle_code_btn_ = new QPushButton(QStringLiteral("显示"), unattended_banner_);
-    unattended_toggle_code_btn_->setObjectName(QStringLiteral("miniGhostBtn"));
-    unattended_toggle_code_btn_->setFocusPolicy(Qt::NoFocus);
-    connect(unattended_toggle_code_btn_, &QPushButton::clicked, this, [this] {
+    auto* quick_lan_btn = new QPushButton(QStringLiteral("＋  局域网直连"), page);
+    quick_lan_btn->setObjectName(QStringLiteral("primary"));
+    quick_lan_btn->setCursor(Qt::PointingHandCursor);
+    quick_lan_btn->setFocusPolicy(Qt::NoFocus);
+    quick_lan_btn->setMinimumHeight(32);
+    connect(quick_lan_btn, &QPushButton::clicked, this, &AccountWindow::openLanConnectDialog);
+    hdr->addWidget(quick_lan_btn);
+    layout->addLayout(hdr);
+
+    // Card 1: 允许局域网连接 + IP & Large Verification Code
+    local_lan_card_ = new QFrame(page);
+    local_lan_card_->setObjectName(QStringLiteral("localLanCard"));
+    auto* lan_vbox = new QVBoxLayout(local_lan_card_);
+    lan_vbox->setContentsMargins(22, 20, 22, 20);
+    lan_vbox->setSpacing(16);
+
+    auto* lan_hdr = new QHBoxLayout;
+    lan_hdr->setSpacing(16);
+    auto* lan_title_col = new QVBoxLayout;
+    lan_title_col->setContentsMargins(0, 0, 0, 0);
+    lan_title_col->setSpacing(4);
+    auto* lan_title = new QLabel(QStringLiteral("允许局域网连接"), local_lan_card_);
+    lan_title->setObjectName(QStringLiteral("cardTitle"));
+    lan_title_col->addWidget(lan_title);
+    local_lan_desc_ = new QLabel(
+        QStringLiteral("开启后，同网段设备可通过本机 IP 与连接验证码直接控制此电脑"), local_lan_card_);
+    local_lan_desc_->setObjectName(QStringLiteral("muted"));
+    local_lan_desc_->setWordWrap(true);
+    lan_title_col->addWidget(local_lan_desc_);
+    lan_hdr->addLayout(lan_title_col, 1);
+
+    lan_allow_switch_ = new ToggleSwitch(QString{}, local_lan_card_);
+    lan_allow_switch_->setToolTip(QStringLiteral("允许同网段设备通过 IP 与连接验证码直连本机"));
+    connect(lan_allow_switch_, &QAbstractButton::toggled, this, &AccountWindow::setLanAllowEnabled);
+    lan_hdr->addWidget(lan_allow_switch_, 0, Qt::AlignVCenter);
+    lan_vbox->addLayout(lan_hdr);
+
+    auto* lan_div = new QFrame(local_lan_card_);
+    lan_div->setObjectName(QStringLiteral("divider"));
+    lan_vbox->addWidget(lan_div);
+
+    // Active LAN info & verification code area (generous 2-tile layout)
+    lan_info_area_ = new QWidget(local_lan_card_);
+    auto* info_vbox = new QVBoxLayout(lan_info_area_);
+    info_vbox->setContentsMargins(0, 0, 0, 0);
+    info_vbox->setSpacing(14);
+
+    auto* tiles = new QHBoxLayout;
+    tiles->setSpacing(14);
+
+    auto* ip_tile = new QFrame(lan_info_area_);
+    ip_tile->setObjectName(QStringLiteral("metricTile"));
+    auto* ip_vbox = new QVBoxLayout(ip_tile);
+    ip_vbox->setContentsMargins(18, 14, 18, 14);
+    ip_vbox->setSpacing(6);
+    auto* ip_caption = new QLabel(QStringLiteral("本机局域网 IP"), ip_tile);
+    ip_caption->setObjectName(QStringLiteral("metricLabel"));
+    ip_vbox->addWidget(ip_caption);
+    local_ip_value_ = new QLabel(QStringLiteral("—"), ip_tile);
+    local_ip_value_->setObjectName(QStringLiteral("ipDisplay"));
+    local_ip_value_->setTextFormat(Qt::PlainText);
+    local_ip_value_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    ip_vbox->addWidget(local_ip_value_);
+    local_ip_extra_ = new QLabel(QStringLiteral("同网段设备可自动发现或手动输入此地址"), ip_tile);
+    local_ip_extra_->setObjectName(QStringLiteral("muted"));
+    local_ip_extra_->setTextFormat(Qt::PlainText);
+    local_ip_extra_->setWordWrap(true);
+    ip_vbox->addWidget(local_ip_extra_);
+    tiles->addWidget(ip_tile, 1);
+
+    auto* code_tile = new QFrame(lan_info_area_);
+    code_tile->setObjectName(QStringLiteral("metricTile"));
+    auto* code_vbox = new QVBoxLayout(code_tile);
+    code_vbox->setContentsMargins(18, 14, 18, 14);
+    code_vbox->setSpacing(6);
+    auto* code_caption = new QLabel(QStringLiteral("连接验证码"), code_tile);
+    code_caption->setObjectName(QStringLiteral("metricLabel"));
+    code_vbox->addWidget(code_caption);
+    local_code_value_ = new QLabel(QStringLiteral("••••••••"), code_tile);
+    local_code_value_->setObjectName(QStringLiteral("codeDisplay"));
+    local_code_value_->setTextFormat(Qt::PlainText);
+    local_code_value_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    code_vbox->addWidget(local_code_value_);
+    auto* code_sub = new QLabel(QStringLiteral("固定连接验证码 · 校验通过后即可远控"), code_tile);
+    code_sub->setObjectName(QStringLiteral("muted"));
+    code_vbox->addWidget(code_sub);
+    tiles->addWidget(code_tile, 1);
+
+    info_vbox->addLayout(tiles);
+
+    auto* lan_actions = new QHBoxLayout;
+    lan_actions->setSpacing(10);
+    lan_toggle_code_btn_ = new QPushButton(QStringLiteral("显示验证码"), lan_info_area_);
+    lan_toggle_code_btn_->setFocusPolicy(Qt::NoFocus);
+    lan_toggle_code_btn_->setMinimumHeight(30);
+    connect(lan_toggle_code_btn_, &QPushButton::clicked, this, [this] {
         lan_code_visible_ = !lan_code_visible_;
-        updateUnattendedBanner();
+        updateLocalPage();
     });
-    row->addWidget(unattended_toggle_code_btn_);
+    lan_actions->addWidget(lan_toggle_code_btn_);
 
-    unattended_copy_btn_ = new QPushButton(QStringLiteral("复制"), unattended_banner_);
-    unattended_copy_btn_->setObjectName(QStringLiteral("miniGhostBtn"));
-    unattended_copy_btn_->setFocusPolicy(Qt::NoFocus);
-    connect(unattended_copy_btn_, &QPushButton::clicked, this, &AccountWindow::copyUnattendedInfo);
-    row->addWidget(unattended_copy_btn_);
+    lan_copy_btn_ = new QPushButton(QStringLiteral("复制连接信息"), lan_info_area_);
+    lan_copy_btn_->setFocusPolicy(Qt::NoFocus);
+    lan_copy_btn_->setMinimumHeight(30);
+    connect(lan_copy_btn_, &QPushButton::clicked, this, &AccountWindow::copyLanConnectionInfo);
+    lan_actions->addWidget(lan_copy_btn_);
 
-    unattended_edit_btn_ = new QPushButton(QStringLiteral("修改"), unattended_banner_);
-    unattended_edit_btn_->setObjectName(QStringLiteral("miniGhostBtn"));
-    unattended_edit_btn_->setFocusPolicy(Qt::NoFocus);
-    connect(unattended_edit_btn_, &QPushButton::clicked, this, &AccountWindow::editUnattendedCode);
-    row->addWidget(unattended_edit_btn_);
+    lan_edit_btn_ = new QPushButton(QStringLiteral("修改验证码"), lan_info_area_);
+    lan_edit_btn_->setFocusPolicy(Qt::NoFocus);
+    lan_edit_btn_->setMinimumHeight(30);
+    connect(lan_edit_btn_, &QPushButton::clicked, this, &AccountWindow::editLanAccessCode);
+    lan_actions->addWidget(lan_edit_btn_);
 
-    row->addStretch(1);
+    lan_actions->addStretch(1);
 
-    screens_ = new QComboBox(unattended_banner_);
+    screens_ = new QComboBox(lan_info_area_);
     screens_->setAccessibleName(QStringLiteral("共享显示器"));
-    screens_->setMaximumWidth(160);
-    row->addWidget(screens_);
+    screens_->setMinimumWidth(168);
+    connect(screens_, qOverload<int>(&QComboBox::activated), this, [this](int) {
+        if (lan_host_) {
+            stopLanReceiving();
+            startLanReceiving(lan_host_code_, lan_host_port_);
+        }
+        updateLocalPage();
+    });
+    lan_actions->addWidget(screens_);
+    info_vbox->addLayout(lan_actions);
+    lan_vbox->addWidget(lan_info_area_);
 
-    unattended_banner_->hide();
-    return unattended_banner_;
+    lan_off_hint_ = new QWidget(local_lan_card_);
+    auto* off_row = new QHBoxLayout(lan_off_hint_);
+    off_row->setContentsMargins(0, 2, 0, 2);
+    auto* off_label = new QLabel(
+        QStringLiteral("当前未开启局域网连接。开启上方开关后，将显示本机 IP 与连接验证码；该功能与云端账号相互独立，可同时使用。"),
+        lan_off_hint_);
+    off_label->setObjectName(QStringLiteral("muted"));
+    off_label->setWordWrap(true);
+    off_row->addWidget(off_label, 1);
+    lan_vbox->addWidget(lan_off_hint_);
+
+    layout->addWidget(local_lan_card_);
+
+    // Card 2: 本机信息与云端连接状态
+    auto* info_card = new QFrame(page);
+    info_card->setObjectName(QStringLiteral("accountCard"));
+    auto* info_card_vbox = new QVBoxLayout(info_card);
+    info_card_vbox->setContentsMargins(22, 18, 22, 18);
+    info_card_vbox->setSpacing(14);
+
+    auto* info_hdr = new QHBoxLayout;
+    auto* info_title = new QLabel(QStringLiteral("本机信息与云端状态"), info_card);
+    info_title->setObjectName(QStringLiteral("cardTitle"));
+    info_hdr->addWidget(info_title, 1);
+    auto* audit_link = new QPushButton(QStringLiteral("AI Agent 诊断记录"), info_card);
+    audit_link->setObjectName(QStringLiteral("miniGhostBtn"));
+    audit_link->setFocusPolicy(Qt::NoFocus);
+    connect(audit_link, &QPushButton::clicked, this, &AccountWindow::openAgentAudit);
+    info_hdr->addWidget(audit_link);
+    info_card_vbox->addLayout(info_hdr);
+
+    auto makeSummaryCol = [&](const QString& label_text, QLabel*& value_out) {
+        auto* col = new QVBoxLayout;
+        col->setContentsMargins(0, 0, 0, 0);
+        col->setSpacing(4);
+        auto* lbl = new QLabel(label_text, info_card);
+        lbl->setObjectName(QStringLiteral("metricLabel"));
+        col->addWidget(lbl);
+        value_out = new QLabel(QStringLiteral("—"), info_card);
+        value_out->setObjectName(QStringLiteral("summaryValue"));
+        value_out->setTextFormat(Qt::PlainText);
+        value_out->setWordWrap(true);
+        col->addWidget(value_out);
+        return col;
+    };
+
+    auto* summary_row = new QHBoxLayout;
+    summary_row->setSpacing(20);
+    summary_row->addLayout(makeSummaryCol(QStringLiteral("局域网 IP"), local_summary_ip_), 1);
+    summary_row->addLayout(makeSummaryCol(QStringLiteral("当前显示器"), local_summary_display_), 1);
+    summary_row->addLayout(makeSummaryCol(QStringLiteral("运行权限"), privilege_status_), 1);
+    local_summary_ip_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    info_card_vbox->addLayout(summary_row);
+
+    auto* info_div = new QFrame(info_card);
+    info_div->setObjectName(QStringLiteral("divider"));
+    info_card_vbox->addWidget(info_div);
+
+    cloud_host_section_ = new QWidget(info_card);
+    auto* ch_row = new QHBoxLayout(cloud_host_section_);
+    ch_row->setContentsMargins(0, 0, 0, 0);
+    ch_row->setSpacing(10);
+    cloud_host_status_ = new QLabel(cloud_host_section_);
+    cloud_host_status_->setObjectName(QStringLiteral("muted"));
+    cloud_host_status_->setTextFormat(Qt::PlainText);
+    cloud_host_status_->setWordWrap(true);
+    ch_row->addWidget(cloud_host_status_, 1);
+    add_device_ = new QPushButton(QStringLiteral("添加到云端"), cloud_host_section_);
+    add_device_->setFocusPolicy(Qt::NoFocus);
+    connect(add_device_, &QPushButton::clicked, this, &AccountWindow::addLocalDevice);
+    ch_row->addWidget(add_device_);
+    receive_ = new QPushButton(QStringLiteral("开启云端接收"), cloud_host_section_);
+    receive_->setFocusPolicy(Qt::NoFocus);
+    connect(receive_, &QPushButton::clicked, this, &AccountWindow::toggleReceiving);
+    ch_row->addWidget(receive_);
+    elevate_button_ = new QPushButton(QStringLiteral("管理员重启"), cloud_host_section_);
+    elevate_button_->setFocusPolicy(Qt::NoFocus);
+    connect(elevate_button_, &QPushButton::clicked, this, &AccountWindow::relaunchAsAdmin);
+    ch_row->addWidget(elevate_button_);
+    service_button_ = new QPushButton(QStringLiteral("启用系统服务"), cloud_host_section_);
+    service_button_->setFocusPolicy(Qt::NoFocus);
+    connect(service_button_, &QPushButton::clicked, this, &AccountWindow::toggleHostService);
+    ch_row->addWidget(service_button_);
+    info_card_vbox->addWidget(cloud_host_section_);
+
+    cloud_guest_hint_ = new QLabel(
+        QStringLiteral("云端跨网访问：未登录账号 · 点击右上角「登录账号」可跨外网管理个人设备，与局域网直连互不冲突。"),
+        info_card);
+    cloud_guest_hint_->setObjectName(QStringLiteral("muted"));
+    cloud_guest_hint_->setWordWrap(true);
+    info_card_vbox->addWidget(cloud_guest_hint_);
+
+    layout->addWidget(info_card);
+    layout->addStretch(1);
+    return page;
 }
 
 QWidget* AccountWindow::makeDetailPage(QWidget* parent) {
@@ -1025,9 +1215,9 @@ QWidget* AccountWindow::makeDetailPage(QWidget* parent) {
         btn->setFocusPolicy(Qt::NoFocus);
         return btn;
     };
-    strip_btn_1_ = makeStripBtn(QStringLiteral("立即直连"));
-    strip_btn_2_ = makeStripBtn(QStringLiteral("输入参数连接"));
-    strip_btn_3_ = makeStripBtn(QStringLiteral("复制 IP"));
+    strip_btn_1_ = makeStripBtn(QStringLiteral("远程控制"));
+    strip_btn_2_ = makeStripBtn(QStringLiteral("只读诊断"));
+    strip_btn_3_ = makeStripBtn(QStringLiteral("移除设备"));
 
     auto addSep = [&] {
         auto* s = new QFrame(strip);
@@ -1047,211 +1237,126 @@ QWidget* AccountWindow::makeDetailPage(QWidget* parent) {
         connectSelectedDevice(false);
     });
     connect(strip_btn_2_, &QPushButton::clicked, this, [this] {
-        if (selected_.kind == SelectionKind::lan) {
-            openLanConnectDialog(selected_.id, selected_.name);
-        } else if (selected_.kind == SelectionKind::cloud) {
-            connectSelectedDevice(true);
-        }
+        connectSelectedDevice(true);
     });
-    connect(strip_btn_3_, &QPushButton::clicked, this, [this] {
-        if (selected_.kind == SelectionKind::lan) {
-            if (auto* cb = QApplication::clipboard()) cb->setText(selected_.id);
-            setStatus(QStringLiteral("已复制设备 IP：%1").arg(selected_.id));
-        } else if (selected_.kind == SelectionKind::cloud) {
-            removeSelectedDevice();
-        }
-    });
+    connect(strip_btn_3_, &QPushButton::clicked, this, &AccountWindow::removeSelectedDevice);
     connect(detail_more_btn_, &QPushButton::clicked, this, [this] {
         auto* menu = new QMenu(detail_more_btn_);
         menu->setObjectName(QStringLiteral("remoteMenu"));
         menu->setAttribute(Qt::WA_DeleteOnClose);
-        if (selected_.kind == SelectionKind::lan) {
-            menu->addAction(QStringLiteral("输入被控码并直连…"), this, [this] {
-                openLanConnectDialog(selected_.id, selected_.name);
-            });
-            menu->addAction(QStringLiteral("复制设备 IP"), this, [this] {
-                if (auto* cb = QApplication::clipboard()) cb->setText(selected_.id);
-                setStatus(QStringLiteral("已复制设备 IP：%1").arg(selected_.id));
-            });
-            menu->addAction(QStringLiteral("清除已记住的被控码"), this, [this] {
-                deleteLanSecret(QStringLiteral("Peer/") + selected_.id);
-                setStatus(QStringLiteral("已清除该设备保存的被控码。"));
-            });
-        } else if (selected_.kind == SelectionKind::cloud) {
-            menu->addAction(QStringLiteral("只读诊断"), this, [this] { connectSelectedDevice(true); })
-                ->setEnabled(selected_.state == QStringLiteral("online") && !selected_.is_self);
-            menu->addAction(QStringLiteral("移除此设备"), this, &AccountWindow::removeSelectedDevice);
-        }
+        menu->addAction(QStringLiteral("只读诊断"), this, [this] { connectSelectedDevice(true); })
+            ->setEnabled(selected_.state == QStringLiteral("online") && !selected_.is_self);
+        menu->addAction(QStringLiteral("移除此设备"), this, &AccountWindow::removeSelectedDevice);
         menu->popup(detail_more_btn_->mapToGlobal(QPoint(0, detail_more_btn_->height() + 4)));
     });
 
-    // Lower section: Quick direct connect + Cloud host status (only shown when signed in)
-    auto* quick_title = new QLabel(QStringLiteral("快速操作"), page);
+    // Lower section: Quick direct connect
+    auto* quick_title = new QLabel(QStringLiteral("快速启动"), page);
     quick_title->setObjectName(QStringLiteral("sectionTitle"));
     layout->addWidget(quick_title);
 
     auto* quick_row = new QHBoxLayout;
     quick_row->setSpacing(12);
-    auto* add_direct = new QPushButton(QStringLiteral("＋  输入 IP 局域网直连"), page);
+    auto* add_direct = new QPushButton(QStringLiteral("＋  局域网直连"), page);
     add_direct->setObjectName(QStringLiteral("quickAddTile"));
     add_direct->setCursor(Qt::PointingHandCursor);
     add_direct->setFocusPolicy(Qt::NoFocus);
-    connect(add_direct, &QPushButton::clicked, this, [this] { openLanConnectDialog(); });
+    connect(add_direct, &QPushButton::clicked, this, &AccountWindow::openLanConnectDialog);
     quick_row->addWidget(add_direct, 1);
     layout->addLayout(quick_row);
-
-    // Compact cloud local-receiver card (visible when signed in and viewing cloud self/devices)
-    cloud_host_card_ = new QFrame(page);
-    cloud_host_card_->setObjectName(QStringLiteral("accountCard"));
-    auto* ch_layout = new QVBoxLayout(cloud_host_card_);
-    ch_layout->setContentsMargins(14, 10, 14, 10);
-    ch_layout->setSpacing(6);
-    auto* ch_top = new QHBoxLayout;
-    ch_top->setSpacing(8);
-    cloud_host_status_ = new QLabel(cloud_host_card_);
-    cloud_host_status_->setObjectName(QStringLiteral("muted"));
-    cloud_host_status_->setTextFormat(Qt::PlainText);
-    cloud_host_status_->setWordWrap(true);
-    ch_top->addWidget(cloud_host_status_, 1);
-    add_device_ = new QPushButton(QStringLiteral("添加本机"), cloud_host_card_);
-    connect(add_device_, &QPushButton::clicked, this, &AccountWindow::addLocalDevice);
-    ch_top->addWidget(add_device_);
-    receive_ = new QPushButton(QStringLiteral("开启云端接收"), cloud_host_card_);
-    connect(receive_, &QPushButton::clicked, this, &AccountWindow::toggleReceiving);
-    ch_top->addWidget(receive_);
-    ch_layout->addLayout(ch_top);
-
-    auto* ch_bot = new QHBoxLayout;
-    ch_bot->setSpacing(8);
-    privilege_status_ = new QLabel(cloud_host_card_);
-    privilege_status_->setObjectName(QStringLiteral("muted"));
-    privilege_status_->setTextFormat(Qt::PlainText);
-    privilege_status_->setWordWrap(true);
-    ch_bot->addWidget(privilege_status_, 1);
-    elevate_button_ = new QPushButton(QStringLiteral("管理员重启"), cloud_host_card_);
-    connect(elevate_button_, &QPushButton::clicked, this, &AccountWindow::relaunchAsAdmin);
-    ch_bot->addWidget(elevate_button_);
-    service_button_ = new QPushButton(QStringLiteral("启用系统服务"), cloud_host_card_);
-    connect(service_button_, &QPushButton::clicked, this, &AccountWindow::toggleHostService);
-    ch_bot->addWidget(service_button_);
-    ch_layout->addLayout(ch_bot);
-
-    cloud_host_card_->hide();
-    layout->addWidget(cloud_host_card_);
     layout->addStretch(1);
     return page;
 }
 
-QWidget* AccountWindow::makeWelcomePage(QWidget* parent) {
-    auto* page = new QWidget(parent);
-    auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(0, 12, 0, 0);
-    layout->setSpacing(16);
+void AccountWindow::makeLoginPopup() {
+    class PopupFrame final : public QFrame {
+    public:
+        PopupFrame(QWidget* parent, std::function<void()> on_hide)
+            : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint), on_hide_(std::move(on_hide)) {
+            setAttribute(Qt::WA_TranslucentBackground, true);
+        }
+    protected:
+        void hideEvent(QHideEvent* event) override {
+            QFrame::hideEvent(event);
+            if (on_hide_) on_hide_();
+        }
+    private:
+        std::function<void()> on_hide_;
+    };
 
-    auto* hero_box = new QFrame(page);
-    hero_box->setObjectName(QStringLiteral("heroContainer"));
-    auto* hb = new QVBoxLayout(hero_box);
-    hb->setContentsMargins(0, 0, 0, 0);
-    hb->setSpacing(0);
-    auto* welcome_hero = new DeviceHeroWidget(hero_box);
-    welcome_hero->setContent(
-        QStringLiteral("选择左侧设备开始控制，或直接通过局域网 IP 连接远程电脑"),
-        QStringLiteral("＋  局域网直连"), true, true);
-    connect(welcome_hero->actionButton(), &QPushButton::clicked, this, [this] {
-        openLanConnectDialog();
+    login_popup_ = new PopupFrame(this, [this] {
+        login_popup_closed_.start();
+        if (account_btn_) {
+            account_btn_->setProperty("menuOpen", false);
+            account_btn_->style()->unpolish(account_btn_);
+            account_btn_->style()->polish(account_btn_);
+        }
     });
-    hb->addWidget(welcome_hero);
+    login_popup_->setFixedWidth(348);
 
-    auto* bar = new QFrame(hero_box);
-    bar->setObjectName(QStringLiteral("heroActionBar"));
-    auto* bar_row = new QHBoxLayout(bar);
-    bar_row->setContentsMargins(12, 6, 12, 6);
-    bar_row->setSpacing(8);
-    auto* scan_btn = new QPushButton(QStringLiteral("重新扫描局域网"), bar);
-    scan_btn->setObjectName(QStringLiteral("heroStripBtn"));
-    connect(scan_btn, &QPushButton::clicked, this, [this] {
-        if (lan_scanner_) p2p_lan_scanner_probe(lan_scanner_.get());
-        refreshLanPeers();
-        setStatus(QStringLiteral("正在扫描局域网在线设备…"));
-    });
-    welcome_login_btn_ = new QPushButton(QStringLiteral("登录云端账号"), bar);
-    welcome_login_btn_->setObjectName(QStringLiteral("heroStripBtn"));
-    connect(welcome_login_btn_, &QPushButton::clicked, this, &AccountWindow::showLoginPage);
-    bar_row->addWidget(scan_btn, 1);
-    auto* sep = new QFrame(bar);
-    sep->setObjectName(QStringLiteral("titleSeparator"));
-    bar_row->addWidget(sep);
-    bar_row->addWidget(welcome_login_btn_, 1);
-    hb->addWidget(bar);
+    auto* outer = new QVBoxLayout(login_popup_);
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setSpacing(0);
+    auto* card = new QFrame(login_popup_);
+    card->setObjectName(QStringLiteral("accountPopup"));
+    outer->addWidget(card);
 
-    layout->addWidget(hero_box);
+    auto* layout = new QVBoxLayout(card);
+    layout->setContentsMargins(18, 16, 18, 16);
+    layout->setSpacing(10);
 
-    auto* tip = new QLabel(
-        QStringLiteral("提示：打开右上角「无人值守」开关即可让本机在局域网内等待直连，并显示本机固定被控码。"), page);
-    tip->setObjectName(QStringLiteral("muted"));
-    tip->setWordWrap(true);
-    layout->addWidget(tip);
-    layout->addStretch(1);
-    return page;
-}
-
-QWidget* AccountWindow::makeLoginPage(QWidget* parent) {
-    auto* page = new QWidget(parent);
-    auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(0, 8, 0, 4);
-    layout->setSpacing(14);
-
-    auto* hdr = new QHBoxLayout;
-    hdr->addWidget(heading(QStringLiteral("登录云端账号"), page), 1);
-    auto* back = new QPushButton(QStringLiteral("返回"), page);
-    back->setObjectName(QStringLiteral("miniGhostBtn"));
-    connect(back, &QPushButton::clicked, this, [this] {
-        right_stack_->setCurrentWidget(selected_.kind == SelectionKind::none ? welcome_page_ : detail_page_);
-    });
-    hdr->addWidget(back);
-    layout->addLayout(hdr);
+    auto* title = new QLabel(QStringLiteral("登录云端账号"), login_popup_);
+    title->setObjectName(QStringLiteral("sectionTitle"));
+    layout->addWidget(title);
 
     auto* notice = new QLabel(
-        QStringLiteral("登录后可跨外网管理账号下的全部设备；纯局域网直连无需登录。"), page);
+        QStringLiteral("登录后可跨外网管理云端设备；局域网直连无需登录。"), login_popup_);
     notice->setObjectName(QStringLiteral("muted"));
     notice->setWordWrap(true);
     layout->addWidget(notice);
 
-    auto* card = new QFrame(page);
-    card->setObjectName(QStringLiteral("accountCard"));
-    auto* fields = new QFormLayout(card);
-    fields->setContentsMargins(18, 18, 18, 18);
-    fields->setHorizontalSpacing(18);
-    fields->setVerticalSpacing(12);
+    auto* fields = new QFormLayout;
+    fields->setContentsMargins(0, 4, 0, 0);
+    fields->setHorizontalSpacing(12);
+    fields->setVerticalSpacing(10);
     fields->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+
     QSettings settings;
-    server_ = new QLineEdit(settings.value(QStringLiteral("lastServer"), winText(p2p_default_server())).toString(), card);
+    server_ = new QLineEdit(settings.value(QStringLiteral("lastServer"), winText(p2p_default_server())).toString(), login_popup_);
     server_->setObjectName(QStringLiteral("server"));
     server_->setMaxLength(256);
     server_->setPlaceholderText(QStringLiteral("https://"));
-    user_ = new QLineEdit(card);
+    user_ = new QLineEdit(login_popup_);
     user_->setObjectName(QStringLiteral("user"));
     user_->setMaxLength(32);
-    password_ = new QLineEdit(card);
+    user_->setPlaceholderText(QStringLiteral("输入账号"));
+    password_ = new QLineEdit(login_popup_);
     password_->setObjectName(QStringLiteral("password"));
     password_->setMaxLength(72);
     password_->setEchoMode(QLineEdit::Password);
-    remember_ = new QCheckBox(QStringLiteral("记住密码"), card);
+    password_->setPlaceholderText(QStringLiteral("输入密码"));
+    remember_ = new QCheckBox(QStringLiteral("记住密码"), login_popup_);
     fields->addRow(QStringLiteral("服务地址"), server_);
     fields->addRow(QStringLiteral("账号"), user_);
     fields->addRow(QStringLiteral("密码"), password_);
     fields->addRow(QString{}, remember_);
+    layout->addLayout(fields);
+
+    login_popup_status_ = new QLabel(login_popup_);
+    login_popup_status_->setObjectName(QStringLiteral("muted"));
+    login_popup_status_->setWordWrap(true);
+    login_popup_status_->setTextFormat(Qt::PlainText);
+    login_popup_status_->hide();
+    layout->addWidget(login_popup_status_);
+
     auto* buttons = new QHBoxLayout;
     buttons->setSpacing(8);
-    login_ = new QPushButton(QStringLiteral("登录"), card);
+    login_ = new QPushButton(QStringLiteral("登录"), login_popup_);
     login_->setObjectName(QStringLiteral("primary"));
-    register_ = new QPushButton(QStringLiteral("注册并登录"), card);
-    buttons->addWidget(login_);
-    buttons->addWidget(register_);
-    buttons->addStretch();
-    fields->addRow(QString{}, buttons);
-    layout->addWidget(card);
-    layout->addStretch(1);
+    register_ = new QPushButton(QStringLiteral("注册并登录"), login_popup_);
+    buttons->addWidget(login_, 1);
+    buttons->addWidget(register_, 1);
+    layout->addLayout(buttons);
 
     connect(login_, &QPushButton::clicked, this, [this] { signIn(false); });
     connect(register_, &QPushButton::clicked, this, [this] { signIn(true); });
@@ -1268,9 +1373,13 @@ QWidget* AccountWindow::makeLoginPage(QWidget* parent) {
         remember_->setChecked(false);
     });
     connect(remember_, &QCheckBox::clicked, this, [this](bool checked) {
-        if (!checked && !deleteCredentials(server_->text())) setStatus(QStringLiteral("无法删除 Windows 凭据。"));
+        if (!checked && !deleteCredentials(server_->text())) {
+            if (login_popup_status_) {
+                login_popup_status_->setText(QStringLiteral("无法删除 Windows 凭据。"));
+                login_popup_status_->show();
+            }
+        }
     });
-    return page;
 }
 
 void AccountWindow::makeTray() {
@@ -1279,11 +1388,11 @@ void AccountWindow::makeTray() {
     tray_ = new QSystemTrayIcon(windowIcon(), this);
     auto* menu = new QMenu(this);
     menu->addAction(QStringLiteral("打开 P2P Remote"), this, &AccountWindow::restore);
-    tray_unattended_ = menu->addAction(QStringLiteral("开启无人值守"), this, [this] {
-        if (unattended_switch_) unattended_switch_->toggle();
+    tray_lan_allow_ = menu->addAction(QStringLiteral("允许局域网连接"), this, [this] {
+        if (lan_allow_switch_) lan_allow_switch_->toggle();
     });
     tray_receive_ = menu->addAction(QStringLiteral("开启云端接收"), this, &AccountWindow::toggleReceiving);
-    menu->addAction(QStringLiteral("IP 局域网直连…"), this, [this] {
+    menu->addAction(QStringLiteral("局域网直连…"), this, [this] {
         restore();
         openLanConnectDialog();
     });
@@ -1326,11 +1435,16 @@ void AccountWindow::closeEvent(QCloseEvent* event) {
 bool AccountWindow::nativeEvent(const QByteArray& type, void* message, qintptr* result) {
     if (handleWin32FramelessChrome(this, message, result)) return true;
     const auto* msg = static_cast<MSG*>(message);
+    if (SingleInstance::isActivationMessage(msg->message)) {
+        if (!quitting_) restore();
+        *result = quitting_ ? 0 : 1;
+        return true;
+    }
     if (msg->message == WM_HOTKEY && msg->wParam == stop_hotkey && (host_ || lan_host_)) {
         if (host_) stopReceiving();
         if (lan_host_) {
-            const QSignalBlocker b(unattended_switch_);
-            if (unattended_switch_) unattended_switch_->setChecked(false);
+            const QSignalBlocker b(lan_allow_switch_);
+            if (lan_allow_switch_) lan_allow_switch_->setChecked(false);
             stopLanReceiving();
         }
         setStatus(QStringLiteral("已用本机快捷键停止接收。"));
@@ -1358,8 +1472,8 @@ void AccountWindow::openSettings() {
 }
 
 void AccountWindow::restore() {
-    if (isMinimized()) showNormal();
-    else show();
+    if (isMinimized()) setWindowState(windowState() & ~Qt::WindowMinimized);
+    show();
     raise();
     activateWindow();
 }
@@ -1370,14 +1484,33 @@ void AccountWindow::quit() {
     QApplication::quit();
 }
 
-void AccountWindow::setStatus(const QString& text) {
+void AccountWindow::setStatus(const QString& text, bool persistent) {
     if (!status_) return;
     status_->setText(text);
-    status_->setVisible(!text.trimmed().isEmpty());
+    const bool show = !text.trimmed().isEmpty();
+    status_->setVisible(show);
+    if (show && !persistent) status_clear_timer_.start();
+    else status_clear_timer_.stop();
 }
 
-void AccountWindow::showLoginPage() {
-    right_stack_->setCurrentWidget(login_page_);
+void AccountWindow::showLoginPopup() {
+    if (!login_popup_ || !account_btn_) return;
+    if (login_popup_status_ && request_ == Request::none) login_popup_status_->hide();
+    login_popup_->adjustSize();
+    const QPoint bottom_right = account_btn_->mapToGlobal(QPoint(account_btn_->width(), account_btn_->height() + 4));
+    QPoint pos(bottom_right.x() - login_popup_->width(), bottom_right.y());
+    if (const auto* scr = screen()) {
+        const QRect avail = scr->availableGeometry();
+        pos.setX(std::clamp(pos.x(), avail.left() + 8, std::max(avail.left() + 8, avail.right() - login_popup_->width() - 8)));
+        pos.setY(std::clamp(pos.y(), avail.top() + 8, std::max(avail.top() + 8, avail.bottom() - login_popup_->height() - 8)));
+    }
+    account_btn_->setProperty("menuOpen", true);
+    account_btn_->style()->unpolish(account_btn_);
+    account_btn_->style()->polish(account_btn_);
+    login_popup_->move(pos);
+    login_popup_->show();
+    login_popup_->raise();
+    login_popup_->activateWindow();
     (user_->text().isEmpty() ? user_ : password_)->setFocus();
 }
 
@@ -1408,43 +1541,113 @@ void AccountWindow::showAccountMenu() {
     menu->addSeparator();
     menu->addAction(QStringLiteral("退出账号"), this, &AccountWindow::signOut);
 
+    account_btn_->setProperty("menuOpen", true);
+    account_btn_->style()->unpolish(account_btn_);
+    account_btn_->style()->polish(account_btn_);
+    connect(menu, &QMenu::aboutToHide, this, [this] {
+        if (account_btn_) {
+            account_btn_->setProperty("menuOpen", false);
+            account_btn_->style()->unpolish(account_btn_);
+            account_btn_->style()->polish(account_btn_);
+        }
+    });
+
     const int x = account_btn_->width() - menu->sizeHint().width();
     menu->popup(account_btn_->mapToGlobal(QPoint(x, account_btn_->height() + 4)));
 }
 
-void AccountWindow::updateUnattendedBanner() {
-    if (!unattended_banner_) return;
-    const bool active = lan_host_ != nullptr;
-    unattended_banner_->setVisible(active);
-    if (!active) return;
+void AccountWindow::updateLocalPage() {
+    const bool lan_active = lan_host_ != nullptr;
+    const bool cloud_active = host_ != nullptr || service_info_.running;
 
+    if (local_lan_card_) {
+        setStyledProperty(local_lan_card_, "active", lan_active);
+    }
+    if (lan_allow_switch_ && lan_allow_switch_->isChecked() != lan_active) {
+        const QSignalBlocker b(lan_allow_switch_);
+        lan_allow_switch_->setChecked(lan_active);
+    }
+
+    if (local_status_pill_) {
+        const auto status = lan_host_controlled_ ? QStringLiteral("busy")
+            : ((lan_active || cloud_active) ? QStringLiteral("online") : QStringLiteral("offline"));
+        if (lan_host_controlled_) {
+            local_status_pill_->setText(QStringLiteral("● 正在被控"));
+        } else if (lan_active && cloud_active) {
+            local_status_pill_->setText(QStringLiteral("● 局域网与云端就绪"));
+        } else if (lan_active) {
+            local_status_pill_->setText(QStringLiteral("● 局域网可连接"));
+        } else if (cloud_active) {
+            local_status_pill_->setText(QStringLiteral("● 云端在线"));
+        } else {
+            local_status_pill_->setText(QStringLiteral("● 未开启被控"));
+        }
+        if (setStyledProperty(local_status_pill_, "state", status) && local_nav_btn_) {
+            local_nav_btn_->setIcon(makeSidebarDeviceIcon(status));
+        }
+    }
+
+    if (local_lan_desc_) {
+        if (lan_host_controlled_) {
+            local_lan_desc_->setText(QStringLiteral("远程主控已接入，按 Ctrl+Alt+F11 可随时断开本机被控"));
+        } else if (lan_active) {
+            local_lan_desc_->setText(QStringLiteral("同网段设备已可发现此电脑，使用下方 IP 与连接验证码即可直连"));
+        } else {
+            local_lan_desc_->setText(QStringLiteral("开启后，同网段设备可通过本机 IP 与连接验证码直接控制此电脑"));
+        }
+    }
+
+    if (lan_info_area_) lan_info_area_->setVisible(lan_active);
+    if (lan_off_hint_) lan_off_hint_->setVisible(!lan_active);
+
+    if (lan_active) {
+        if (local_code_value_) {
+            local_code_value_->setText(lan_code_visible_
+                ? lan_host_code_
+                : QString(std::max<qsizetype>(6, lan_host_code_.size()), QChar(0x2022)));
+        }
+        if (lan_toggle_code_btn_) {
+            lan_toggle_code_btn_->setText(lan_code_visible_ ? QStringLiteral("隐藏验证码") : QStringLiteral("显示验证码"));
+        }
+        if (screens_) {
+            screens_->setVisible(screens_->count() > 1);
+            screens_->setEnabled(!lan_host_controlled_);
+        }
+    }
+
+    updateLocalAddresses();
+    if (local_summary_display_ && screens_) {
+        if (screens_->count() == 0) {
+            local_summary_display_->setText(QStringLiteral("未检测到显示器"));
+        } else if (screens_->count() == 1) {
+            local_summary_display_->setText(screens_->currentText());
+        } else {
+            local_summary_display_->setText(QStringLiteral("%1（共 %2 台）")
+                .arg(screens_->currentText()).arg(screens_->count()));
+        }
+    }
+
+    if (local_nav_btn_) local_nav_btn_->setChecked(viewing_local_);
+}
+
+void AccountWindow::updateLocalAddresses() {
     const auto ips = winText(p2p_lan_local_addresses());
     const auto first_ip = ips.section(QStringLiteral(","), 0, 0).trimmed();
-    unattended_ip_label_->setText(first_ip.isEmpty()
-        ? QStringLiteral("本机 IP：未检测到局域网")
-        : QStringLiteral("本机 IP：%1").arg(first_ip));
-
-    if (lan_host_controlled_) {
-        unattended_pill_->setText(QStringLiteral("● 被控中"));
-        unattended_pill_->setProperty("state", QStringLiteral("busy"));
-    } else {
-        unattended_pill_->setText(QStringLiteral("● 无人值守"));
-        unattended_pill_->setProperty("state", QStringLiteral("online"));
+    const auto address = first_ip.isEmpty() ? QStringLiteral("未检测到局域网") : first_ip;
+    local_summary_ip_->setText(address);
+    if (lan_host_) {
+        const auto other_ips = ips.section(QStringLiteral(","), 1).trimmed();
+        local_ip_value_->setText(address);
+        local_ip_extra_->setText(other_ips.isEmpty()
+            ? QStringLiteral("同网段设备可自动发现或手动输入此地址")
+            : QStringLiteral("其他地址：%1").arg(other_ips));
     }
-    unattended_pill_->style()->unpolish(unattended_pill_);
-    unattended_pill_->style()->polish(unattended_pill_);
-
-    unattended_code_label_->setText(lan_code_visible_
-        ? lan_host_code_ : QString(std::max<qsizetype>(6, lan_host_code_.size()), QChar(0x2022)));
-    unattended_toggle_code_btn_->setText(lan_code_visible_ ? QStringLiteral("隐藏") : QStringLiteral("显示"));
-    screens_->setVisible(screens_->count() > 1);
-    screens_->setEnabled(false);
 }
 
 void AccountWindow::updateDetailView() {
-    if (selected_.kind == SelectionKind::none) {
-        if (right_stack_->currentWidget() == detail_page_) {
-            right_stack_->setCurrentWidget(welcome_page_);
+    if (viewing_local_ || !selected_.valid()) {
+        if (right_stack_ && right_stack_->currentWidget() != local_page_) {
+            right_stack_->setCurrentWidget(local_page_);
         }
         return;
     }
@@ -1465,36 +1668,21 @@ void AccountWindow::updateDetailView() {
     detail_status_pill_->style()->unpolish(detail_status_pill_);
     detail_status_pill_->style()->polish(detail_status_pill_);
 
-    if (selected_.kind == SelectionKind::lan) {
-        const bool has_saved_code = !readLanSecret(QStringLiteral("Peer/") + selected_.id).isEmpty();
-        const QString subtitle = busy
-            ? QStringLiteral("局域网设备正被控制 · %1").arg(selected_.id)
-            : QStringLiteral("局域网直连就绪 · %1").arg(selected_.id);
-        const QString cta = has_saved_code ? QStringLiteral("开始远程控制") : QStringLiteral("输入被控码并连接");
-        hero_widget_->setContent(subtitle, cta, !busy, !busy);
-        strip_btn_1_->setText(QStringLiteral("远程控制"));
-        strip_btn_1_->setEnabled(!busy);
-        strip_btn_2_->setText(QStringLiteral("修改连接参数"));
-        strip_btn_2_->setEnabled(true);
-        strip_btn_3_->setText(QStringLiteral("复制 IP"));
-        strip_btn_3_->setEnabled(true);
-    } else {
-        const bool can_connect = online && !selected_.is_self;
-        QString subtitle = selected_.subtitle;
-        if (selected_.is_self) subtitle += QStringLiteral(" · 本机设备");
-        else if (online) subtitle += QStringLiteral(" · 云端在线，可建立远程控制");
-        else if (busy) subtitle += QStringLiteral(" · 设备正在被控制");
-        else subtitle += QStringLiteral(" · 设备离线");
-        hero_widget_->setContent(subtitle,
-            selected_.is_self ? QStringLiteral("当前为本机") : QStringLiteral("开始远程控制"),
-            can_connect, online || busy);
-        strip_btn_1_->setText(QStringLiteral("远程控制"));
-        strip_btn_1_->setEnabled(can_connect);
-        strip_btn_2_->setText(QStringLiteral("只读诊断"));
-        strip_btn_2_->setEnabled(can_connect);
-        strip_btn_3_->setText(QStringLiteral("移除设备"));
-        strip_btn_3_->setEnabled(request_ == Request::none);
-    }
+    const bool can_connect = online && !selected_.is_self;
+    QString subtitle = selected_.platform;
+    if (selected_.is_self) subtitle += QStringLiteral(" · 本机云端设备");
+    else if (online) subtitle += QStringLiteral(" · 云端在线，可建立远程控制");
+    else if (busy) subtitle += QStringLiteral(" · 设备正在被控制");
+    else subtitle += QStringLiteral(" · 设备离线");
+    hero_widget_->setContent(subtitle,
+        selected_.is_self ? QStringLiteral("当前为本机") : QStringLiteral("开始远程控制"),
+        can_connect, online || busy);
+    strip_btn_1_->setText(QStringLiteral("远程控制"));
+    strip_btn_1_->setEnabled(can_connect);
+    strip_btn_2_->setText(QStringLiteral("只读诊断"));
+    strip_btn_2_->setEnabled(can_connect);
+    strip_btn_3_->setText(QStringLiteral("移除设备"));
+    strip_btn_3_->setEnabled(request_ == Request::none);
 }
 
 void AccountWindow::updateControls() {
@@ -1502,28 +1690,25 @@ void AccountWindow::updateControls() {
     const auto* local = p2p_account_device_id(account_.get());
     const bool signed_in = p2p_account_signed_in(account_.get()) != 0;
     const bool busy = request_ != Request::none;
+    const bool changing_account = busy && request_ != Request::devices;
 
     if (account_btn_) {
         account_btn_->setText(signed_in && active_credentials_
             ? QStringLiteral("%1 ▾").arg(active_credentials_->user)
-            : QStringLiteral("登录账号"));
+            : QStringLiteral("登录账号 ▾"));
     }
     if (cloud_refresh_btn_) {
         cloud_refresh_btn_->setVisible(signed_in);
-        cloud_refresh_btn_->setEnabled(!busy);
+        cloud_refresh_btn_->setEnabled(!changing_account && !add_device_after_refresh_);
     }
-    if (cloud_list_) cloud_list_->setVisible(signed_in);
-    if (cloud_login_sidebar_btn_) cloud_login_sidebar_btn_->setVisible(!signed_in);
-    if (welcome_login_btn_) welcome_login_btn_->setVisible(!signed_in);
-    if (login_page_) login_page_->setEnabled(!busy);
+    if (login_popup_) login_popup_->setEnabled(!busy);
 
     const bool service_active = service_info_.running;
-    if (cloud_host_card_) {
-        cloud_host_card_->setVisible(signed_in && selected_.kind == SelectionKind::cloud);
-    }
+    if (cloud_host_section_) cloud_host_section_->setVisible(signed_in);
+    if (cloud_guest_hint_) cloud_guest_hint_->setVisible(!signed_in);
     if (add_device_) {
         add_device_->setVisible(!local);
-        add_device_->setEnabled(signed_in && !busy);
+        add_device_->setEnabled(signed_in && !changing_account && !add_device_after_refresh_);
     }
     if (receive_) {
         receive_->setVisible(!service_active);
@@ -1533,13 +1718,13 @@ void AccountWindow::updateControls() {
     if (cloud_host_status_) {
         if (service_active) {
             cloud_host_status_->setText(service_info_.status.isEmpty()
-                ? QStringLiteral("[系统服务] 后台已启动") : service_info_.status);
+                ? QStringLiteral("[系统服务] 后台云端接收已启动") : service_info_.status);
         } else if (host_) {
             cloud_host_status_->setText(host_status_text_.isEmpty()
                 ? QStringLiteral("本机云端接收运行中") : host_status_text_);
         } else {
             cloud_host_status_->setText(local ? QStringLiteral("云端接收已暂停")
-                : QStringLiteral("添加本机后可开启云端接收"));
+                : QStringLiteral("尚未将本机添加到云端设备"));
         }
     }
     if (service_button_) {
@@ -1551,16 +1736,16 @@ void AccountWindow::updateControls() {
     if (elevate_button_) elevate_button_->setVisible(!elevated_ && !service_active);
     if (privilege_status_) {
         if (service_active) {
-            privilege_status_->setText(QStringLiteral("SYSTEM 系统服务已托管 · 支持 UAC / 锁屏 / 开机自启"));
+            privilege_status_->setText(QStringLiteral("SYSTEM 系统服务"));
         } else if (elevated_) {
-            privilege_status_->setText(QStringLiteral("管理员权限 · 支持任务管理器"));
+            privilege_status_->setText(QStringLiteral("管理员权限"));
         } else {
-            privilege_status_->setText(QStringLiteral("普通权限 · 如需 UAC / 锁屏支持请启用系统服务"));
+            privilege_status_->setText(QStringLiteral("普通用户权限"));
         }
     }
 
-    if (tray_unattended_) {
-        tray_unattended_->setText(lan_host_ ? QStringLiteral("关闭无人值守") : QStringLiteral("开启无人值守"));
+    if (tray_lan_allow_) {
+        tray_lan_allow_->setText(lan_host_ ? QStringLiteral("关闭局域网连接") : QStringLiteral("允许局域网连接"));
     }
     if (tray_receive_) {
         tray_receive_->setVisible(signed_in);
@@ -1569,11 +1754,11 @@ void AccountWindow::updateControls() {
         tray_receive_->setEnabled(signed_in && !service_active && local);
     }
 
-    updateUnattendedBanner();
+    updateLocalPage();
     updateDetailView();
 }
 
-void AccountWindow::setUnattendedEnabled(bool enabled) {
+void AccountWindow::setLanAllowEnabled(bool enabled) {
     if (enabled) {
         if (!lan_host_) startLanReceiving();
     } else {
@@ -1587,8 +1772,8 @@ void AccountWindow::startLanHostFromCli(const QString& code, std::uint16_t port)
         lan_host_code_ = code;
         saveLanSecret(QStringLiteral("HostAccessCode"), code);
     }
-    const QSignalBlocker b(unattended_switch_);
-    if (unattended_switch_) unattended_switch_->setChecked(true);
+    const QSignalBlocker b(lan_allow_switch_);
+    if (lan_allow_switch_) lan_allow_switch_->setChecked(true);
     startLanReceiving(lan_host_code_, lan_host_port_);
 }
 
@@ -1630,18 +1815,18 @@ void AccountWindow::startLanReceiving(const QString& override_code, std::uint16_
                 if (generation != lan_host_generation_ || !lan_host_) return;
                 lan_host_status_text_ = status;
                 lan_host_controlled_ = desktop_control && state == P2P_STREAMING;
-                updateUnattendedBanner();
+                updateLocalPage();
                 if (state == P2P_STOPPED) {
-                    const QSignalBlocker b(unattended_switch_);
-                    if (unattended_switch_) unattended_switch_->setChecked(false);
+                    const QSignalBlocker b(lan_allow_switch_);
+                    if (lan_allow_switch_) lan_allow_switch_->setChecked(false);
                     stopLanReceiving();
                     setStatus(status);
                 }
             }, Qt::QueuedConnection);
         }, &error);
     if (!session->valid()) {
-        const QSignalBlocker b(unattended_switch_);
-        if (unattended_switch_) unattended_switch_->setChecked(false);
+        const QSignalBlocker b(lan_allow_switch_);
+        if (lan_allow_switch_) lan_allow_switch_->setChecked(false);
         setStatus(error);
         updateControls();
         return;
@@ -1668,18 +1853,18 @@ void AccountWindow::stopLanReceiving() {
     updateControls();
 }
 
-void AccountWindow::editUnattendedCode() {
-    FramelessDialog dialog(QStringLiteral("修改固定被控码"), false, this);
-    dialog.resize(360, 180);
+void AccountWindow::editLanAccessCode() {
+    FramelessDialog dialog(QStringLiteral("修改连接验证码"), false, this);
+    dialog.resize(380, 190);
     auto* form = new QFormLayout;
-    form->setSpacing(10);
+    form->setSpacing(12);
     auto* edit = new QLineEdit(lan_host_code_, &dialog);
     edit->setMaxLength(32);
     edit->setPlaceholderText(QStringLiteral("6–32 位字母或数字"));
-    form->addRow(QStringLiteral("固定被控码"), edit);
+    form->addRow(QStringLiteral("连接验证码"), edit);
     dialog.contentLayout()->addLayout(form);
 
-    auto* hint = new QLabel(QStringLiteral("修改后将立即生效，主控端需使用新被控码连接本机。"), &dialog);
+    auto* hint = new QLabel(QStringLiteral("修改后将立即生效，主控端需使用新验证码连接本机。"), &dialog);
     hint->setObjectName(QStringLiteral("muted"));
     hint->setWordWrap(true);
     dialog.contentLayout()->addWidget(hint);
@@ -1697,7 +1882,7 @@ void AccountWindow::editUnattendedCode() {
     connect(ok, &QPushButton::clicked, &dialog, [&] {
         const auto next = edit->text().trimmed();
         if (next.size() < 6 || next.size() > 32) {
-            QMessageBox::warning(&dialog, QStringLiteral("固定被控码"), QStringLiteral("被控码长度需为 6 至 32 位。"));
+            QMessageBox::warning(&dialog, QStringLiteral("连接验证码"), QStringLiteral("连接验证码长度需为 6 至 32 位。"));
             return;
         }
         lan_host_code_ = next;
@@ -1713,99 +1898,77 @@ void AccountWindow::editUnattendedCode() {
             stopLanReceiving();
             startLanReceiving(lan_host_code_, lan_host_port_);
         }
-        updateUnattendedBanner();
-        setStatus(QStringLiteral("固定被控码已更新。"));
+        updateLocalPage();
+        setStatus(QStringLiteral("连接验证码已更新。"));
     }
 }
 
-void AccountWindow::copyUnattendedInfo() {
+void AccountWindow::copyLanConnectionInfo() {
     const auto ips = winText(p2p_lan_local_addresses());
     const auto first = ips.section(QStringLiteral(","), 0, 0).trimmed();
     QString text;
-    if (!first.isEmpty()) text = QStringLiteral("IP: %1  被控码: %2").arg(first, lan_host_code_);
+    if (!first.isEmpty()) text = QStringLiteral("IP: %1  验证码: %2").arg(first, lan_host_code_);
     else text = lan_host_code_;
     if (auto* cb = QApplication::clipboard()) cb->setText(text);
-    setStatus(QStringLiteral("已复制本机局域网直连信息。"));
+    setStatus(QStringLiteral("已复制本机局域网连接信息。"));
 }
 
-void AccountWindow::refreshLanPeers() {
-    if (!lan_scanner_ || !lan_list_) return;
-    const auto count = p2p_lan_scanner_read(lan_scanner_.get());
-    const QSignalBlocker block(lan_list_);
-    lan_list_->clear();
-
-    if (count == 0) {
-        auto* placeholder = new QListWidgetItem(QStringLiteral("暂未发现局域网设备"), lan_list_);
-        placeholder->setFlags(Qt::NoItemFlags);
-        return;
-    }
-
-    QListWidgetItem* to_select{};
-    for (size_t i = 0; i < count; ++i) {
-        p2p_lan_peer_v1 peer{};
-        if (p2p_lan_scanner_peer(lan_scanner_.get(), i, &peer) != P2P_OK) continue;
-        const auto name = winText(peer.name);
-        const auto addr = winText(peer.address);
-        const auto state = peer.busy ? QStringLiteral("busy") : QStringLiteral("online");
-
-        auto* item = new QListWidgetItem(makeSidebarDeviceIcon(state, true), name, lan_list_);
-        item->setToolTip(QStringLiteral("%1 (%2)").arg(name, addr));
-        item->setData(Qt::UserRole, addr);
-        item->setData(device_name_role, name);
-        item->setData(device_state_role, state);
-        item->setData(lan_port_role, static_cast<int>(peer.port));
-
-        if (selected_.kind == SelectionKind::lan && selected_.id == addr) {
-            to_select = item;
-            selected_.name = name;
-            selected_.state = state;
-            selected_.port = peer.port;
-        }
-    }
-
-    if (to_select) {
-        lan_list_->setCurrentItem(to_select);
-        updateDetailView();
-    } else if (selected_.kind == SelectionKind::none && lan_list_->count() > 0
-               && right_stack_->currentWidget() != login_page_) {
-        auto* first = lan_list_->item(0);
-        lan_list_->setCurrentItem(first);
-        selected_ = {
-            SelectionKind::lan,
-            first->data(Qt::UserRole).toString(),
-            first->data(device_name_role).toString(),
-            first->data(device_state_role).toString(),
-            first->data(Qt::UserRole).toString(),
-            static_cast<std::uint16_t>(first->data(lan_port_role).toInt()),
-            false
-        };
-        right_stack_->setCurrentWidget(detail_page_);
-        updateDetailView();
-    }
-}
-
-void AccountWindow::openLanConnectDialog(const QString& prefill_host, const QString& prefill_name) {
+void AccountWindow::openLanConnectDialog() {
     FramelessDialog dialog(QStringLiteral("局域网直连"), false, this);
-    dialog.resize(390, 232);
+    dialog.resize(450, 420);
 
-    const QString initial_host = !prefill_host.isEmpty()
-        ? prefill_host : QSettings().value(QStringLiteral("lan/lastTarget")).toString();
-    const QString saved_code = !initial_host.isEmpty()
+    std::unique_ptr<p2p_lan_scanner, decltype(&p2p_lan_scanner_destroy)> scanner(
+        p2p_lan_scanner_create(), p2p_lan_scanner_destroy);
+    if (scanner) p2p_lan_scanner_probe(scanner.get());
+
+    // Section 1: Auto-discovered LAN hosts inside the dialog
+    auto* scan_hdr = new QHBoxLayout;
+    auto* scan_title = new QLabel(QStringLiteral("局域网在线设备（自动发现）"), &dialog);
+    scan_title->setObjectName(QStringLiteral("sectionTitle"));
+    scan_hdr->addWidget(scan_title, 1);
+    auto* rescan_btn = new QPushButton(QStringLiteral("↻ 重新扫描"), &dialog);
+    rescan_btn->setObjectName(QStringLiteral("miniGhostBtn"));
+    rescan_btn->setFocusPolicy(Qt::NoFocus);
+    scan_hdr->addWidget(rescan_btn);
+    dialog.contentLayout()->addLayout(scan_hdr);
+
+    auto* peer_card = new QFrame(&dialog);
+    peer_card->setObjectName(QStringLiteral("accountCard"));
+    auto* peer_card_layout = new QVBoxLayout(peer_card);
+    peer_card_layout->setContentsMargins(6, 6, 6, 6);
+    peer_card_layout->setSpacing(0);
+
+    auto* peer_list = new QListWidget(peer_card);
+    peer_list->setObjectName(QStringLiteral("sidebarList"));
+    peer_list->setIconSize(QSize(28, 18));
+    peer_list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    peer_list->setMinimumHeight(130);
+    peer_list->setMaximumHeight(160);
+    peer_card_layout->addWidget(peer_list);
+    dialog.contentLayout()->addWidget(peer_card);
+
+    auto* divider = new QFrame(&dialog);
+    divider->setObjectName(QStringLiteral("divider"));
+    dialog.contentLayout()->addWidget(divider);
+
+    // Section 2: Direct connection parameters
+    const QString initial_host = QSettings().value(QStringLiteral("lan/lastTarget")).toString();
+    const QString initial_code = !initial_host.isEmpty()
         ? readLanSecret(QStringLiteral("Peer/") + initial_host) : QString{};
 
     auto* form = new QFormLayout;
     form->setHorizontalSpacing(14);
-    form->setVerticalSpacing(12);
+    form->setVerticalSpacing(10);
 
     auto* host_edit = new QLineEdit(initial_host, &dialog);
-    host_edit->setPlaceholderText(QStringLiteral("如 192.168.0.32"));
+    host_edit->setPlaceholderText(QStringLiteral("点击上方设备或输入 IP（如 192.168.0.32）"));
     host_edit->setMaxLength(128);
     form->addRow(QStringLiteral("目标 IP 地址"), host_edit);
 
     auto* code_row = new QHBoxLayout;
-    code_row->setSpacing(6);
-    auto* code_edit = new QLineEdit(saved_code, &dialog);
-    code_edit->setPlaceholderText(QStringLiteral("输入远端固定被控码"));
+    code_row->setSpacing(8);
+    auto* code_edit = new QLineEdit(initial_code, &dialog);
+    code_edit->setPlaceholderText(QStringLiteral("输入远端连接验证码"));
     code_edit->setMaxLength(32);
     code_edit->setEchoMode(QLineEdit::Password);
     code_row->addWidget(code_edit, 1);
@@ -1814,14 +1977,13 @@ void AccountWindow::openLanConnectDialog(const QString& prefill_host, const QStr
         code_edit->setEchoMode(checked ? QLineEdit::Normal : QLineEdit::Password);
     });
     code_row->addWidget(show_cb);
-    form->addRow(QStringLiteral("被控码"), code_row);
+    form->addRow(QStringLiteral("连接验证码"), code_row);
 
-    auto* remember_cb = new QCheckBox(QStringLiteral("记住此设备的被控码"), &dialog);
-    remember_cb->setChecked(!saved_code.isEmpty() || true);
+    auto* remember_cb = new QCheckBox(QStringLiteral("记住此设备的连接验证码"), &dialog);
+    remember_cb->setChecked(true);
     form->addRow(QString{}, remember_cb);
 
     dialog.contentLayout()->addLayout(form);
-    dialog.contentLayout()->addStretch(1);
 
     auto* btns = new QHBoxLayout;
     btns->addStretch(1);
@@ -1832,11 +1994,112 @@ void AccountWindow::openLanConnectDialog(const QString& prefill_host, const QStr
     btns->addWidget(go);
     dialog.contentLayout()->addLayout(btns);
 
+    QString chosen_name;
+    QString chosen_addr;
+    std::uint16_t chosen_port{};
+    int scan_ticks{};
+    QStringList last_peer_sig;
+    int last_empty_state = -1;
+    auto populatePeers = [&] {
+        if (!scanner) return;
+        const auto count = p2p_lan_scanner_read(scanner.get());
+        if (count == 0) {
+            const int empty_state = scan_ticks < 2 ? 0 : 1;
+            if (last_empty_state == empty_state) return;
+            last_empty_state = empty_state;
+            last_peer_sig.clear();
+            const QSignalBlocker b(peer_list);
+            peer_list->clear();
+            const auto placeholder = empty_state == 0
+                ? QStringLiteral("正在搜索同网段在线设备…")
+                : QStringLiteral("暂未发现同网段在线设备，可点击「重新扫描」或在下方输入 IP");
+            auto* empty = new QListWidgetItem(placeholder, peer_list);
+            empty->setFlags(Qt::NoItemFlags);
+            return;
+        }
+        struct PeerRow {
+            QString name, addr, state, status_txt;
+            int port;
+        };
+        QVector<PeerRow> rows;
+        rows.reserve(static_cast<qsizetype>(count));
+        QStringList sig;
+        sig.reserve(static_cast<qsizetype>(count));
+        for (size_t i = 0; i < count; ++i) {
+            p2p_lan_peer_v1 peer{};
+            if (p2p_lan_scanner_peer(scanner.get(), i, &peer) != P2P_OK) continue;
+            const auto name = winText(peer.name);
+            const auto addr = winText(peer.address);
+            const auto state = peer.busy ? QStringLiteral("busy") : QStringLiteral("online");
+            const auto status_txt = peer.busy ? QStringLiteral("控制中") : QStringLiteral("在线");
+            rows.push_back({name, addr, state, status_txt, static_cast<int>(peer.port)});
+            sig.push_back(QStringLiteral("%1|%2|%3|%4").arg(addr, name).arg(peer.port).arg(peer.busy ? 1 : 0));
+        }
+        if (last_empty_state == 2 && sig == last_peer_sig) return;
+        last_empty_state = 2;
+        last_peer_sig = sig;
+
+        const auto prev_addr = peer_list->currentItem() ? peer_list->currentItem()->data(Qt::UserRole).toString() : QString{};
+        const QSignalBlocker b(peer_list);
+        peer_list->clear();
+        for (const auto& row : rows) {
+            auto* item = new QListWidgetItem(makeSidebarDeviceIcon(row.state, true),
+                QStringLiteral("%1   ·   %2   (%3)").arg(row.name, row.addr, row.status_txt), peer_list);
+            item->setData(Qt::UserRole, row.addr);
+            item->setData(device_name_role, row.name);
+            item->setData(lan_port_role, row.port);
+            if (row.addr == prev_addr) peer_list->setCurrentItem(item);
+        }
+    };
+
+    QTimer scan_timer(&dialog);
+    scan_timer.setInterval(800);
+    connect(&scan_timer, &QTimer::timeout, &dialog, [&] {
+        ++scan_ticks;
+        populatePeers();
+    });
+    connect(rescan_btn, &QPushButton::clicked, &dialog, [&] {
+        scan_ticks = 0;
+        if (scanner) p2p_lan_scanner_probe(scanner.get());
+        populatePeers();
+    });
+    populatePeers();
+    scan_timer.start();
+
+    connect(peer_list, &QListWidget::itemClicked, &dialog, [&](QListWidgetItem* item) {
+        if (!item || !(item->flags() & Qt::ItemIsSelectable)) return;
+        const auto addr = item->data(Qt::UserRole).toString();
+        chosen_addr = addr;
+        chosen_name = item->data(device_name_role).toString();
+        chosen_port = static_cast<std::uint16_t>(item->data(lan_port_role).toInt());
+        host_edit->setText(addr);
+        const auto saved = readLanSecret(QStringLiteral("Peer/") + addr);
+        if (!saved.isEmpty()) code_edit->setText(saved);
+        else code_edit->clear();
+        code_edit->setFocus();
+    });
+    connect(peer_list, &QListWidget::itemDoubleClicked, &dialog, [&](QListWidgetItem* item) {
+        if (!item || !(item->flags() & Qt::ItemIsSelectable)) return;
+        const auto addr = item->data(Qt::UserRole).toString();
+        chosen_addr = addr;
+        chosen_name = item->data(device_name_role).toString();
+        chosen_port = static_cast<std::uint16_t>(item->data(lan_port_role).toInt());
+        host_edit->setText(addr);
+        const auto saved = readLanSecret(QStringLiteral("Peer/") + addr);
+        if (!saved.isEmpty()) {
+            code_edit->setText(saved);
+            go->click();
+        } else {
+            code_edit->clear();
+            code_edit->setFocus();
+        }
+    });
+
     connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
     connect(host_edit, &QLineEdit::returnPressed, code_edit, qOverload<>(&QLineEdit::setFocus));
 
     LanConnectOptions result;
-    QString display_name = prefill_name;
+    QString display_name;
     connect(go, &QPushButton::clicked, &dialog, [&] {
         const auto raw = host_edit->text().trimmed();
         const auto code = code_edit->text();
@@ -1846,12 +2109,12 @@ void AccountWindow::openLanConnectDialog(const QString& prefill_host, const QStr
             return;
         }
         if (code.size() < 6 || code.size() > 32) {
-            QMessageBox::warning(&dialog, QStringLiteral("局域网直连"), QStringLiteral("请输入 6 至 32 位被控码。"));
+            QMessageBox::warning(&dialog, QStringLiteral("局域网直连"), QStringLiteral("请输入 6 至 32 位连接验证码。"));
             code_edit->setFocus();
             return;
         }
         QString host = raw;
-        std::uint16_t port = P2P_LAN_DEFAULT_PORT;
+        std::uint16_t port = (host == chosen_addr && chosen_port) ? chosen_port : P2P_LAN_DEFAULT_PORT;
         const int colon = raw.lastIndexOf(QLatin1Char(':'));
         if (colon > 0 && raw.indexOf(QLatin1Char(':')) == colon) {
             bool ok = false;
@@ -1869,7 +2132,7 @@ void AccountWindow::openLanConnectDialog(const QString& prefill_host, const QStr
         else deleteLanSecret(QStringLiteral("Peer/") + host);
 
         result = {host.toStdWString(), port, code.toStdWString()};
-        if (display_name.isEmpty()) display_name = host;
+        display_name = (!chosen_name.isEmpty() && host == chosen_addr) ? chosen_name : host;
         dialog.accept();
     });
     connect(code_edit, &QLineEdit::returnPressed, go, &QPushButton::click);
@@ -1884,22 +2147,9 @@ void AccountWindow::openLanConnectDialog(const QString& prefill_host, const QStr
 }
 
 void AccountWindow::connectSelectedDevice(bool diagnostics) {
-    if (selected_.kind == SelectionKind::lan) {
-        const auto saved_code = readLanSecret(QStringLiteral("Peer/") + selected_.id);
-        if (saved_code.size() >= 6 && saved_code.size() <= 32) {
-            LanConnectOptions lan{selected_.id.toStdWString(),
-                selected_.port ? selected_.port : static_cast<std::uint16_t>(P2P_LAN_DEFAULT_PORT),
-                saved_code.toStdWString()};
-            if (!viewer_) viewer_ = new RemoteWindow(this);
-            viewer_->openLanSession(lan, selected_.name, options_);
-        } else {
-            openLanConnectDialog(selected_.id, selected_.name);
-        }
-    } else if (selected_.kind == SelectionKind::cloud) {
-        if (selected_.state != QStringLiteral("online") || selected_.is_self) return;
-        if (!viewer_) viewer_ = new RemoteWindow(this);
-        viewer_->openSession(account_.get(), selected_.id, selected_.name, options_, diagnostics);
-    }
+    if (!selected_.valid() || selected_.state != QStringLiteral("online") || selected_.is_self) return;
+    if (!viewer_) viewer_ = new RemoteWindow(this);
+    viewer_->openSession(account_.get(), selected_.id, selected_.name, options_, diagnostics);
 }
 
 void AccountWindow::loadCredentials() {
@@ -1920,13 +2170,27 @@ void AccountWindow::signIn(bool create) {
     const auto user = pending_->user.toStdWString();
     if (p2p_account_login(account_.get(), endpoint.c_str(), user.c_str(), pending_->password.c_str(),
         create, options_.compatible_http, options_.relay_only) != P2P_OK) {
-        setStatus(winText(p2p_last_error()));
+        const auto err = winText(p2p_last_error());
+        if (login_popup_status_ && login_popup_ && login_popup_->isVisible()) {
+            login_popup_status_->setText(err);
+            login_popup_status_->show();
+            login_popup_->adjustSize();
+        } else {
+            setStatus(err, true);
+        }
         pending_.reset();
         return;
     }
     password_->clear();
     request_ = Request::login;
-    setStatus(create ? QStringLiteral("正在注册账号…") : QStringLiteral("正在登录…"));
+    const auto msg = create ? QStringLiteral("正在注册账号…") : QStringLiteral("正在登录…");
+    if (login_popup_status_ && login_popup_ && login_popup_->isVisible()) {
+        login_popup_status_->setText(msg);
+        login_popup_status_->show();
+        login_popup_->adjustSize();
+    } else {
+        setStatus(msg);
+    }
     updateControls();
 }
 
@@ -1942,7 +2206,16 @@ void AccountWindow::refresh() {
 }
 
 void AccountWindow::addLocalDevice() {
-    if (request_ != Request::none || !p2p_account_signed_in(account_.get()) || p2p_account_device_id(account_.get())) return;
+    if (!p2p_account_signed_in(account_.get()) || p2p_account_device_id(account_.get())) return;
+    if (request_ == Request::devices) {
+        if (!add_device_after_refresh_) {
+            add_device_after_refresh_ = true;
+            setStatus(QStringLiteral("正在添加本机…"));
+            updateControls();
+        }
+        return;
+    }
+    if (request_ != Request::none) return;
     if (p2p_account_add_local_device(account_.get()) != P2P_OK) {
         setStatus(winText(p2p_last_error()));
         return;
@@ -1953,7 +2226,7 @@ void AccountWindow::addLocalDevice() {
 }
 
 void AccountWindow::removeSelectedDevice() {
-    if (request_ != Request::none || !p2p_account_signed_in(account_.get()) || selected_.kind != SelectionKind::cloud) return;
+    if (request_ != Request::none || !p2p_account_signed_in(account_.get()) || !selected_.valid()) return;
     const auto id = selected_.id.toStdWString();
     const auto name = selected_.name;
     QMessageBox confirm(QMessageBox::Question, QStringLiteral("移除设备"),
@@ -1989,9 +2262,11 @@ void AccountWindow::completeRequest() {
             }
             active_credentials_.emplace(pending_->server, pending_->user, pending_->password, pending_->remember);
             pending_.reset();
+            if (login_popup_status_) login_popup_status_->hide();
+            if (login_popup_) login_popup_->hide();
             refreshServiceStatus();
             if (!service_info_.running && AppSettings::instance().data().auto_receive_on_login) startReceiving();
-            right_stack_->setCurrentWidget(selected_.kind == SelectionKind::none ? welcome_page_ : detail_page_);
+            right_stack_->setCurrentWidget(viewing_local_ || !selected_.valid() ? local_page_ : detail_page_);
             refresh_.start();
             refresh();
         } else if (request == Request::devices || request == Request::add_device || request == Request::remove_device) {
@@ -2015,11 +2290,20 @@ void AccountWindow::completeRequest() {
             refresh_.stop();
             stopReceiving();
             active_credentials_.reset();
-            if (cloud_list_) cloud_list_->clear();
-            if (selected_.kind == SelectionKind::cloud) selected_ = {};
+            selected_ = {};
+            fillDevices();
         }
         pending_.reset();
-        setStatus(error);
+        if (request == Request::login && login_popup_ && login_popup_->isVisible() && login_popup_status_) {
+            login_popup_status_->setText(error);
+            login_popup_status_->show();
+            login_popup_->adjustSize();
+        } else {
+            setStatus(error, true);
+        }
+    }
+    if (request == Request::devices && std::exchange(add_device_after_refresh_, false)) {
+        addLocalDevice();
     }
     updateControls();
 }
@@ -2029,16 +2313,17 @@ void AccountWindow::signOut() {
     refresh_.stop();
     p2p_account_cancel(account_.get());
     request_ = Request::none;
+    add_device_after_refresh_ = false;
     stopReceiving();
     active_credentials_.reset();
     if (p2p_account_logout(account_.get()) != P2P_OK) {
-        setStatus(winText(p2p_last_error()));
+        setStatus(winText(p2p_last_error()), true);
     } else {
         request_ = Request::logout;
         setStatus(QStringLiteral("正在退出账号…"));
     }
-    if (cloud_list_) cloud_list_->clear();
-    if (selected_.kind == SelectionKind::cloud) selected_ = {};
+    selected_ = {};
+    fillDevices();
     loaded_server_.clear();
     loadCredentials();
     updateControls();
@@ -2046,10 +2331,30 @@ void AccountWindow::signOut() {
 
 void AccountWindow::fillDevices() {
     if (!cloud_list_) return;
-    const auto local = winText(p2p_account_device_id(account_.get()));
-    const auto count = p2p_account_device_count(account_.get());
     const QSignalBlocker block(cloud_list_);
     cloud_list_->clear();
+
+    if (!p2p_account_signed_in(account_.get())) {
+        auto* hint = new QListWidgetItem(QStringLiteral("登录后可查看云端设备"), cloud_list_);
+        hint->setFlags(Qt::NoItemFlags);
+        viewing_local_ = true;
+        selected_ = {};
+        if (local_nav_btn_) local_nav_btn_->setChecked(true);
+        right_stack_->setCurrentWidget(local_page_);
+        return;
+    }
+
+    const auto local = winText(p2p_account_device_id(account_.get()));
+    const auto count = p2p_account_device_count(account_.get());
+    if (count == 0) {
+        auto* empty = new QListWidgetItem(QStringLiteral("暂无已绑定设备"), cloud_list_);
+        empty->setFlags(Qt::NoItemFlags);
+        viewing_local_ = true;
+        selected_ = {};
+        if (local_nav_btn_) local_nav_btn_->setChecked(true);
+        right_stack_->setCurrentWidget(local_page_);
+        return;
+    }
 
     QListWidgetItem* to_select{};
     for (size_t i = 0; i < count; ++i) {
@@ -2067,20 +2372,27 @@ void AccountWindow::fillDevices() {
         item->setData(device_state_role, state);
         item->setData(device_name_role, name);
         item->setData(device_platform_role, platform);
-        if (selected_.kind == SelectionKind::cloud && selected_.id == id) {
+        if (!viewing_local_ && selected_.valid() && selected_.id == id) {
             to_select = item;
             selected_.name = name;
             selected_.state = state;
-            selected_.subtitle = platform;
+            selected_.platform = platform;
             selected_.is_self = is_self;
         }
     }
+
     if (to_select) {
         cloud_list_->setCurrentItem(to_select);
+        if (local_nav_btn_) local_nav_btn_->setChecked(false);
+        right_stack_->setCurrentWidget(detail_page_);
         updateDetailView();
-    } else if (selected_.kind == SelectionKind::cloud) {
+    } else {
+        viewing_local_ = true;
         selected_ = {};
-        updateDetailView();
+        cloud_list_->clearSelection();
+        cloud_list_->setCurrentRow(-1);
+        if (local_nav_btn_) local_nav_btn_->setChecked(true);
+        right_stack_->setCurrentWidget(local_page_);
     }
 }
 
@@ -2233,7 +2545,12 @@ void AccountWindow::openAgentAudit() {
     dialog->resize(650, 370);
     const auto count = std::min<qsizetype>(records.size(), 200);
     if (!count) {
-        dialog->contentLayout()->addWidget(new QLabel(QStringLiteral("暂无本机诊断记录。"), dialog));
+        auto* empty = new QLabel(QStringLiteral("暂无本机诊断记录。"), dialog);
+        empty->setObjectName(QStringLiteral("muted"));
+        empty->setAlignment(Qt::AlignCenter);
+        dialog->contentLayout()->addStretch(1);
+        dialog->contentLayout()->addWidget(empty);
+        dialog->contentLayout()->addStretch(1);
     } else {
         auto* table = new QTableWidget(static_cast<int>(count), 5, dialog);
         table->setHorizontalHeaderLabels({QStringLiteral("时间"), QStringLiteral("请求"), QStringLiteral("操作"), QStringLiteral("结果"),
@@ -2270,8 +2587,11 @@ void AccountWindow::refreshServiceStatus() {
     auto status = queryHostServiceInfo();
     if (status.running != service_info_.running || status.installed != service_info_.installed) {
         ++service_status_generation_;
+        service_status_age_.invalidate();
         service_info_ = status;
         updateControls();
+    } else {
+        updateLocalAddresses();
     }
     if (service_info_.running && host_) {
         stopReceiving();
@@ -2281,11 +2601,17 @@ void AccountWindow::refreshServiceStatus() {
     const auto generation = service_status_generation_;
     service_status_thread_ = std::jthread([this, generation, status = std::move(status)]() mutable {
         auto info = queryHostWorkerStatus(std::move(status));
-        QMetaObject::invokeMethod(this, [this, generation, info = std::move(info)] {
+        QMetaObject::invokeMethod(this, [this, generation, info = std::move(info)]() mutable {
             service_status_pending_ = false;
             if (generation != service_status_generation_) return;
-            service_info_ = info;
-            updateControls();
+            if (info.pipe_connected) {
+                service_status_age_.start();
+            } else if (service_status_age_.isValid() && !service_status_age_.hasExpired(service_status_grace_ms)) {
+                return;
+            }
+            const bool status_changed = service_info_.status != info.status;
+            service_info_ = std::move(info);
+            if (status_changed) updateControls();
         }, Qt::QueuedConnection);
     });
 }
@@ -2341,8 +2667,7 @@ void AccountWindow::relaunchAsAdmin() {
 
 void AccountWindow::closeSessions() {
     refresh_.stop();
-    lan_scan_timer_.stop();
-    lan_scanner_.reset();
+    status_clear_timer_.stop();
     delete viewer_.data();
     stopReceiving();
     stopLanReceiving();

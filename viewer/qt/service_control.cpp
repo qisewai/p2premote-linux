@@ -156,6 +156,7 @@ bool relaunchClientElevated(QString* error) {
     sei.cbSize = sizeof(sei);
     sei.lpVerb = L"runas";
     sei.lpFile = exe.c_str();
+    sei.lpParameters = L"--elevated-restart";
     sei.nShow = SW_SHOWNORMAL;
     if (!ShellExecuteExW(&sei)) {
         const DWORD err = GetLastError();

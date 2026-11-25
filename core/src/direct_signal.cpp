@@ -28,7 +28,7 @@ using namespace winrt::Windows::Data::Json;
 constexpr std::size_t kMaxFrameBytes = 256 * 1024;
 constexpr unsigned kMaxAuthFailures = 5;
 constexpr ULONGLONG kLockoutDurationMs = 60'000;
-constexpr ULONGLONG kPeerExpiryMs = 7'000;
+constexpr ULONGLONG kPeerExpiryMs = 10'000;
 constexpr ULONGLONG kBeaconIntervalMs = 2'500;
 
 struct WinsockGuard {
@@ -835,11 +835,11 @@ void LanDiscoveryScanner::Probe() {
 }
 
 std::vector<LanPeer> LanDiscoveryScanner::Snapshot() const {
-    const auto now = GetTickCount64();
     const std::lock_guard lock(mutex_);
+    const auto now = GetTickCount64();
     std::vector<LanPeer> active;
     for (const auto& peer : peers_) {
-        if (now - peer.last_seen_ms <= kPeerExpiryMs) active.push_back(peer);
+        if (now <= peer.last_seen_ms || now - peer.last_seen_ms <= kPeerExpiryMs) active.push_back(peer);
     }
     std::ranges::sort(active, [](const LanPeer& a, const LanPeer& b) {
         if (a.name != b.name) return a.name < b.name;
@@ -881,12 +881,13 @@ void LanDiscoveryScanner::Run(std::stop_token stop, std::uint16_t discovery_port
 
         WSAPOLLFD fd{sock.Get(), POLLIN, 0};
         if (WSAPoll(&fd, 1, 50) > 0 && (fd.revents & POLLIN)) {
-            char buf[512]{};
-            sockaddr_in from{};
-            int from_len = sizeof(from);
-            const int n = recvfrom(sock.Get(), buf, sizeof(buf) - 1, 0,
-                reinterpret_cast<sockaddr*>(&from), &from_len);
-            if (n > 0) {
+            for (;;) {
+                char buf[512]{};
+                sockaddr_in from{};
+                int from_len = sizeof(from);
+                const int n = recvfrom(sock.Get(), buf, sizeof(buf) - 1, 0,
+                    reinterpret_cast<sockaddr*>(&from), &from_len);
+                if (n <= 0) break;
                 try {
                     const auto json = JsonObject::Parse(winrt::to_hstring(std::string_view(buf, static_cast<std::size_t>(n))));
                     if (json.HasKey(L"p2p_lan_host")) {
@@ -924,8 +925,11 @@ void LanDiscoveryScanner::Run(std::stop_token stop, std::uint16_t discovery_port
             }
         }
 
+        const auto purge_now = GetTickCount64();
         const std::lock_guard lock(mutex_);
-        std::erase_if(peers_, [now](const LanPeer& item) { return now - item.last_seen_ms > kPeerExpiryMs; });
+        std::erase_if(peers_, [purge_now](const LanPeer& item) {
+            return purge_now > item.last_seen_ms && (purge_now - item.last_seen_ms) > kPeerExpiryMs;
+        });
     }
 }
 

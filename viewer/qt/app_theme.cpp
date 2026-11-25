@@ -1,11 +1,117 @@
 #include "app_theme.h"
 
 #include <QApplication>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
+#include <QProxyStyle>
+#include <QStyleFactory>
+#include <QStyleOption>
 
 namespace {
 
 ThemePalette g_current_palette;
+
+class AppProxyStyle final : public QProxyStyle {
+public:
+    explicit AppProxyStyle(QStyle* base) : QProxyStyle(base) {}
+
+    void drawPrimitive(PrimitiveElement element, const QStyleOption* option,
+        QPainter* painter, const QWidget* widget) const override {
+        const auto& theme = g_current_palette;
+        if (element == PE_IndicatorCheckBox && option && painter) {
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing, true);
+
+            const QRectF r = QRectF(option->rect).adjusted(0.5, 0.5, -0.5, -0.5);
+            const bool enabled = (option->state & State_Enabled) != 0;
+            const bool hovered = enabled && ((option->state & State_MouseOver) != 0);
+            const bool checked = (option->state & State_On) != 0;
+            const bool partial = (option->state & State_NoChange) != 0;
+
+            QColor bg(theme.input_bg);
+            QColor border(hovered ? theme.accent : theme.border_strong);
+            if (!enabled) {
+                bg = QColor(theme.surface_alt);
+                border = QColor(theme.border);
+            } else if (checked || partial) {
+                bg = QColor(hovered ? theme.accent_hover : theme.accent);
+                border = bg;
+            }
+
+            painter->setPen(QPen(border, 1.2));
+            painter->setBrush(bg);
+            painter->drawRoundedRect(r, 4.0, 4.0);
+
+            if (checked) {
+                QPen tick(enabled ? QColor(theme.accent_text) : QColor(theme.text_muted),
+                    2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+                painter->setPen(tick);
+                painter->setBrush(Qt::NoBrush);
+                QPainterPath path;
+                path.moveTo(r.left() + r.width() * 0.24, r.top() + r.height() * 0.52);
+                path.lineTo(r.left() + r.width() * 0.43, r.top() + r.height() * 0.72);
+                path.lineTo(r.left() + r.width() * 0.77, r.top() + r.height() * 0.30);
+                painter->drawPath(path);
+            } else if (partial) {
+                QPen dash(enabled ? QColor(theme.accent_text) : QColor(theme.text_muted),
+                    2.0, Qt::SolidLine, Qt::RoundCap);
+                painter->setPen(dash);
+                painter->drawLine(QPointF(r.left() + r.width() * 0.26, r.center().y()),
+                    QPointF(r.right() - r.width() * 0.26, r.center().y()));
+            }
+            painter->restore();
+            return;
+        }
+        if (element == PE_IndicatorMenuCheckMark && option && painter) {
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            const QRectF r = option->rect;
+            const QColor color((option->state & State_Enabled) ? theme.accent : theme.text_muted);
+            painter->setPen(QPen(color, 1.9, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            QPainterPath path;
+            path.moveTo(r.center().x() - 4.2, r.center().y() + 0.2);
+            path.lineTo(r.center().x() - 1.2, r.center().y() + 3.2);
+            path.lineTo(r.center().x() + 4.5, r.center().y() - 3.2);
+            painter->drawPath(path);
+            painter->restore();
+            return;
+        }
+        if ((element == PE_IndicatorArrowDown || element == PE_IndicatorArrowRight) && option && painter) {
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            const QPointF c = QRectF(option->rect).center();
+            const QColor color((option->state & State_Enabled) ? theme.text_secondary : theme.text_muted);
+            painter->setPen(QPen(color, 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            QPainterPath path;
+            if (element == PE_IndicatorArrowDown) {
+                path.moveTo(c.x() - 3.5, c.y() - 1.5);
+                path.lineTo(c.x(), c.y() + 2.0);
+                path.lineTo(c.x() + 3.5, c.y() - 1.5);
+            } else {
+                path.moveTo(c.x() - 1.5, c.y() - 3.5);
+                path.lineTo(c.x() + 2.0, c.y());
+                path.lineTo(c.x() - 1.5, c.y() + 3.5);
+            }
+            painter->drawPath(path);
+            painter->restore();
+            return;
+        }
+        if (element == PE_FrameFocusRect && option && painter) {
+            // Suppress legacy dotted focus rectangles on checkboxes/buttons/lists.
+            if (widget && (widget->inherits("QCheckBox") || widget->inherits("QAbstractButton")
+                    || widget->inherits("QAbstractItemView"))) {
+                return;
+            }
+        }
+        QProxyStyle::drawPrimitive(element, option, painter, widget);
+    }
+
+    int pixelMetric(PixelMetric metric, const QStyleOption* option, const QWidget* widget) const override {
+        if (metric == PM_IndicatorWidth || metric == PM_IndicatorHeight) return 17;
+        return QProxyStyle::pixelMetric(metric, option, widget);
+    }
+};
 
 struct AccentTokens {
     const char* main;
@@ -173,6 +279,15 @@ QPushButton#titleBtn:hover, QPushButton#titleToolBtn:hover {
     background: %SURF_HOVER%;
     color: %TEXT%;
 }
+QPushButton#titleToolBtn[menuOpen="true"] {
+    background: %ACCENT_SOFT%;
+    color: %TEXT%;
+}
+QFrame#accountPopup {
+    background: %SURFACE%;
+    border: 1px solid %BORDER_STRONG%;
+    border-radius: 10px;
+}
 QPushButton#titleCloseBtn:hover {
     background: %DANGER%;
     color: #ffffff;
@@ -258,20 +373,6 @@ QCheckBox {
     color: %TEXT%;
     spacing: 8px;
 }
-QCheckBox::indicator {
-    width: 17px;
-    height: 17px;
-    border-radius: 4px;
-    border: 1px solid %BORDER_STRONG%;
-    background: %INPUT_BG%;
-}
-QCheckBox::indicator:hover {
-    border-color: %ACCENT%;
-}
-QCheckBox::indicator:checked {
-    background: %ACCENT%;
-    border-color: %ACCENT%;
-}
 QPushButton {
     background: %SURFACE_ALT%;
     color: %TEXT%;
@@ -280,8 +381,11 @@ QPushButton {
     padding: 5px 14px;
     min-height: 22px;
 }
-QPushButton:hover, QPushButton:focus {
+QPushButton:hover {
     background: %SURF_HOVER%;
+    border-color: %BORDER_STRONG%;
+}
+QPushButton:focus {
     border-color: %BORDER_STRONG%;
 }
 QPushButton:pressed {
@@ -298,9 +402,11 @@ QPushButton#primary, QPushButton[variant="primary"] {
     border-color: %ACCENT%;
     font-weight: 600;
 }
-QPushButton#primary:hover, QPushButton#primary:focus,
-QPushButton[variant="primary"]:hover, QPushButton[variant="primary"]:focus {
+QPushButton#primary:hover, QPushButton[variant="primary"]:hover {
     background: %ACCENT_HOVER%;
+    border-color: %ACCENT_HOVER%;
+}
+QPushButton#primary:focus, QPushButton[variant="primary"]:focus {
     border-color: %ACCENT_HOVER%;
 }
 QPushButton#primary:pressed, QPushButton[variant="primary"]:pressed {
@@ -380,24 +486,29 @@ QListWidget#settingsNav::item:disabled {
     padding: 10px 12px 4px 12px;
     background: transparent;
 }
-QTreeWidget {
+QTreeWidget, QTableWidget, QTableView {
     background: %SURFACE%;
     color: %TEXT%;
     border: 1px solid %BORDER%;
     border-radius: 8px;
+    gridline-color: %BORDER%;
     outline: 0;
     alternate-background-color: %SURFACE_ALT%;
 }
-QTreeWidget::item {
+QTreeWidget::item, QTableWidget::item, QTableView::item {
     padding: 4px 6px;
     min-height: 24px;
 }
-QTreeWidget::item:hover {
+QTreeWidget::item:hover, QTableWidget::item:hover, QTableView::item:hover {
     background: %SURF_HOVER%;
 }
-QTreeWidget::item:selected {
+QTreeWidget::item:selected, QTableWidget::item:selected, QTableView::item:selected {
     background: %ACCENT_SOFT%;
     color: %TEXT%;
+}
+QTableCornerButton::section {
+    background: %SURFACE_ALT%;
+    border: 0;
 }
 QHeaderView::section {
     background: %SURFACE_ALT%;
@@ -502,6 +613,8 @@ QPushButton#controlCenterBtn[micLive="true"] {
     color: %TEXT%;
     border-color: %DANGER%;
 }
+)");
+    qss += QStringLiteral(R"(
 QFrame#titleSeparator {
     background: %BORDER%;
     min-width: 1px;
@@ -583,16 +696,30 @@ QPushButton#sidebarActionBtn:hover, QPushButton#sidebarFooterBtn:hover {
 QPushButton#sidebarActionBtn:pressed, QPushButton#sidebarFooterBtn:pressed {
     background: %SURF_PRESS%;
 }
-QFrame#unattendedBanner {
+QPushButton#sidebarNavItem {
+    background: transparent;
+    color: %TEXT_SEC%;
+    border: 0;
+    border-radius: 8px;
+    padding: 8px 10px;
+    text-align: left;
+    min-height: 22px;
+    font-size: %FONT%px;
+}
+QPushButton#sidebarNavItem:hover {
+    background: %SURF_HOVER%;
+    color: %TEXT%;
+}
+QPushButton#sidebarNavItem:checked {
     background: %ACCENT_SOFT%;
-    border: 1px solid %ACCENT%;
-    border-radius: 10px;
+    color: %TEXT%;
+    font-weight: 600;
 }
 QLabel#statusPill {
     background: %SURFACE_ALT%;
     color: %TEXT%;
-    border-radius: 11px;
-    padding: 3px 10px;
+    border-radius: 12px;
+    padding: 4px 11px;
     font-size: 12px;
     font-weight: 600;
 }
@@ -610,8 +737,57 @@ QLabel#statusPill[state="offline"] {
 }
 QLabel#deviceTitle {
     color: %TEXT%;
-    font-size: 20px;
+    font-size: 22px;
     font-weight: 700;
+}
+QLabel#cardTitle {
+    color: %TEXT%;
+    font-size: 16px;
+    font-weight: 600;
+}
+QLabel#selfTag {
+    background: %ACCENT_SOFT%;
+    color: %ACCENT%;
+    border-radius: 5px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QFrame#localLanCard {
+    background: %SURFACE%;
+    border: 1px solid %BORDER%;
+    border-radius: 12px;
+}
+QFrame#localLanCard[active="true"] {
+    border-color: %BORDER_STRONG%;
+}
+QFrame#metricTile {
+    background: %SURFACE_ALT%;
+    border: 1px solid %BORDER%;
+    border-radius: 10px;
+}
+QLabel#metricLabel {
+    color: %TEXT_MUTED%;
+    font-size: 12px;
+    font-weight: 500;
+}
+QLabel#ipDisplay {
+    color: %TEXT%;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 21px;
+    font-weight: 700;
+}
+QLabel#codeDisplay {
+    color: %TEXT%;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 23px;
+    font-weight: 700;
+    letter-spacing: 3px;
+}
+QLabel#summaryValue {
+    color: %TEXT%;
+    font-size: 13px;
+    font-weight: 600;
 }
 QFrame#heroContainer {
     background: %SURFACE%;
@@ -837,6 +1013,13 @@ QMessageBox {
 void AppTheme::apply(const AppSettingsData& settings) {
     g_current_palette = paletteFor(settings);
     if (!qApp) return;
+
+    static bool style_installed = false;
+    if (!style_installed) {
+        style_installed = true;
+        auto* base = QStyleFactory::create(QStringLiteral("Fusion"));
+        qApp->setStyle(new AppProxyStyle(base));
+    }
 
     QPalette pal;
     pal.setColor(QPalette::Window, QColor(g_current_palette.bg));

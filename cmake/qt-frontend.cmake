@@ -34,6 +34,7 @@ add_executable(p2premote_qt WIN32
     viewer/connection_overlay.cpp
     viewer/qt/service_control.cpp
     viewer/qt/service_control.h
+    viewer/qt/single_instance.cpp
     viewer/qt/settings_dialog.cpp
     viewer/qt/settings_dialog.h
     viewer/qt/stream_driver.cpp
