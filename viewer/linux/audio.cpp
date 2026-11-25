@@ -1,21 +1,22 @@
 #include "audio.h"
-
-#include <QtEndian>
+#include "audio_buffer.h"
 
 #include <pulse/pulseaudio.h>
 
 #include <algorithm>
-#include <array>
-#include <cstring>
+#include <atomic>
+#include <cstdint>
 
 namespace {
 
-constexpr qsizetype frame_bytes = 960;
+constexpr qsizetype frame_bytes = static_cast<qsizetype>(PcmRingBuffer::frame_samples * sizeof(std::int16_t));
 constexpr pa_sample_spec sample_spec{PA_SAMPLE_S16LE, 48'000, 1};
 constexpr auto default_value = static_cast<uint32_t>(-1);
 
 void closeStream(pa_stream*& stream) {
     if (!stream) return;
+    pa_stream_set_write_callback(stream, nullptr, nullptr);
+    pa_stream_set_read_callback(stream, nullptr, nullptr);
     pa_stream_disconnect(stream);
     pa_stream_unref(stream);
     stream = nullptr;
@@ -57,12 +58,29 @@ struct ViewerAudio::Impl {
 
     void syncStreams() {
         if (pa_context_get_state(context) != PA_CONTEXT_READY) return;
-        if (!speaker) closeStream(playback);
-        else if (!playback) {
+        if (!speaker) {
+            closeStream(playback);
+            playback_ring.clear();
+        } else if (!playback) {
             playback = pa_stream_new(context, "Remote desktop audio", &sample_spec, nullptr);
-            const pa_buffer_attr attributes{frame_bytes * 8, frame_bytes * 4, frame_bytes * 2, frame_bytes, default_value};
-            if (playback && pa_stream_connect_playback(playback, nullptr, &attributes, PA_STREAM_ADJUST_LATENCY, nullptr, nullptr) < 0) {
-                closeStream(playback);
+            if (playback) {
+                pa_stream_set_write_callback(playback, [](pa_stream* stream, size_t nbytes, void* ctx) {
+                    static_cast<Impl*>(ctx)->writePlayback(stream, nbytes);
+                }, this);
+                // Let PipeWire/PulseAudio keep the sink's native quantum (critical for Bluetooth)
+                // while pulling continuously from the jitter-absorbing ring buffer.
+                const pa_buffer_attr attributes{
+                    static_cast<uint32_t>(frame_bytes * 16), // maxlength: 160 ms
+                    static_cast<uint32_t>(frame_bytes * 6),  // tlength: 60 ms
+                    default_value,                            // prebuf: default (= tlength)
+                    static_cast<uint32_t>(frame_bytes * 2),  // minreq: 20 ms
+                    default_value
+                };
+                if (pa_stream_connect_playback(playback, nullptr, &attributes,
+                        static_cast<pa_stream_flags_t>(PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_AUTO_TIMING_UPDATE),
+                        nullptr, nullptr) < 0) {
+                    closeStream(playback);
+                }
             }
         }
         if (!microphone) {
@@ -74,10 +92,25 @@ struct ViewerAudio::Impl {
             pa_stream_set_read_callback(recording, [](pa_stream* stream, size_t, void* ctx) {
                 static_cast<Impl*>(ctx)->record(stream);
             }, this);
-            const pa_buffer_attr attributes{frame_bytes * 8, default_value, default_value, default_value, frame_bytes};
+            const pa_buffer_attr attributes{static_cast<uint32_t>(frame_bytes * 8), default_value, default_value,
+                default_value, static_cast<uint32_t>(frame_bytes)};
             if (pa_stream_connect_record(recording, nullptr, &attributes, PA_STREAM_ADJUST_LATENCY) < 0) {
                 closeStream(recording);
             }
+        }
+    }
+
+    void writePlayback(pa_stream* stream, size_t nbytes) {
+        size_t remaining = nbytes - (nbytes % sizeof(std::int16_t));
+        const float vol = gain.load(std::memory_order_relaxed);
+        while (remaining >= sizeof(std::int16_t)) {
+            void* dst{};
+            size_t chunk = remaining;
+            if (pa_stream_begin_write(stream, &dst, &chunk) < 0 || !dst || chunk < sizeof(std::int16_t)) break;
+            chunk -= chunk % sizeof(std::int16_t);
+            playback_ring.pop(static_cast<std::int16_t*>(dst), chunk / sizeof(std::int16_t), vol);
+            if (pa_stream_write(stream, dst, chunk, nullptr, 0, PA_SEEK_RELATIVE) < 0) break;
+            remaining -= chunk;
         }
     }
 
@@ -87,9 +120,9 @@ struct ViewerAudio::Impl {
             size_t available{};
             if (pa_stream_peek(stream, &source, &available) < 0 || available == 0) break;
             // Skip stale chunks when the audio server has been suspended.
-            const auto count = std::min<size_t>(available, frame_bytes * 4);
-            if (source) recorded.append(static_cast<const char*>(source) + available - count, count);
-            else recorded.append(QByteArray(count, '\0'));
+            const auto count = std::min<size_t>(available, static_cast<size_t>(frame_bytes * 4));
+            if (source) recorded.append(static_cast<const char*>(source) + available - count, static_cast<qsizetype>(count));
+            else recorded.append(QByteArray(static_cast<qsizetype>(count), '\0'));
             pa_stream_drop(stream);
             while (recorded.size() >= frame_bytes) {
                 input(recorded.first(frame_bytes));
@@ -100,11 +133,13 @@ struct ViewerAudio::Impl {
 
     Input input;
     QByteArray recorded;
+    PcmRingBuffer playback_ring;
     pa_threaded_mainloop* loop{};
     pa_context* context{};
     pa_stream* playback{};
     pa_stream* recording{};
-    float gain{1.0f};
+    std::atomic<float> gain{1.0f};
+    std::atomic<bool> speaker_enabled{false};
     bool running{}, speaker{}, microphone{};
 };
 
@@ -112,26 +147,17 @@ ViewerAudio::ViewerAudio(Input input) : impl_(std::make_unique<Impl>(std::move(i
 ViewerAudio::~ViewerAudio() = default;
 
 void ViewerAudio::configure(bool speaker, bool mic, float volume) {
+    impl_->gain.store(std::clamp(volume, 0.0f, 1.0f), std::memory_order_relaxed);
+    impl_->speaker_enabled.store(speaker, std::memory_order_release);
     if (!impl_->running) return;
     const PulseLock lock(impl_->loop);
     impl_->speaker = speaker;
     impl_->microphone = mic;
-    impl_->gain = std::clamp(volume, 0.0f, 1.0f);
     impl_->syncStreams();
 }
 
-void ViewerAudio::play(QByteArray pcm) {
-    if (!impl_->running || pcm.size() % sizeof(qint16)) return;
-    const PulseLock lock(impl_->loop);
-    const auto stream = impl_->playback;
-    if (!stream || pa_stream_get_state(stream) != PA_STREAM_READY) return;
-    const auto available = pa_stream_writable_size(stream);
-    if (available == static_cast<size_t>(-1) || available < static_cast<size_t>(pcm.size())) return;
-    if (impl_->gain < 1.0f) {
-        for (qsizetype offset = 0; offset < pcm.size(); offset += sizeof(qint16)) {
-            const auto sample = qFromLittleEndian<qint16>(pcm.constData() + offset);
-            qToLittleEndian(static_cast<qint16>(sample * impl_->gain), pcm.data() + offset);
-        }
-    }
-    pa_stream_write(stream, pcm.constData(), pcm.size(), nullptr, 0, PA_SEEK_RELATIVE);
+void ViewerAudio::play(const char* pcm, std::size_t size) {
+    if (!pcm || size < sizeof(std::int16_t) || (size % sizeof(std::int16_t)) != 0) return;
+    if (!impl_->speaker_enabled.load(std::memory_order_acquire)) return;
+    impl_->playback_ring.push(reinterpret_cast<const std::int16_t*>(pcm), size / sizeof(std::int16_t));
 }

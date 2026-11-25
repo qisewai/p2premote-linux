@@ -344,6 +344,7 @@ void main() {
             painter.fillRect(rect(), QColor("#111827"));
             painter.setPen(QColor("#cbd5e1"));
             painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("等待被控端画面"));
+            paintOverlays(painter, rect());
             return;
         }
         const auto area = videoRect();

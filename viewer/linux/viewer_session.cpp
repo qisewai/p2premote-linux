@@ -20,8 +20,8 @@
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
-#include <chrono>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string_view>
 #include <utility>
@@ -207,7 +207,13 @@ void ViewerSession::stop(const QString& status) {
     ++generation_;
     timeout_.stop();
     plugin_timer_.stop();
-    sound_.reset();
+    std::shared_ptr<ViewerAudio> old_sound;
+    {
+        const std::lock_guard lock(sound_mutex_);
+        sound_generation_ = 0;
+        old_sound = std::exchange(sound_, {});
+    }
+    old_sound.reset();
     if (plugins_) plugins_->Stop();
     plugins_.reset();
     overlay_plugins_.reset();
@@ -464,8 +470,7 @@ void ViewerSession::connectionChanged(ConnectionStatus status, const char*, size
         if (generation != session.generation_) return;
         if (status == Connected && session.state_ == State::negotiation) {
             session.transport_ready_ = true;
-            if (session.diagnostics_ || session.metrics_.presented) session.startStreaming();
-            else if (session.statusChanged) session.statusChanged(QStringLiteral("已建立媒体通道，等待被控端画面…"));
+            session.startStreaming();
         } else if (status == Closed || status == Failed || status == Disconnected ||
                    status == IncorrectPassword || status == NoSuchTransmissionId || status == RemoteUnavailable) {
             session.stop(QStringLiteral("媒体连接已断开，可以重新连接。"));
@@ -481,13 +486,18 @@ void ViewerSession::startStreaming() {
         overlay_plugins_ = std::make_unique<p2premote::PluginHost>(false, p2premote::PluginHost::SendFrame{},
             std::filesystem::path{}, p2premote::PluginHost::Notify{}, std::filesystem::path{}, true, overlay_);
         overlay_plugins_->SetConnected(true);
-        sound_ = std::make_unique<ViewerAudio>([this, generation = generation_](QByteArray pcm) {
+        auto created_sound = std::make_shared<ViewerAudio>([this, generation = generation_](QByteArray pcm) {
             QMetaObject::invokeMethod(this, [this, generation, pcm = std::move(pcm)] {
                 if (generation != generation_ || !canControl() || !audio_.mic_enabled) return;
                 const MiniRtcAudioFrame frame{pcm.constData(), static_cast<std::size_t>(pcm.size()), 0};
                 SendAudioFrame(peer_, &frame, microphone_stream);
             }, Qt::QueuedConnection);
         });
+        {
+            const std::lock_guard lock(sound_mutex_);
+            sound_ = std::move(created_sound);
+            sound_generation_ = generation_;
+        }
     }
     if (plugin_channel_) {
         plugins_ = std::make_unique<p2premote::PluginHost>(false, [api = api_, peer = peer_](std::string_view bytes) {
@@ -501,8 +511,13 @@ void ViewerSession::startStreaming() {
     if (canControl()) sendCursorReady();
     tick();
     if (statusChanged) {
-        statusChanged(diagnostics_ ? QStringLiteral("已连接 · 只读诊断") :
-            (control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看")));
+        if (diagnostics_) {
+            statusChanged(QStringLiteral("已连接 · 只读诊断"));
+        } else if (metrics_.presented) {
+            statusChanged(control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看"));
+        } else {
+            statusChanged(QStringLiteral("已建立媒体通道，等待被控端画面…"));
+        }
     }
 }
 
@@ -567,9 +582,12 @@ void ViewerSession::queueFrame(const char* data, int width, int height, std::siz
             ++frame_wait_samples_;
             metrics_.width = frame.width;
             metrics_.height = frame.height;
-            ++metrics_.presented;
+            const bool first_frame = ++metrics_.presented == 1;
             if (frameReceived) frameReceived(frame);
             if (transport_ready_ && state_ == State::negotiation) startStreaming();
+            else if (first_frame && state_ == State::streaming && !diagnostics_ && statusChanged) {
+                statusChanged(control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看"));
+            }
         }
         if (!frame.nv12.isEmpty()) {
             const std::lock_guard lock(frame_mutex_);
@@ -632,10 +650,12 @@ void ViewerSession::receiveAudio(const char* data, size_t size, const char*, siz
     size_t source_size, void* context) {
     if (!data || !source || !size || size > 4096 || std::string_view(source, source_size) != desktop_audio_stream) return;
     auto& peer = *static_cast<PeerContext*>(context);
-    QMetaObject::invokeMethod(&peer.session, [&session = peer.session, generation = peer.generation,
-        bytes = QByteArray(data, size)]() mutable {
-        if (session.generation_ == generation && session.sound_) session.sound_->play(std::move(bytes));
-    }, Qt::QueuedConnection);
+    std::shared_ptr<ViewerAudio> sound;
+    {
+        const std::lock_guard lock(peer.session.sound_mutex_);
+        if (peer.session.sound_generation_ == peer.generation) sound = peer.session.sound_;
+    }
+    if (sound) sound->play(data, size);
 }
 
 void ViewerSession::processData(QByteArray data, const QByteArray& label) {
@@ -645,7 +665,9 @@ void ViewerSession::processData(QByteArray data, const QByteArray& label) {
         if (const auto packet = p2premote::DecodeInput(bytes); packet && packet->kind == InputKind::video_settings_reply &&
             packet->sequence == video_request_) {
             confirmed_bitrate_ = p2premote::VideoSettingsBitrate(*packet);
+            const bool newly_acknowledged = !video_acknowledged_;
             video_acknowledged_ = true;
+            if (newly_acknowledged) sendAudioSettings();
         }
     } else if (label == cursor_stream && !diagnostics_ && control_allowed_) {
         if (auto cursor = decodeRemoteCursor({data.constData(), static_cast<std::size_t>(data.size())})) {
@@ -758,11 +780,11 @@ void ViewerSession::tick() {
     const auto wait_sum = std::exchange(frame_wait_sum_ms_, 0.0);
     if (wait_samples > 0) metrics_.frame_wait_ms = wait_sum / static_cast<double>(wait_samples);
     if (!notice_.isEmpty() && notice_age_.elapsed() >= 3500) notice_.clear();
-    if (isViewable() && !video_acknowledged_ && video_attempts_ < 3 &&
+    if (isViewable() && !video_acknowledged_ && video_attempts_ < 12 &&
         video_retry_.isValid() && video_retry_.hasExpired(1000)) {
         sendVideoSettings();
     }
-    if (canControl() && !cursor_separate_ && cursor_attempts_ < 3 &&
+    if (canControl() && !cursor_separate_ && cursor_attempts_ < 12 &&
         cursor_retry_.isValid() && cursor_retry_.hasExpired(1000)) {
         sendCursorReady();
     }

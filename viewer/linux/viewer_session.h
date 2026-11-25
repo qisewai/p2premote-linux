@@ -134,7 +134,9 @@ private:
     std::uint32_t video_request_{};
     std::uint32_t confirmed_bitrate_{};
     p2p_audio_options_v1 audio_{};
-    std::unique_ptr<ViewerAudio> sound_;
+    std::mutex sound_mutex_;
+    std::shared_ptr<ViewerAudio> sound_;
+    std::uint64_t sound_generation_{};
     std::bitset<4> sent_buttons_;
     std::optional<p2premote::InputPacket> drag_checkpoint_;
 

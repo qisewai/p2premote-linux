@@ -75,7 +75,14 @@ std::optional<INPUT> DesktopInput::BuildMove(const InputPacket& input) {
         MONITORINFO info{sizeof(info)};
         const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        if (!GetMonitorInfoW(monitor_, &info) || width <= 0 || height <= 0) {
+        if ((!monitor_ || !GetMonitorInfoW(monitor_, &info))) {
+            monitor_ = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+            if (!monitor_ || !GetMonitorInfoW(monitor_, &info)) {
+                metrics_.valid = false;
+                return std::nullopt;
+            }
+        }
+        if (width <= 0 || height <= 0) {
             metrics_.valid = false;
             return std::nullopt;
         }

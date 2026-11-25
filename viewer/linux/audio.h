@@ -2,17 +2,19 @@
 
 #include <QByteArray>
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 
-class ViewerAudio {
+class ViewerAudio final {
 public:
     using Input = std::function<void(QByteArray)>;
 
     explicit ViewerAudio(Input input);
     ~ViewerAudio();
-    void configure(bool speaker, bool mic, float volume);
-    void play(QByteArray pcm);
+
+    void configure(bool speaker, bool microphone, float volume);
+    void play(const char* pcm, std::size_t size);
 
 private:
     struct Impl;

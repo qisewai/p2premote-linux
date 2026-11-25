@@ -62,6 +62,13 @@ constexpr VideoLimits LimitsFor(StreamQuality quality) {
     return {1920, 1080};
 }
 
+HMONITOR ResolveValidMonitor(HMONITOR monitor) noexcept {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (monitor && GetMonitorInfoW(monitor, &info)) return monitor;
+    return MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
 bool NeedsCaptureRateLimit(HMONITOR monitor, unsigned target_fps) {
     MONITORINFOEXW info{};
     info.cbSize = sizeof(info);
@@ -470,6 +477,15 @@ struct StreamSession::Impl {
     bool StartBestCapture(ActiveStream& stream, bool capture_cursor, bool prefer_dxgi) noexcept {
         stream.dxgi_probe.reset();
         SyncThreadToInputDesktop(attached_desktop, desktop_name);
+        if (const auto resolved = ResolveValidMonitor(stream.monitor); resolved && resolved != stream.monitor) {
+            stream.monitor = resolved;
+            capture_item = nullptr;
+            capture_monitor = nullptr;
+            if (stats.target_fps) {
+                stream.capture_interval = NeedsCaptureRateLimit(stream.monitor, stats.target_fps)
+                    ? QpcFrequency() / stats.target_fps : 0;
+            }
+        }
         const bool secure = IsSecureDesktopName(desktop_name);
         if (prefer_dxgi || secure) {
             if (TryStartDxgi(stream, capture_cursor)) return true;
@@ -584,11 +600,11 @@ void StreamSession::Open(HMONITOR monitor, HWND surface, StreamFrameRate frame_r
         : std::make_shared<LatencyTrace>(connection.latency_trace_dir, impl_->host);
     auto active = std::make_unique<ActiveStream>(std::move(trace));
     active->diagnostics = !impl_->host && connection.diagnostics;
-    active->monitor = monitor;
+    active->monitor = impl_->host ? ResolveValidMonitor(monitor) : monitor;
     active->surface = surface;
     active->dynamic_cadence = impl_->host && connection.DynamicCadenceEnabled();
     const auto target_fps = static_cast<unsigned>(frame_rate);
-    active->capture_interval = impl_->host && NeedsCaptureRateLimit(monitor, target_fps) ? QpcFrequency() / target_fps : 0;
+    active->capture_interval = impl_->host && NeedsCaptureRateLimit(active->monitor, target_fps) ? QpcFrequency() / target_fps : 0;
     const auto target = !impl_->host ? winrt::to_string(connection.remote_device) : std::string{};
     if (connection.lan_direct) {
         if (impl_->host) {
@@ -797,6 +813,11 @@ void StreamSession::Resize(bool drawable) noexcept {
 void StreamSession::DisplayChanged() noexcept {
     impl_->capture_item = nullptr;
     impl_->capture_monitor = nullptr;
+    if (impl_->host && impl_->active) {
+        if (const auto resolved = ResolveValidMonitor(impl_->active->monitor)) {
+            impl_->active->monitor = resolved;
+        }
+    }
 }
 
 HANDLE StreamSession::Event() const noexcept {

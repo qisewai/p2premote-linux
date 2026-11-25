@@ -1,7 +1,96 @@
-diff -ruN a/src/ice/ice_agent.cpp b/src/ice/ice_agent.cpp
---- a/src/ice/ice_agent.cpp	2026-11-25 19:36:46.291499696 +0800
-+++ b/src/ice/ice_agent.cpp	2026-11-25 19:36:46.356940443 +0800
-@@ -286,7 +286,9 @@
+diff --git a/src/ice/ice_agent.cpp b/src/ice/ice_agent.cpp
+index e4d1dda..8319446 100644
+--- a/src/ice/ice_agent.cpp
++++ b/src/ice/ice_agent.cpp
+@@ -7,6 +7,15 @@
+ #include <utility>
+ #include <vector>
+ 
++#if defined(__linux__) && !defined(__ANDROID__)
++#include <arpa/inet.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <cstring>
++#include <set>
++#endif
++
+ #include "ice_server_resolver.h"
+ #include "ice_utils.h"
+ #include "log.h"
+@@ -56,6 +65,71 @@ bool IsTurnForced(TurnMode mode) {
+   return mode == TurnMode::TurnForceUdp || mode == TurnMode::TurnForceTcp;
+ }
+ 
++#if defined(__linux__) && !defined(__ANDROID__)
++bool IsVirtualLinuxInterface(const char* name) {
++  if (!name || !*name) return true;
++  static constexpr const char* kPrefixes[] = {
++      "docker", "br-", "veth", "vmnet", "virbr", "vboxnet",
++      "cni", "flannel", "kube", "podman", "lxc", "lxd", "incus"};
++  for (const char* prefix : kPrefixes) {
++    if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) return true;
++  }
++  return false;
++}
++
++void RegisterFilteredLinuxLocalAddresses(NiceAgent* agent) {
++  ifaddrs* ifas = nullptr;
++  if (getifaddrs(&ifas) != 0 || !ifas) return;
++
++  std::vector<NiceAddress> addresses;
++  std::set<std::string> seen;
++  for (ifaddrs* ifa = ifas; ifa != nullptr; ifa = ifa->ifa_next) {
++    if (!ifa->ifa_addr) continue;
++    if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK) != 0) {
++      continue;
++    }
++    if (IsVirtualLinuxInterface(ifa->ifa_name)) continue;
++
++    const int family = ifa->ifa_addr->sa_family;
++    char text[INET6_ADDRSTRLEN] = {};
++    if (family == AF_INET) {
++      const auto* sin = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
++      const uint32_t ip = ntohl(sin->sin_addr.s_addr);
++      if ((ip & 0xff000000u) == 0x7f000000u) continue;
++      if ((ip & 0xffff0000u) == 0xa9fe0000u) continue;
++      if ((ip & 0xfffe0000u) == 0xc6120000u) continue;
++      if (!inet_ntop(AF_INET, &sin->sin_addr, text, sizeof(text))) continue;
++    } else if (family == AF_INET6) {
++      const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(ifa->ifa_addr);
++      if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) ||
++          IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr) ||
++          IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr) ||
++          IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr)) {
++        continue;
++      }
++      if (!inet_ntop(AF_INET6, &sin6->sin6_addr, text, sizeof(text))) continue;
++    } else {
++      continue;
++    }
++
++    if (!seen.insert(text).second) continue;
++    NiceAddress nice_addr;
++    nice_address_init(&nice_addr);
++    nice_address_set_from_sockaddr(&nice_addr, ifa->ifa_addr);
++    nice_address_set_port(&nice_addr, 0);
++    addresses.push_back(nice_addr);
++  }
++  freeifaddrs(ifas);
++
++  if (addresses.empty()) return;
++  size_t added = 0;
++  for (auto& addr : addresses) {
++    if (nice_agent_add_local_address(agent, &addr)) ++added;
++  }
++  LOG_INFO("ICE filtered local Linux addresses [{}]", added);
++}
++#endif
++
+ }  // namespace
+ 
+ auto log_openssl_errors = []() {
+@@ -286,7 +360,9 @@ int IceAgent::CreateIceAgent(nice_cb_state_changed_t on_state_changed,
      LOG_DEBUG("ICE UPnP mapping disabled in mobile builds");
  #else
      // Enable port mapping unless the caller explicitly requires relay-only ICE.
@@ -12,9 +101,20 @@ diff -ruN a/src/ice/ice_agent.cpp b/src/ice/ice_agent.cpp
      g_object_set(agent, "upnp", enable_upnp,
                   "upnp-timeout", 3000u, nullptr);
      LOG_DEBUG("ICE UPnP mapping [{}], discovery timeout 3000 ms",
-diff -ruN a/src/media/video/decode/video_decoder_factory.cpp b/src/media/video/decode/video_decoder_factory.cpp
---- a/src/media/video/decode/video_decoder_factory.cpp	2026-11-25 19:36:46.329036739 +0800
-+++ b/src/media/video/decode/video_decoder_factory.cpp	2026-11-25 19:36:46.357662629 +0800
+@@ -302,6 +378,9 @@ int IceAgent::CreateIceAgent(nice_cb_state_changed_t on_state_changed,
+     g_signal_connect(agent, "component-state-changed",
+                      G_CALLBACK(&IceAgent::OnNiceStateChangedStatic), this);
+ 
++#if defined(__linux__) && !defined(__ANDROID__)
++    RegisterFilteredLinuxLocalAddresses(agent);
++#endif
+     stream_id_ = nice_agent_add_stream(agent, n_components_);
+     if (stream_id_ == 0) {
+       LOG_ERROR("Failed to add stream");
+diff --git a/src/media/video/decode/video_decoder_factory.cpp b/src/media/video/decode/video_decoder_factory.cpp
+index 1d16008..b918bec 100644
+--- a/src/media/video/decode/video_decoder_factory.cpp
++++ b/src/media/video/decode/video_decoder_factory.cpp
 @@ -29,6 +29,10 @@
  #include "log.h"
  
@@ -26,22 +126,23 @@ diff -ruN a/src/media/video/decode/video_decoder_factory.cpp b/src/media/video/d
  
  VideoDecoderFactory::VideoDecoderFactory() {}
  
-@@ -85,6 +89,11 @@
+@@ -84,6 +88,11 @@ VideoDecoderFactory::CreateVideoDecoder(std::shared_ptr<SystemClock> clock,
+       CheckIsHardwareAccelerationSupported(VideoCodecType::H264)) {
      return std::make_unique<NvidiaVideoDecoder>(clock, native_video_output);
    }
- #endif
++#endif
 +#if defined(__linux__) && !defined(__ANDROID__)
 +  if (auto linux_decoder = CreateLinuxH264Decoder(clock, hardware_acceleration)) {
 +    return linux_decoder;
 +  }
-+#endif
+ #endif
    return std::make_unique<OpenH264Decoder>(clock, native_video_output);
  #endif
- }
-diff -ruN a/src/pc/minirtc_connection.cpp b/src/pc/minirtc_connection.cpp
---- a/src/pc/minirtc_connection.cpp	2026-11-25 19:36:46.322957225 +0800
-+++ b/src/pc/minirtc_connection.cpp	2026-11-25 19:36:46.357515497 +0800
-@@ -46,6 +46,10 @@
+diff --git a/src/pc/minirtc_connection.cpp b/src/pc/minirtc_connection.cpp
+index 5be2c1d..087e424 100644
+--- a/src/pc/minirtc_connection.cpp
++++ b/src/pc/minirtc_connection.cpp
+@@ -46,6 +46,10 @@ int MiniRtcConnection::Init() {
        // b_force_i_frame_ = true;
        LOG_INFO("Ice connected");
      } else if ("ready" == ice_status) {
@@ -52,10 +153,11 @@ diff -ruN a/src/pc/minirtc_connection.cpp b/src/pc/minirtc_connection.cpp
        is_ice_transport_ready_ = true;
        b_force_i_frame_ = true;
        LOG_INFO("Ice ready");
-diff -ruN a/src/transport/ice_component_state.h b/src/transport/ice_component_state.h
---- a/src/transport/ice_component_state.h	2026-11-25 19:36:46.301539378 +0800
-+++ b/src/transport/ice_component_state.h	2026-11-25 19:36:46.357125493 +0800
-@@ -26,6 +26,12 @@
+diff --git a/src/transport/ice_component_state.h b/src/transport/ice_component_state.h
+index 55af772..2a95218 100644
+--- a/src/transport/ice_component_state.h
++++ b/src/transport/ice_component_state.h
+@@ -26,6 +26,12 @@ enum class IcePathAvailabilityChange {
  // availability semantics.
  class IceComponentStateTracker {
   public:
@@ -68,10 +170,11 @@ diff -ruN a/src/transport/ice_component_state.h b/src/transport/ice_component_st
    IcePathAvailabilityChange Update(NiceComponentState state) noexcept {
      switch (state) {
        case NICE_COMPONENT_STATE_READY:
-diff -ruN a/src/transport/ice_transport.cpp b/src/transport/ice_transport.cpp
---- a/src/transport/ice_transport.cpp	2026-11-25 19:36:46.313642953 +0800
-+++ b/src/transport/ice_transport.cpp	2026-11-25 19:36:46.357360101 +0800
-@@ -595,6 +595,20 @@
+diff --git a/src/transport/ice_transport.cpp b/src/transport/ice_transport.cpp
+index d15edd1..4b337ae 100644
+--- a/src/transport/ice_transport.cpp
++++ b/src/transport/ice_transport.cpp
+@@ -595,6 +595,20 @@ void IceTransport::OnDtlsHandshakeDone(gpointer user_ptr) {
      if (ice_transport_controller_) {
        ice_transport_controller_->OnDtlsHandshakeDone(user_ptr);
      }
@@ -92,3 +195,17 @@ diff -ruN a/src/transport/ice_transport.cpp b/src/transport/ice_transport.cpp
    }
  }
  
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+index d151b7f..a44255a 100644
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -3077,7 +3077,8 @@ int IceTransportController::CreateCodecs(std::shared_ptr<SystemClock> clock,
+     ret = CreateStreamCodecs(clock, false, VideoCodecType::AV1);
+ #endif
+   } else if (rtp::PAYLOAD_TYPE::H264 == video_pt) {
+-#if defined(__APPLE__) || defined(__ANDROID__)
++#if defined(__APPLE__) || defined(__ANDROID__) || \
++    (defined(__linux__) && !USE_CUDA)
+     ret = CreateStreamCodecs(clock, hardware_acceleration_,
+                              VideoCodecType::H264);
+ #elif USE_CUDA && !defined(__aarch64__) && !defined(__arm__)
