@@ -1,7 +1,9 @@
 #pragma once
 
 #include "cloud_connection.h"
+#include "cursor_shape.h"
 #include "managed_api.h"
+#include "video_surface.h"
 
 #include <p2premote/core_api.h>
 #include <p2premote/input_protocol.h>
@@ -9,7 +11,6 @@
 
 #include <QByteArray>
 #include <QElapsedTimer>
-#include <QImage>
 #include <QObject>
 #include <QTcpSocket>
 #include <QTimer>
@@ -52,7 +53,8 @@ public:
     std::uint32_t confirmedBitrate() const { return confirmed_bitrate_; }
 
     std::function<void(const QString&)> statusChanged;
-    std::function<void(QImage)> frameReceived;
+    std::function<void(VideoFrame&)> frameReceived;
+    std::function<void(DecodedCursor)> cursorChanged;
 
 private:
     enum class State { idle, challenge, authentication, approval, negotiation, streaming };
@@ -74,9 +76,10 @@ private:
     bool sendReliable(std::string_view data, const char* channel);
     void processPluginActions();
     void applyMediaSettings();
+    void sendCursorReady();
     void sendVideoSettings();
     void sendAudioSettings();
-    void queueFrame(QImage image, std::uint64_t generation);
+    void queueFrame(const char* data, int width, int height, std::size_t size, std::uint64_t generation);
     void stop(const QString& status);
 
     static void sendSignal(const char* data, size_t size, void* context) noexcept;
@@ -117,9 +120,12 @@ private:
     QElapsedTimer notice_age_;
     QElapsedTimer workspace_retry_;
     QElapsedTimer video_retry_;
+    QElapsedTimer cursor_retry_;
     int ice_path_{};
     QByteArray ice_protocol_;
     bool srtp_active_{};
+    bool cursor_separate_{};
+    int cursor_attempts_{};
     int requested_quality_{P2P_1080P};
     int requested_bitrate_{P2P_AUTOMATIC};
     int active_bitrate_{P2P_AUTOMATIC};
@@ -133,7 +139,11 @@ private:
     std::optional<p2premote::InputPacket> drag_checkpoint_;
 
     std::mutex frame_mutex_;
-    QImage pending_frame_;
+    VideoFrame pending_frame_;
+    VideoFrame recycled_frame_;
     std::uint64_t pending_frame_generation_{};
+    std::uint64_t pending_frame_ms_{};
     bool frame_update_pending_{};
+    double frame_wait_sum_ms_{};
+    std::uint64_t frame_wait_samples_{};
 };

@@ -7,7 +7,16 @@ revision=f5b53e920db0713b456e23af6a0fe9907d94a612
 source_dir="${XDG_CACHE_HOME:-$HOME/.cache}/p2premote/minirtc-${revision:0:7}-linux"
 prefix="${P2PREMOTE_LINUX_MINIRTC_DIR:-$HOME/.local/share/p2premote/minirtc}"
 xmake="${XMAKE_BIN:-xmake}"
-patch="$tools_dir/ExternalSignaling.patch"
+patches=(
+    "$tools_dir/ExternalSignaling.patch"
+    "$tools_dir/ManagedStats.patch"
+    "$tools_dir/LowLatency.patch"
+    "$tools_dir/DesktopVideoQuality.patch"
+    "$tools_dir/DesktopIdleResume.patch"
+    "$tools_dir/RecoveredPacketOrdering.patch"
+    "$tools_dir/TrafficStats.patch"
+    "$tools_dir/LinuxFastIce.patch"
+)
 
 mkdir -p -- "$source_dir" "$prefix/include" "$prefix/lib"
 if [[ ! -d "$source_dir/.git" ]]; then
@@ -26,9 +35,10 @@ if [[ $(git -C "$source_dir" rev-parse HEAD) != "$revision" ]]; then
     printf 'MiniRTC source directory must be at %s: %s\n' "$revision" "$source_dir" >&2
     exit 1
 fi
-if ! git -C "$source_dir" apply --reverse --check "$patch" 2>/dev/null; then
-    git -C "$source_dir" apply "$patch"
-fi
+git -C "$source_dir" checkout -- .
+for patch in "${patches[@]}"; do
+    git -C "$source_dir" apply --ignore-whitespace "$patch"
+done
 
 recipe="$source_dir/xmake.lua"
 if ! grep -Fq 'P2PREMOTE_LINUX_MINIRTC_TARGET' "$recipe"; then
@@ -43,7 +53,7 @@ export P2PREMOTE_LINUX_MINIRTC_TARGET="$tools_dir/linux-target.lua"
 export P2PREMOTE_LINUX_MINIRTC_OUTPUT="$source_dir/build/p2premote"
 library="$P2PREMOTE_LINUX_MINIRTC_OUTPUT/libp2premote_minirtc.so"
 export_list="$P2PREMOTE_LINUX_MINIRTC_OUTPUT/exports.sha256"
-fingerprint=$(sha256sum "$tools_dir/linux-exports.map" "$P2PREMOTE_LINUX_MINIRTC_TARGET")
+fingerprint=$(sha256sum "$tools_dir/linux-exports.map" "$tools_dir/linux_h264.h" "$tools_dir/linux_h264.cpp" "$P2PREMOTE_LINUX_MINIRTC_TARGET" "${patches[@]}")
 if [[ ! -f "$export_list" ]] || [[ $(<"$export_list") != "$fingerprint" ]]; then
     rm -f -- "$library"
 fi

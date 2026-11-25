@@ -22,8 +22,11 @@ struct p2p_stream {
 
     explicit p2p_stream(QWidget* widget) : video(widget) {
         if (video) attachVideoSession(video, &session);
-        session.frameReceived = [this](QImage frame) {
-            if (video) setVideoFrame(video, std::move(frame));
+        session.frameReceived = [this](VideoFrame& frame) {
+            if (video) setVideoFrame(video, frame);
+        };
+        session.cursorChanged = [this](DecodedCursor cursor) {
+            if (video) setVideoCursor(video, std::move(cursor));
         };
         session.statusChanged = [this](const QString& text) {
             status = text.toStdWString();
@@ -33,6 +36,7 @@ struct p2p_stream {
 
     ~p2p_stream() {
         if (video) attachVideoSession(video, nullptr);
+        session.cursorChanged = {};
         session.statusChanged = {};
         session.close();
     }

@@ -1,4 +1,4 @@
-find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets Network WebSockets)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets Network WebSockets OpenGLWidgets)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LINUX_LUA REQUIRED IMPORTED_TARGET lua5.4)
@@ -35,6 +35,7 @@ add_executable(p2premote_linux_viewer
     viewer/linux/account.cpp
     viewer/linux/audio.cpp
     viewer/linux/credentials.cpp
+    viewer/linux/cursor_shape.cpp
     viewer/linux/lan_discovery.cpp
     viewer/linux/plugin_platform.cpp
     viewer/linux/single_instance.cpp
@@ -51,7 +52,7 @@ target_include_directories(p2premote_linux_viewer PRIVATE
     proto/include core/include core/src tools/minirtc_probe viewer/linux)
 target_include_directories(p2premote_linux_viewer SYSTEM PRIVATE
     "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
-target_link_libraries(p2premote_linux_viewer PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets OpenSSL::Crypto
+target_link_libraries(p2premote_linux_viewer PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets OpenSSL::Crypto
     PkgConfig::LINUX_LUA PkgConfig::LINUX_SECRET PkgConfig::LINUX_PULSE ghostty-vt::ghostty-vt
     "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}")
 
@@ -76,3 +77,10 @@ target_compile_features(terminal_widget_test PRIVATE cxx_std_20)
 target_link_libraries(terminal_widget_test PRIVATE Qt6::Widgets ghostty-vt::ghostty-vt)
 add_test(NAME terminal_widget_test COMMAND terminal_widget_test)
 set_tests_properties(terminal_widget_test PROPERTIES TIMEOUT 10 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(linux_cursor_shape_test viewer/linux/cursor_shape_test.cpp viewer/linux/cursor_shape.cpp)
+target_compile_features(linux_cursor_shape_test PRIVATE cxx_std_20)
+target_compile_options(linux_cursor_shape_test PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(linux_cursor_shape_test PRIVATE Qt6::Gui)
+add_test(NAME linux_cursor_shape_test COMMAND linux_cursor_shape_test)
+set_tests_properties(linux_cursor_shape_test PROPERTIES TIMEOUT 10)

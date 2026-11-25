@@ -17,7 +17,6 @@
 #include <QSslConfiguration>
 #include <QtEndian>
 
-#include <libyuv.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
@@ -235,6 +234,9 @@ void ViewerSession::stop(const QString& status) {
     video_acknowledged_ = false;
     video_attempts_ = 0;
     video_retry_.invalidate();
+    cursor_separate_ = false;
+    cursor_attempts_ = 0;
+    cursor_retry_.invalidate();
     active_bitrate_ = requested_bitrate_;
     notice_.clear();
     ice_path_ = P2P_ICE_UNKNOWN;
@@ -248,6 +250,10 @@ void ViewerSession::stop(const QString& status) {
     {
         const std::lock_guard lock(frame_mutex_);
         pending_frame_ = {};
+        recycled_frame_ = {};
+        pending_frame_ms_ = 0;
+        frame_wait_sum_ms_ = 0;
+        frame_wait_samples_ = 0;
     }
     if (statusChanged) statusChanged(status);
 }
@@ -367,6 +373,7 @@ bool ViewerSession::startPeer() {
     params.user_data = context_.get();
     params.turn_mode = cloud_ ? turnPolicy(*cloud_) : TurnDisabled;
     params.enable_srtp = true;
+    params.hardware_acceleration = true;
     p2premote::ConfigureMiniRtcDesktopVideo(params, 60);
     params.on_signal_status = [](SignalStatus, const char*, size_t, void*) {};
     params.on_connection_status = connectionChanged;
@@ -491,6 +498,7 @@ void ViewerSession::startStreaming() {
         plugin_timer_.start();
     }
     applyMediaSettings();
+    if (canControl()) sendCursorReady();
     tick();
     if (statusChanged) {
         statusChanged(diagnostics_ ? QStringLiteral("已连接 · 只读诊断") :
@@ -507,39 +515,65 @@ void ViewerSession::receiveVideo(const MiniRtcVideoFrame* frame, const char*, si
     const auto width = static_cast<int>(frame->width);
     const auto height = static_cast<int>(frame->height);
     const auto luma = static_cast<std::size_t>(width) * height;
-    if (!frame->data || frame->size < luma + luma / 2) return;
-    const auto* source = reinterpret_cast<const std::uint8_t*>(frame->data);
-    QImage image(width, height, QImage::Format_ARGB32);
-    if (image.isNull() ||
-        libyuv::NV12ToARGBMatrix(source, width, source + luma, width, image.bits(), image.bytesPerLine(),
-            &libyuv::kYuvH709Constants, width, height) != 0) return;
+    const auto nv12_size = luma + luma / 2;
+    if (!frame->data || frame->size < nv12_size) return;
 
     auto& peer = *static_cast<PeerContext*>(context);
-    peer.session.queueFrame(std::move(image), peer.generation);
+    peer.session.queueFrame(frame->data, width, height, nv12_size, peer.generation);
 }
 
-void ViewerSession::queueFrame(QImage image, std::uint64_t generation) {
+void ViewerSession::queueFrame(const char* data, int width, int height, std::size_t size, std::uint64_t generation) {
+    VideoFrame buffer;
     {
         const std::lock_guard lock(frame_mutex_);
-        pending_frame_ = std::move(image);
-        pending_frame_generation_ = generation;
-        if (std::exchange(frame_update_pending_, true)) return;
+        buffer = std::exchange(recycled_frame_, {});
     }
+    if (buffer.nv12.size() != static_cast<qsizetype>(size)) {
+        buffer.nv12.resize(static_cast<qsizetype>(size));
+    }
+    std::memcpy(buffer.nv12.data(), data, size);
+    buffer.width = width;
+    buffer.height = height;
+
+    const auto arrived_ms = monotonicMilliseconds();
+    bool notify{};
+    {
+        const std::lock_guard lock(frame_mutex_);
+        if (!pending_frame_.nv12.isEmpty() && recycled_frame_.nv12.isEmpty()) {
+            recycled_frame_ = std::move(pending_frame_);
+        }
+        pending_frame_ = std::move(buffer);
+        pending_frame_generation_ = generation;
+        pending_frame_ms_ = arrived_ms;
+        notify = !std::exchange(frame_update_pending_, true);
+    }
+    if (!notify) return;
+
     QMetaObject::invokeMethod(this, [this] {
-        QImage frame;
+        VideoFrame frame;
         std::uint64_t generation;
+        std::uint64_t arrived_ms{};
         {
             const std::lock_guard lock(frame_mutex_);
             frame_update_pending_ = false;
             frame = std::exchange(pending_frame_, {});
             generation = pending_frame_generation_;
+            arrived_ms = pending_frame_ms_;
         }
-        if (generation == generation_ && !frame.isNull()) {
-            metrics_.width = frame.width();
-            metrics_.height = frame.height();
+        if (generation == generation_ && frame.width > 0 && frame.height > 0 && !frame.nv12.isEmpty()) {
+            const auto now_ms = monotonicMilliseconds();
+            const double wait_ms = now_ms >= arrived_ms ? static_cast<double>(now_ms - arrived_ms) : 0.0;
+            frame_wait_sum_ms_ += wait_ms;
+            ++frame_wait_samples_;
+            metrics_.width = frame.width;
+            metrics_.height = frame.height;
             ++metrics_.presented;
-            if (frameReceived) frameReceived(std::move(frame));
+            if (frameReceived) frameReceived(frame);
             if (transport_ready_ && state_ == State::negotiation) startStreaming();
+        }
+        if (!frame.nv12.isEmpty()) {
+            const std::lock_guard lock(frame_mutex_);
+            if (recycled_frame_.nv12.isEmpty()) recycled_frame_ = std::move(frame);
         }
     }, Qt::QueuedConnection);
 }
@@ -585,7 +619,8 @@ void ViewerSession::receiveData(const char* data, size_t size, const char*, size
     if (!data || !source || size > max_frame_bytes || source_size > 32) return;
     auto& peer = *static_cast<PeerContext*>(context);
     const QByteArray label(source, source_size);
-    if (label != control_stream && label != plugin_stream) return;
+    if (label != control_stream && label != plugin_stream && label != cursor_stream) return;
+    if (label == cursor_stream && size > linux_cursor_max_packet) return;
     QMetaObject::invokeMethod(&peer.session, [&session = peer.session, generation = peer.generation,
         bytes = QByteArray(data, size), label] {
         if (session.generation_ != generation) return;
@@ -612,6 +647,11 @@ void ViewerSession::processData(QByteArray data, const QByteArray& label) {
             confirmed_bitrate_ = p2premote::VideoSettingsBitrate(*packet);
             video_acknowledged_ = true;
         }
+    } else if (label == cursor_stream && !diagnostics_ && control_allowed_) {
+        if (auto cursor = decodeRemoteCursor({data.constData(), static_cast<std::size_t>(data.size())})) {
+            cursor_separate_ = true;
+            if (cursorChanged) cursorChanged(std::move(*cursor));
+        }
     } else if (label == plugin_stream && plugins_) {
         const std::string_view frame(data.constData(), data.size());
         const auto packet = p2premote::DecodePluginPacket(frame);
@@ -628,20 +668,31 @@ void ViewerSession::reportTraffic(const char*, size_t, TraversalMode route, cons
     const char*, size_t, void* context) {
     if (!stats || route == UnknownMode) return;
     auto& peer = *static_cast<PeerContext*>(context);
+    const auto path = stats->selected_path;
     const auto rtt = stats->rtt_ms;
     const auto srtp = stats->srtp_active;
     const auto loss = stats->video_inbound_stats.loss_rate;
     const auto received = stats->video_inbound_stats.rtp_packet_count;
     const auto download = stats->total_inbound_stats.bitrate;
     const auto upload = stats->total_outbound_stats.bitrate;
-    QMetaObject::invokeMethod(&peer.session, [&session = peer.session, generation = peer.generation, route, rtt, srtp,
+    QMetaObject::invokeMethod(&peer.session, [&session = peer.session, generation = peer.generation, route, path, rtt, srtp,
         loss, received, download, upload] {
         if (session.generation_ != generation) return;
-        const auto ice = route == Relay ? P2P_ICE_RELAY : (session.cloud_ ? P2P_ICE_NAT : P2P_ICE_HOST);
+        using Path = MiniRtcNetTrafficStats::Path;
+        int ice = route == Relay ? P2P_ICE_RELAY : (session.cloud_ ? P2P_ICE_NAT : P2P_ICE_HOST);
+        QByteArray proto;
+        if (path == Path::Relay) {
+            ice = P2P_ICE_RELAY;
+        } else if (path != Path::Unknown) {
+            ice = (path == Path::HostUdp || path == Path::HostTcp) ? P2P_ICE_HOST : P2P_ICE_NAT;
+            proto = (path == Path::HostUdp || path == Path::DirectUdp) ? QByteArrayLiteral("udp") : QByteArrayLiteral("tcp");
+        }
         session.ice_path_ = ice;
+        session.ice_protocol_ = proto;
         session.srtp_active_ = srtp;
         auto& metrics = session.metrics_;
         metrics.route = static_cast<p2premote::IcePath>(ice);
+        metrics.protocol = proto.toStdString();
         metrics.rtt_ms = rtt >= 0 ? std::optional<double>{rtt} : std::nullopt;
         metrics.loss = received ? std::optional<double>{loss} : std::nullopt;
         metrics.download_bps = download;
@@ -668,6 +719,12 @@ void ViewerSession::applyMediaSettings() {
     if (!isViewable()) return;
     sendVideoSettings();
     sendAudioSettings();
+}
+
+void ViewerSession::sendCursorReady() {
+    ++cursor_attempts_;
+    cursor_retry_.start();
+    sendInput(InputKind::cursor_ready);
 }
 
 void ViewerSession::sendVideoSettings() {
@@ -697,10 +754,17 @@ void ViewerSession::sendAudioSettings() {
 void ViewerSession::tick() {
     if (state_ != State::streaming) return;
     metrics_.seconds = connected_since_.elapsed() / 1000.0;
+    const auto wait_samples = std::exchange(frame_wait_samples_, 0);
+    const auto wait_sum = std::exchange(frame_wait_sum_ms_, 0.0);
+    if (wait_samples > 0) metrics_.frame_wait_ms = wait_sum / static_cast<double>(wait_samples);
     if (!notice_.isEmpty() && notice_age_.elapsed() >= 3500) notice_.clear();
     if (isViewable() && !video_acknowledged_ && video_attempts_ < 3 &&
         video_retry_.isValid() && video_retry_.hasExpired(1000)) {
         sendVideoSettings();
+    }
+    if (canControl() && !cursor_separate_ && cursor_attempts_ < 3 &&
+        cursor_retry_.isValid() && cursor_retry_.hasExpired(1000)) {
+        sendCursorReady();
     }
     if (overlay_plugins_) overlay_plugins_->UpdateMetrics(metrics_);
     if (!plugins_) return;

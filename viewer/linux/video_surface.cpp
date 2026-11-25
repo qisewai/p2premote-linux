@@ -1,18 +1,32 @@
 #include "video_surface.h"
 #include "viewer_session.h"
 
+#include <QCursor>
+#include <QElapsedTimer>
 #include <QFocusEvent>
+#include <QFontDatabase>
 #include <QGuiApplication>
+#include <QImage>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QOpenGLBuffer>
+#include <QOpenGLContext>
+#include <QOpenGLFunctions>
+#include <QOpenGLShaderProgram>
+#include <QOpenGLVertexArrayObject>
+#include <QOpenGLWidget>
 #include <QPainter>
+#include <QPixmap>
+#include <QTimer>
 #include <QWheelEvent>
-#include <QFontDatabase>
-#include <QWidget>
+
+#include <libyuv.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include <linux/input-event-codes.h>
@@ -21,6 +35,9 @@ namespace {
 
 using p2premote::InputButton;
 using p2premote::InputKind;
+
+constexpr qint64 mouse_move_min_interval_ms = 4;
+constexpr int drag_tail_delay_ms = 24;
 
 std::uint16_t windowsScanCode(const QKeyEvent& event, bool xkb) {
     // The Windows host uses SendInput with KEYEVENTF_SCANCODE. Bit 8 marks extended keys.
@@ -136,24 +153,66 @@ std::uint16_t pointerButton(Qt::MouseButton button) {
     }
 }
 
-class VideoSurface final : public QWidget {
+class VideoSurface final : public QOpenGLWidget, protected QOpenGLFunctions {
 public:
     VideoSurface(std::function<void()> fullscreen, QWidget* parent)
-        : QWidget(parent), fullscreen_(std::move(fullscreen)),
+        : QOpenGLWidget(parent), fullscreen_(std::move(fullscreen)),
           xkb_(QGuiApplication::platformName().startsWith("wayland") || QGuiApplication::platformName() == "xcb") {
+        auto fmt = format();
+        fmt.setSwapInterval(0);
+        setFormat(fmt);
         setFocusPolicy(Qt::StrongFocus);
         setMouseTracking(true);
         setObjectName(QStringLiteral("video"));
         heartbeat_.setInterval(p2premote::input_heartbeat_ms);
-        connect(&heartbeat_, &QTimer::timeout, this, [this] { session_->sendInput(InputKind::heartbeat); });
+        connect(&heartbeat_, &QTimer::timeout, this, [this] {
+            if (session_) session_->sendInput(InputKind::heartbeat);
+        });
+        move_flush_timer_.setSingleShot(true);
+        connect(&move_flush_timer_, &QTimer::timeout, this, [this] { flushPendingMove(true); });
+        drag_tail_timer_.setSingleShot(true);
+        connect(&drag_tail_timer_, &QTimer::timeout, this, [this] {
+            if (capturing_ && pressed_buttons_ != Qt::NoButton && session_) {
+                session_->sendInput(InputKind::heartbeat);
+            }
+        });
     }
 
-    bool hasFrame() const { return !frame_.isNull(); }
+    ~VideoSurface() override {
+        if (context()) {
+            makeCurrent();
+            if (tex_y_) glDeleteTextures(1, &tex_y_);
+            if (tex_uv_) glDeleteTextures(1, &tex_uv_);
+            vbo_.destroy();
+            vao_.destroy();
+            program_.removeAllShaders();
+            doneCurrent();
+        }
+    }
+
+    bool hasFrame() const { return frame_.width > 0 && frame_.height > 0 && !frame_.nv12.isEmpty(); }
     bool capturing() const { return capturing_; }
 
-    void setFrame(QImage frame) {
-        frame_ = std::move(frame);
+    void setFrame(VideoFrame& incoming) {
+        const bool size_changed = frame_.width != incoming.width || frame_.height != incoming.height;
+        std::swap(frame_, incoming);
+        frame_dirty_ = true;
+        if (capturing_ && size_changed) {
+            updatePointerInVideo(mapFromGlobal(QCursor::pos()));
+        }
         update();
+    }
+
+    void setRemoteCursor(DecodedCursor cursor) {
+        cursor_separate_ = true;
+        if (!cursor.visible) {
+            remote_cursor_ = QCursor(Qt::BlankCursor);
+        } else if (cursor.image.isNull()) {
+            remote_cursor_ = QCursor(Qt::ArrowCursor);
+        } else {
+            remote_cursor_ = QCursor(QPixmap::fromImage(cursor.image), cursor.hot_x, cursor.hot_y);
+        }
+        updateSurfaceCursor();
     }
 
     void setCapture(bool enabled) {
@@ -164,17 +223,32 @@ public:
             setFocus(Qt::OtherFocusReason);
             session_->sendInput(InputKind::heartbeat);
             heartbeat_.start();
+            const auto pos = mapFromGlobal(QCursor::pos());
+            pointer_in_video_ = hasFrame() && rect().contains(pos) && QRectF(videoRect()).contains(pos);
+            updateSurfaceCursor();
         } else {
             heartbeat_.stop();
+            move_flush_timer_.stop();
+            drag_tail_timer_.stop();
+            pending_move_.reset();
+            last_move_sent_.reset();
+            pressed_buttons_ = Qt::NoButton;
             if (session_) session_->sendInput(InputKind::reset);
+            updateSurfaceCursor();
         }
-
     }
 
     void attach(ViewerSession* session) {
+        cursor_separate_ = false;
+        pointer_in_video_ = false;
+        remote_cursor_ = QCursor(Qt::ArrowCursor);
         setCapture(false);
         session_ = session;
-        setFrame({});
+        frame_ = {};
+        fallback_image_ = {};
+        frame_dirty_ = true;
+        updateSurfaceCursor();
+        update();
     }
 
     void setOverlays(std::vector<p2premote::PluginOverlayItem> overlays) {
@@ -183,23 +257,114 @@ public:
     }
 
 protected:
-    void paintEvent(QPaintEvent*) override {
+    void initializeGL() override {
+        initializeOpenGLFunctions();
+        gl_ready_ = false;
+        tex_width_ = tex_height_ = 0;
+
+        const auto fmt = context() ? context()->format() : QSurfaceFormat{};
+        const bool is_es = fmt.renderableType() == QSurfaceFormat::OpenGLES;
+        const char* header = is_es ? "#version 300 es\nprecision mediump float;\n" : "#version 330 core\n";
+
+        const QByteArray vert_src = QByteArray(header) + R"(
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aTex;
+out vec2 vTex;
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    vTex = aTex;
+}
+)";
+        const QByteArray frag_src = QByteArray(header) + R"(
+in vec2 vTex;
+out vec4 fragColor;
+uniform sampler2D texY;
+uniform sampler2D texUV;
+void main() {
+    float y = (texture(texY, vTex).r - 0.0627451) * 1.1643836;
+    vec2 uv = texture(texUV, vTex).rg - vec2(0.5019608);
+    float u = uv.x * 1.1383929;
+    float v = uv.y * 1.1383929;
+    vec3 rgb = vec3(
+        y + 1.5748 * v,
+        y - 0.187324 * u - 0.468124 * v,
+        y + 1.8556 * u
+    );
+    fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+)";
+        program_.removeAllShaders();
+        if (!program_.addShaderFromSourceCode(QOpenGLShader::Vertex, vert_src)
+            || !program_.addShaderFromSourceCode(QOpenGLShader::Fragment, frag_src)
+            || !program_.link()) {
+            return;
+        }
+
+        static constexpr float vertices[] = {
+            -1.0f, -1.0f, 0.0f, 1.0f,
+             1.0f, -1.0f, 1.0f, 1.0f,
+            -1.0f,  1.0f, 0.0f, 0.0f,
+             1.0f,  1.0f, 1.0f, 0.0f,
+        };
+        if (vao_.isCreated()) vao_.destroy();
+        if (vbo_.isCreated()) vbo_.destroy();
+        vao_.create();
+        QOpenGLVertexArrayObject::Binder vao_binder(&vao_);
+        vbo_.create();
+        vbo_.bind();
+        vbo_.allocate(vertices, sizeof(vertices));
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), nullptr);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<void*>(2 * sizeof(float)));
+        vbo_.release();
+
+        if (!tex_y_) glGenTextures(1, &tex_y_);
+        if (!tex_uv_) glGenTextures(1, &tex_uv_);
+        for (const GLuint tex : {tex_y_, tex_uv_}) {
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        program_.bind();
+        program_.setUniformValue("texY", 0);
+        program_.setUniformValue("texUV", 1);
+        program_.release();
+
+        gl_ready_ = true;
+    }
+
+    void paintGL() override {
         QPainter painter(this);
-        painter.fillRect(rect(), QColor("#111827"));
-        if (frame_.isNull()) {
+        if (!hasFrame()) {
+            painter.fillRect(rect(), QColor("#111827"));
             painter.setPen(QColor("#cbd5e1"));
             painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("等待被控端画面"));
             return;
         }
-        painter.setRenderHint(QPainter::SmoothPixmapTransform);
         const auto area = videoRect();
-        painter.drawImage(area, frame_);
+        if (gl_ready_) {
+            painter.beginNativePainting();
+            drawGlFrame(area);
+            painter.endNativePainting();
+        } else {
+            painter.fillRect(rect(), QColor("#111827"));
+            updateFallbackImage();
+            if (!fallback_image_.isNull()) {
+                painter.setRenderHint(QPainter::SmoothPixmapTransform);
+                painter.drawImage(area, fallback_image_);
+            }
+        }
         paintOverlays(painter, area);
     }
 
     void focusOutEvent(QFocusEvent* event) override {
         setCapture(false);
-        QWidget::focusOutEvent(event);
+        QOpenGLWidget::focusOutEvent(event);
     }
 
     bool event(QEvent* event) override {
@@ -212,29 +377,51 @@ protected:
             keyPressEvent(static_cast<QKeyEvent*>(event));
             return true;
         }
-        return QWidget::event(event);
+        return QOpenGLWidget::event(event);
     }
 
-    void mouseMoveEvent(QMouseEvent* event) override { pointer(InputKind::move, 0, event->position()); }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        updatePointerInVideo(event->position());
+        queueMove(event->position());
+    }
+
+    void leaveEvent(QEvent* event) override {
+        if (pointer_in_video_) {
+            pointer_in_video_ = false;
+            updateSurfaceCursor();
+        }
+        QOpenGLWidget::leaveEvent(event);
+    }
+
+    void resizeEvent(QResizeEvent* event) override {
+        QOpenGLWidget::resizeEvent(event);
+        if (capturing_) updatePointerInVideo(mapFromGlobal(QCursor::pos()));
+    }
 
     void mousePressEvent(QMouseEvent* event) override {
-        if (!capturing_ && event->button() == Qt::LeftButton && QRectF(videoRect()).contains(event->position())) {
+        updatePointerInVideo(event->position());
+        if (!capturing_ && event->button() == Qt::LeftButton && pointer_in_video_) {
             setCapture(true);
         }
         if (const auto button = pointerButton(event->button())) {
-            pointer(InputKind::button_down, button, event->position());
+            pressed_buttons_ |= event->button();
+            sendPointerAction(InputKind::button_down, button, event->position());
         }
     }
 
     void mouseReleaseEvent(QMouseEvent* event) override {
         if (const auto button = pointerButton(event->button())) {
-            pointer(InputKind::button_up, button, event->position());
+            pressed_buttons_ &= ~event->button();
+            sendPointerAction(InputKind::button_up, button, event->position());
         }
     }
 
     void wheelEvent(QWheelEvent* event) override {
         const auto amount = std::clamp(event->angleDelta().y(), -32768, 32767);
-        if (amount) pointer(InputKind::wheel, static_cast<std::uint16_t>(amount), event->position());
+        if (amount) {
+            sendPointerAction(InputKind::wheel, static_cast<std::uint16_t>(amount), event->position());
+            event->accept();
+        }
     }
 
     void keyPressEvent(QKeyEvent* event) override {
@@ -254,6 +441,74 @@ protected:
     void keyReleaseEvent(QKeyEvent* event) override { key(InputKind::key_up, event); }
 
 private:
+    void drawGlFrame(const QRect& area) {
+        const qreal dpr = devicePixelRatioF();
+        const int fb_w = std::max(1, qRound(width() * dpr));
+        const int fb_h = std::max(1, qRound(height() * dpr));
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_BLEND);
+        glViewport(0, 0, fb_w, fb_h);
+        glClearColor(17.0f / 255.0f, 24.0f / 255.0f, 39.0f / 255.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        if (frame_dirty_) {
+            const auto luma = static_cast<std::size_t>(frame_.width) * frame_.height;
+            const auto* y_ptr = frame_.nv12.constData();
+            const auto* uv_ptr = y_ptr + luma;
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            if (tex_width_ != frame_.width || tex_height_ != frame_.height) {
+                glBindTexture(GL_TEXTURE_2D, tex_y_);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, frame_.width, frame_.height, 0, GL_RED, GL_UNSIGNED_BYTE, y_ptr);
+                glBindTexture(GL_TEXTURE_2D, tex_uv_);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, frame_.width / 2, frame_.height / 2, 0, GL_RG, GL_UNSIGNED_BYTE, uv_ptr);
+                tex_width_ = frame_.width;
+                tex_height_ = frame_.height;
+            } else {
+                glBindTexture(GL_TEXTURE_2D, tex_y_);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame_.width, frame_.height, GL_RED, GL_UNSIGNED_BYTE, y_ptr);
+                glBindTexture(GL_TEXTURE_2D, tex_uv_);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame_.width / 2, frame_.height / 2, GL_RG, GL_UNSIGNED_BYTE, uv_ptr);
+            }
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            frame_dirty_ = false;
+        }
+
+        const int vx = qRound(area.x() * dpr);
+        const int vw = std::max(1, qRound(area.width() * dpr));
+        const int vh = std::max(1, qRound(area.height() * dpr));
+        const int vy = fb_h - qRound((area.y() + area.height()) * dpr);
+        glViewport(vx, vy, vw, vh);
+
+        program_.bind();
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_y_);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, tex_uv_);
+        vao_.bind();
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        vao_.release();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        program_.release();
+    }
+
+    void updateFallbackImage() {
+        if (!frame_dirty_) return;
+        frame_dirty_ = false;
+        if (fallback_image_.width() != frame_.width || fallback_image_.height() != frame_.height) {
+            fallback_image_ = QImage(frame_.width, frame_.height, QImage::Format_ARGB32);
+        }
+        if (fallback_image_.isNull()) return;
+        const auto luma = static_cast<std::size_t>(frame_.width) * frame_.height;
+        const auto* source = reinterpret_cast<const std::uint8_t*>(frame_.nv12.constData());
+        libyuv::NV12ToARGBMatrix(source, frame_.width, source + luma, frame_.width,
+            fallback_image_.bits(), fallback_image_.bytesPerLine(), &libyuv::kYuvH709Constants,
+            frame_.width, frame_.height);
+    }
+
     void paintOverlays(QPainter& painter, const QRect& area) {
         using p2premote::OverlayAnchor;
         std::array<int, 6> stacks{};
@@ -289,20 +544,61 @@ private:
     }
 
     QRect videoRect() const {
-        const auto size = frame_.size().scaled(this->size(), Qt::KeepAspectRatio);
+        if (!hasFrame()) return {};
+        const auto size = QSize(frame_.width, frame_.height).scaled(this->size(), Qt::KeepAspectRatio);
         return QRect(QPoint((width() - size.width()) / 2, (height() - size.height()) / 2), size);
     }
 
-    void pointer(InputKind kind, std::uint16_t code, const QPointF& pos) {
-        if (!capturing_) return;
+    std::optional<std::pair<std::uint16_t, std::uint16_t>> normalizePoint(const QPointF& pos, bool allow_outside) const {
         const auto area = videoRect();
-        if (area.isEmpty() || (kind != InputKind::button_up && !QRectF(area).contains(pos))) return;
+        if (area.isEmpty() || (!allow_outside && !QRectF(area).contains(pos))) return std::nullopt;
         const auto normalize = [](qreal value, int pixels) {
             const auto fraction = std::clamp(value / std::max(1, pixels - 1), qreal{0}, qreal{1});
             return static_cast<std::uint16_t>(fraction * std::numeric_limits<std::uint16_t>::max());
         };
-        session_->sendInput(kind, code, normalize(pos.x() - area.x(), area.width()),
-            normalize(pos.y() - area.y(), area.height()));
+        return std::pair{normalize(pos.x() - area.x(), area.width()), normalize(pos.y() - area.y(), area.height())};
+    }
+
+    void queueMove(const QPointF& pos) {
+        if (!capturing_) return;
+        const auto point = normalizePoint(pos, false);
+        if (!point) return;
+        if (!pending_move_ && last_move_sent_ && *last_move_sent_ == *point) return;
+        pending_move_ = *point;
+        flushPendingMove(false);
+    }
+
+    void flushPendingMove(bool force) {
+        if (!pending_move_ || !capturing_ || !session_) return;
+        if (!force && move_clock_.isValid()) {
+            const auto elapsed = move_clock_.elapsed();
+            if (elapsed < mouse_move_min_interval_ms) {
+                if (!move_flush_timer_.isActive()) {
+                    move_flush_timer_.start(static_cast<int>(mouse_move_min_interval_ms - elapsed));
+                }
+                return;
+            }
+        }
+        move_flush_timer_.stop();
+        const auto move = *std::exchange(pending_move_, std::nullopt);
+        if (last_move_sent_ && *last_move_sent_ == move) return;
+        if (session_->sendInput(InputKind::move, 0, move.first, move.second)) {
+            last_move_sent_ = move;
+            move_clock_.restart();
+            if (pressed_buttons_ != Qt::NoButton) drag_tail_timer_.start(drag_tail_delay_ms);
+        }
+    }
+
+    void sendPointerAction(InputKind kind, std::uint16_t code, const QPointF& pos) {
+        if (!capturing_ || !session_) return;
+        const auto point = normalizePoint(pos, kind == InputKind::button_up);
+        if (!point) return;
+        pending_move_.reset();
+        move_flush_timer_.stop();
+        drag_tail_timer_.stop();
+        if (session_->sendInput(kind, code, point->first, point->second)) {
+            last_move_sent_ = *point;
+        }
     }
 
     void key(InputKind kind, QKeyEvent* event) {
@@ -326,12 +622,46 @@ private:
         event->accept();
     }
 
+    void updatePointerInVideo(const QPointF& pos) {
+        const bool inside = hasFrame() && rect().contains(pos.toPoint()) && QRectF(videoRect()).contains(pos);
+        if (inside == pointer_in_video_) return;
+        pointer_in_video_ = inside;
+        updateSurfaceCursor();
+    }
+
+    void updateSurfaceCursor() {
+        if (!capturing_ || !pointer_in_video_) {
+            if (testAttribute(Qt::WA_SetCursor)) unsetCursor();
+            return;
+        }
+        setCursor(cursor_separate_ ? remote_cursor_ : QCursor(Qt::BlankCursor));
+    }
+
     ViewerSession* session_{};
     std::function<void()> fullscreen_;
     std::vector<p2premote::PluginOverlayItem> overlays_;
     QTimer heartbeat_;
-    QImage frame_;
+    QTimer move_flush_timer_;
+    QTimer drag_tail_timer_;
+    QElapsedTimer move_clock_;
+    std::optional<std::pair<std::uint16_t, std::uint16_t>> pending_move_;
+    std::optional<std::pair<std::uint16_t, std::uint16_t>> last_move_sent_;
+    Qt::MouseButtons pressed_buttons_{Qt::NoButton};
+    VideoFrame frame_;
+    QImage fallback_image_;
+    QOpenGLShaderProgram program_;
+    QOpenGLVertexArrayObject vao_;
+    QOpenGLBuffer vbo_{QOpenGLBuffer::VertexBuffer};
+    GLuint tex_y_{};
+    GLuint tex_uv_{};
+    int tex_width_{};
+    int tex_height_{};
+    bool gl_ready_{};
+    bool frame_dirty_{};
+    QCursor remote_cursor_{Qt::ArrowCursor};
     bool capturing_{};
+    bool cursor_separate_{};
+    bool pointer_in_video_{};
     const bool xkb_;
 };
 
@@ -345,8 +675,12 @@ void attachVideoSession(QWidget* widget, ViewerSession* session) {
     static_cast<VideoSurface*>(widget)->attach(session);
 }
 
-void setVideoFrame(QWidget* widget, QImage frame) {
-    static_cast<VideoSurface*>(widget)->setFrame(std::move(frame));
+void setVideoFrame(QWidget* widget, VideoFrame& frame) {
+    static_cast<VideoSurface*>(widget)->setFrame(frame);
+}
+
+void setVideoCursor(QWidget* widget, DecodedCursor cursor) {
+    static_cast<VideoSurface*>(widget)->setRemoteCursor(std::move(cursor));
 }
 
 void setVideoOverlays(QWidget* widget, std::vector<p2premote::PluginOverlayItem> overlays) {

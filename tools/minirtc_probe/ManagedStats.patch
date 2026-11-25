@@ -1,0 +1,84 @@
+diff --git a/src/api/minirtc.h b/src/api/minirtc.h
+index d0892e3..16633ba 100644
+--- a/src/api/minirtc.h
++++ b/src/api/minirtc.h
+@@ -227,6 +227,12 @@ typedef struct {
+  * a weighted aggregate and may exceed 1. Availability depends on the backend;
+  * an initial login report contains zero counters, unavailable RTT and UnknownMode.
+  */
++struct MiniRtcVideoSendQueueStats {
++  uint64_t packets = 0;
++  uint64_t total_wait_us = 0;
++  uint32_t p95_bucket_ms = 0;  // 1 ms buckets; the final bucket includes 100 ms and above.
++};
++
+ typedef struct MiniRtcNetTrafficStats {
+   MiniRtcInboundStats video_inbound_stats;
+   MiniRtcOutboundStats video_outbound_stats;
+@@ -238,6 +244,10 @@ typedef struct MiniRtcNetTrafficStats {
+   MiniRtcOutboundStats total_outbound_stats;
+   bool srtp_active;
+   double rtt_ms = -1; ///< -1 without a valid sample; zero RTT remains valid.
++  // Selected ICE protocol. Relay reports do not infer the TURN control transport.
++  enum class Path : uint8_t { Unknown, HostUdp, HostTcp, DirectUdp, DirectTcp, Relay };
++  Path selected_path = Path::Unknown;
++  MiniRtcVideoSendQueueStats video_send_queue{};
+ } MiniRtcNetTrafficStats;
+ 
+ /// Opaque owned handle. Create with CreatePeer; release only with DestroyPeer.
+diff --git a/src/transport/ice_transport.cpp b/src/transport/ice_transport.cpp
+index 3c0ba8d..2d0f73c 100644
+--- a/src/transport/ice_transport.cpp
++++ b/src/transport/ice_transport.cpp
+@@ -353,8 +353,13 @@ int IceTransport::InitIceTransmission(
+               ice_transport_controller_ &&
+               ice_transport_controller_->IsSrtpActive();
+           minirtc_net_traffic_stats.rtt_ms = rtt_ms.value_or(-1);
++          minirtc_net_traffic_stats.selected_path = selected_path_.load();
++          if (ice_transport_controller_) {
++            minirtc_net_traffic_stats.video_send_queue =
++                ice_transport_controller_->TakeVideoSendQueueStats();
++          }
+           on_receive_net_status_report_(
+-              user_id_.data(), user_id_.size(), TraversalMode(traversal_type_),
++              user_id_.data(), user_id_.size(), TraversalMode(traversal_type_.load()),
+               &minirtc_net_traffic_stats, remote_user_id_.data(),
+               remote_user_id_.size(), user_data_);
+         }
+@@ -564,13 +569,21 @@ void IceTransport::OnNewSelectedPair(NiceAgent* agent, guint stream_id,
+     ice_transport_controller_->SetRelayPath(traversal_type_ ==
+                                              TraversalType::TRelay);
+   }
++  using Path = MiniRtcNetTrafficStats::Path;
++  const bool udp = local->transport == NICE_CANDIDATE_TRANSPORT_UDP;
++  const bool host = local->type == NICE_CANDIDATE_TYPE_HOST &&
++                    remote->type == NICE_CANDIDATE_TYPE_HOST;
++  const auto path = traversal_type_ == TraversalType::TRelay ? Path::Relay :
++      host ? (udp ? Path::HostUdp : Path::HostTcp) : (udp ? Path::DirectUdp : Path::DirectTcp);
++  selected_path_ = path;
+   MiniRtcNetTrafficStats net_traffic_stats{};
++  net_traffic_stats.selected_path = path;
+   net_traffic_stats.srtp_active = ice_transport_controller_ &&
+                                 ice_transport_controller_->IsSrtpActive();
+ 
+   if (on_receive_net_status_report_) {
+     on_receive_net_status_report_(user_id_.data(), user_id_.size(),
+-                                TraversalMode(traversal_type_),
++                                TraversalMode(traversal_type_.load()),
+                                 &net_traffic_stats, remote_user_id_.data(),
+                                 remote_user_id_.size(), user_data_);
+   }
+diff --git a/src/transport/ice_transport.h b/src/transport/ice_transport.h
+index 343990c..fd91e82 100644
+--- a/src/transport/ice_transport.h
++++ b/src/transport/ice_transport.h
+@@ -254,7 +254,8 @@ class IceTransport {
+   bool remote_gathering_done_ = false;
+   std::atomic<NiceComponentState> state_{NICE_COMPONENT_STATE_DISCONNECTED};
+   IceComponentStateTracker component_state_tracker_;
+-  TraversalType traversal_type_ = TraversalType::TP2P;
++  std::atomic<TraversalType> traversal_type_{TraversalType::TP2P};
++  std::atomic<MiniRtcNetTrafficStats::Path> selected_path_{MiniRtcNetTrafficStats::Path::Unknown};
+   void* user_data_ = nullptr;
+ 
+  private:
