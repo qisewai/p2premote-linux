@@ -1,9 +1,11 @@
 #include "frameless_chrome.h"
+#include "app_theme.h"
 
 #include <QEvent>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMouseEvent>
+#include <QPainter>
 #include <QPushButton>
 #include <QShowEvent>
 #include <QVBoxLayout>
@@ -94,6 +96,111 @@ void toggleFramelessMaximize(QWidget* window) {
     SendMessageW(hwnd, WM_SYSCOMMAND, IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE, 0);
 }
 
+WindowCaptionButton::WindowCaptionButton(CaptionButtonKind kind, QWidget* parent)
+    : QAbstractButton(parent), kind_(kind) {
+    setAttribute(Qt::WA_Hover, true);
+    setFocusPolicy(Qt::NoFocus);
+    setFixedWidth(46);
+    setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+    switch (kind_) {
+    case CaptionButtonKind::Minimize:
+        setToolTip(QStringLiteral("最小化"));
+        break;
+    case CaptionButtonKind::Maximize:
+        setToolTip(QStringLiteral("最大化"));
+        break;
+    case CaptionButtonKind::Close:
+        setToolTip(QStringLiteral("关闭"));
+        break;
+    }
+    setAccessibleName(toolTip());
+}
+
+void WindowCaptionButton::setMaximized(bool maximized) {
+    if (maximized_ == maximized) return;
+    maximized_ = maximized;
+    if (kind_ == CaptionButtonKind::Maximize) {
+        setToolTip(maximized_ ? QStringLiteral("还原") : QStringLiteral("最大化"));
+        setAccessibleName(toolTip());
+    }
+    update();
+}
+
+bool WindowCaptionButton::event(QEvent* event) {
+    switch (event->type()) {
+    case QEvent::Enter:
+    case QEvent::HoverEnter:
+        hovered_ = true;
+        update();
+        break;
+    case QEvent::Leave:
+    case QEvent::HoverLeave:
+        hovered_ = false;
+        update();
+        break;
+    default:
+        break;
+    }
+    return QAbstractButton::event(event);
+}
+
+void WindowCaptionButton::paintEvent(QPaintEvent*) {
+    const auto& theme = AppTheme::current();
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    const bool active_hover = hovered_ || underMouse();
+    const bool pressed = isDown();
+
+    if (kind_ == CaptionButtonKind::Close) {
+        if (pressed) {
+            painter.fillRect(rect(), QColor(0xc5, 0x0f, 0x1f));
+        } else if (active_hover) {
+            painter.fillRect(rect(), QColor(0xe8, 0x11, 0x23));
+        }
+    } else if (pressed) {
+        painter.fillRect(rect(), theme.is_dark ? QColor(255, 255, 255, 42) : QColor(0, 0, 0, 28));
+    } else if (active_hover) {
+        painter.fillRect(rect(), theme.is_dark ? QColor(255, 255, 255, 24) : QColor(0, 0, 0, 16));
+    }
+
+    QColor glyph_color = active_hover ? QColor(theme.text) : QColor(theme.text_secondary);
+    if (kind_ == CaptionButtonKind::Close && (active_hover || pressed)) {
+        glyph_color = QColor(Qt::white);
+    }
+
+    const QPointF c = QRectF(rect()).center();
+    QPen pen(glyph_color, 1.15, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+
+    if (kind_ == CaptionButtonKind::Minimize) {
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        const qreal y = std::floor(c.y()) + 0.5;
+        painter.drawLine(QPointF(c.x() - 5.0, y), QPointF(c.x() + 5.0, y));
+    } else if (kind_ == CaptionButtonKind::Maximize) {
+        if (!maximized_) {
+            painter.drawRoundedRect(QRectF(c.x() - 4.5, c.y() - 4.5, 9.0, 9.0), 1.0, 1.0);
+        } else {
+            // Front square (lower-left)
+            const QRectF front(c.x() - 5.0, c.y() - 3.0, 8.0, 8.0);
+            painter.drawRoundedRect(front, 0.8, 0.8);
+            // Back square top-right L-rim
+            const qreal bx = c.x() - 2.5;
+            const qreal by = c.y() - 5.0;
+            painter.drawLine(QPointF(bx, by + 2.0), QPointF(bx, by));
+            painter.drawLine(QPointF(bx, by), QPointF(bx + 7.5, by));
+            painter.drawLine(QPointF(bx + 7.5, by), QPointF(bx + 7.5, by + 7.5));
+            painter.drawLine(QPointF(bx + 7.5, by + 7.5), QPointF(bx + 5.5, by + 7.5));
+        }
+    } else {
+        pen.setWidthF(1.25);
+        painter.setPen(pen);
+        painter.drawLine(c + QPointF(-4.5, -4.5), c + QPointF(4.5, 4.5));
+        painter.drawLine(c + QPointF(-4.5, 4.5), c + QPointF(4.5, -4.5));
+    }
+}
+
 TitleBar::TitleBar(QWidget* host_window, const QString& title, bool show_maximize,
     bool show_badge, QWidget* parent)
     : QFrame(parent), host_(host_window), allow_maximize_(show_maximize) {
@@ -101,13 +208,14 @@ TitleBar::TitleBar(QWidget* host_window, const QString& title, bool show_maximiz
     setFixedHeight(38);
 
     layout_ = new QHBoxLayout(this);
-    layout_->setContentsMargins(12, 0, 6, 0);
-    layout_->setSpacing(8);
+    layout_->setContentsMargins(12, 0, 0, 0);
+    layout_->setSpacing(0);
 
     if (show_badge) {
         auto* badge = new QLabel(QStringLiteral("P2P"), this);
         badge->setObjectName(QStringLiteral("titleBadge"));
         layout_->addWidget(badge);
+        layout_->addSpacing(8);
     }
 
     title_label_ = new QLabel(title, this);
@@ -117,36 +225,27 @@ TitleBar::TitleBar(QWidget* host_window, const QString& title, bool show_maximiz
     layout_->addStretch(1);
 
     tools_layout_ = new QHBoxLayout;
-    tools_layout_->setContentsMargins(0, 0, 4, 0);
-    tools_layout_->setSpacing(4);
+    tools_layout_->setContentsMargins(0, 0, 8, 0);
+    tools_layout_->setSpacing(6);
     layout_->addLayout(tools_layout_);
 
-    min_btn_ = new QPushButton(QStringLiteral("—"), this);
-    min_btn_->setObjectName(QStringLiteral("titleBtn"));
-    min_btn_->setToolTip(QStringLiteral("最小化"));
-    min_btn_->setFocusPolicy(Qt::NoFocus);
+    min_btn_ = new WindowCaptionButton(CaptionButtonKind::Minimize, this);
     layout_->addWidget(min_btn_);
-    connect(min_btn_, &QPushButton::clicked, this, [this] {
+    connect(min_btn_, &QAbstractButton::clicked, this, [this] {
         if (host_) minimizeFramelessWindow(host_);
     });
 
     if (allow_maximize_) {
-        max_btn_ = new QPushButton(QStringLiteral("□"), this);
-        max_btn_->setObjectName(QStringLiteral("titleBtn"));
-        max_btn_->setToolTip(QStringLiteral("最大化"));
-        max_btn_->setFocusPolicy(Qt::NoFocus);
+        max_btn_ = new WindowCaptionButton(CaptionButtonKind::Maximize, this);
         layout_->addWidget(max_btn_);
-        connect(max_btn_, &QPushButton::clicked, this, [this] {
+        connect(max_btn_, &QAbstractButton::clicked, this, [this] {
             if (host_) toggleFramelessMaximize(host_);
         });
     }
 
-    close_btn_ = new QPushButton(QStringLiteral("✕"), this);
-    close_btn_->setObjectName(QStringLiteral("titleCloseBtn"));
-    close_btn_->setToolTip(QStringLiteral("关闭"));
-    close_btn_->setFocusPolicy(Qt::NoFocus);
+    close_btn_ = new WindowCaptionButton(CaptionButtonKind::Close, this);
     layout_->addWidget(close_btn_);
-    connect(close_btn_, &QPushButton::clicked, this, [this] {
+    connect(close_btn_, &QAbstractButton::clicked, this, [this] {
         if (host_) host_->close();
     });
 }
@@ -161,9 +260,7 @@ void TitleBar::addToolWidget(QWidget* widget) {
 
 void TitleBar::syncMaximizeState() {
     if (!max_btn_ || !host_) return;
-    const bool maxed = host_->isMaximized();
-    max_btn_->setText(maxed ? QStringLiteral("❐") : QStringLiteral("□"));
-    max_btn_->setToolTip(maxed ? QStringLiteral("还原") : QStringLiteral("最大化"));
+    max_btn_->setMaximized(host_->isMaximized());
 }
 
 void TitleBar::mousePressEvent(QMouseEvent* event) {

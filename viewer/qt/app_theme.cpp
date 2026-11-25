@@ -125,8 +125,16 @@ QFrame#framelessShell {
     background: %BG%;
     border: 1px solid %BORDER%;
 }
-QFrame#titleBar, QFrame#remoteTopbar {
+QFrame#titleBar {
     background: %TITLEBAR%;
+    border-bottom: 1px solid %BORDER%;
+}
+QFrame#remoteTopbar, QFrame#remoteTabStrip {
+    background: %TITLEBAR%;
+    border: 0;
+}
+QFrame#remoteToolbar {
+    background: %SURFACE%;
     border-bottom: 1px solid %BORDER%;
 }
 QLabel#titleLabel {
@@ -440,60 +448,260 @@ QTabBar#remoteTabs {
     background: transparent;
     border: 0;
 }
-QTabBar#remoteTabs::tab {
-    background: transparent;
-    color: %TEXT_SEC%;
-    border: 0;
-    border-top: 2px solid transparent;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    padding: 7px 14px;
-    margin-right: 3px;
-    min-width: 110px;
-    max-width: 230px;
-    font-size: %FONT_SM%px;
-}
-QTabBar#remoteTabs::tab:hover {
-    background: %SURF_HOVER%;
-    color: %TEXT%;
-}
-QTabBar#remoteTabs::tab:selected {
-    background: %SURFACE_ALT%;
-    color: %TEXT%;
-    border-top: 2px solid %ACCENT%;
-    font-weight: 600;
-}
 QPushButton#barAddBtn {
     background: transparent;
     color: %TEXT_SEC%;
     border: 0;
-    border-radius: 5px;
-    padding: 3px 8px;
-    min-height: 20px;
+    border-radius: 13px;
+    padding: 0;
+    min-width: 26px;
+    max-width: 26px;
+    min-height: 26px;
+    max-height: 26px;
     font-size: 16px;
-    font-weight: 600;
+    font-weight: 500;
 }
 QPushButton#barAddBtn:hover {
     background: %SURF_HOVER%;
     color: %TEXT%;
 }
-QPushButton#barMenuBtn {
+QPushButton#barAddBtn:pressed {
+    background: %SURF_PRESS%;
+}
+QPushButton#controlCenterBtn {
     background: %SURFACE_ALT%;
     color: %TEXT%;
     border: 1px solid %BORDER%;
+    border-radius: 13px;
+    padding: 0px 12px;
+    min-height: 26px;
+    max-height: 26px;
+    font-size: %FONT_SM%px;
+    font-weight: 500;
+}
+QPushButton#controlCenterBtn:hover {
+    background: %SURF_HOVER%;
+    border-color: %BORDER_STRONG%;
+    color: %TEXT%;
+}
+QPushButton#controlCenterBtn:pressed {
+    background: %SURF_PRESS%;
+}
+QPushButton#controlCenterBtn[menuOpen="true"] {
+    background: %ACCENT_SOFT%;
+    border-color: %ACCENT%;
+    color: %TEXT%;
+}
+QPushButton#controlCenterBtn:disabled {
+    background: transparent;
+    border-color: transparent;
+    color: %TEXT_MUTED%;
+}
+QPushButton#controlCenterBtn[micLive="true"] {
+    background: %DANGER_SURF%;
+    color: %TEXT%;
+    border-color: %DANGER%;
+}
+QFrame#titleSeparator {
+    background: %BORDER%;
+    min-width: 1px;
+    max-width: 1px;
+    min-height: 16px;
+    max-height: 16px;
+}
+QFrame#navSidebar {
+    background: %TITLEBAR%;
+    border: 0;
+    border-right: 1px solid %BORDER%;
+}
+QFrame#navFooter {
+    background: transparent;
+    border: 0;
+    border-top: 1px solid %BORDER%;
+}
+QLabel#sidebarSection {
+    color: %TEXT_MUTED%;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 6px 2px 6px;
+}
+QPushButton#sidebarIconBtn {
+    background: transparent;
+    color: %TEXT_MUTED%;
+    border: 0;
     border-radius: 6px;
-    padding: 4px 10px;
+    padding: 0;
+    min-width: 24px;
+    max-width: 24px;
+    min-height: 24px;
+    max-height: 24px;
+    font-size: 13px;
+}
+QPushButton#sidebarIconBtn:hover {
+    background: %SURF_HOVER%;
+    color: %TEXT%;
+}
+QListWidget#sidebarList {
+    background: transparent;
+    border: 0;
+    outline: 0;
+}
+QListWidget#sidebarList::item {
+    color: %TEXT_SEC%;
+    border-radius: 8px;
+    padding: 7px 10px;
+    margin: 1px 0px;
+    min-height: 22px;
+}
+QListWidget#sidebarList::item:hover {
+    background: %SURF_HOVER%;
+    color: %TEXT%;
+}
+QListWidget#sidebarList::item:selected {
+    background: %ACCENT_SOFT%;
+    color: %TEXT%;
+    font-weight: 600;
+}
+QListWidget#sidebarList::item:disabled {
+    color: %TEXT_MUTED%;
+    background: transparent;
+}
+QPushButton#sidebarActionBtn, QPushButton#sidebarFooterBtn {
+    background: transparent;
+    color: %TEXT_SEC%;
+    border: 0;
+    border-radius: 8px;
+    padding: 8px 10px;
+    text-align: left;
     min-height: 20px;
     font-size: %FONT_SM%px;
 }
-QPushButton#barMenuBtn:hover, QPushButton#barMenuBtn:focus {
+QPushButton#sidebarActionBtn:hover, QPushButton#sidebarFooterBtn:hover {
     background: %SURF_HOVER%;
+    color: %TEXT%;
+}
+QPushButton#sidebarActionBtn:pressed, QPushButton#sidebarFooterBtn:pressed {
+    background: %SURF_PRESS%;
+}
+QFrame#unattendedBanner {
+    background: %ACCENT_SOFT%;
+    border: 1px solid %ACCENT%;
+    border-radius: 10px;
+}
+QLabel#statusPill {
+    background: %SURFACE_ALT%;
+    color: %TEXT%;
+    border-radius: 11px;
+    padding: 3px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QLabel#statusPill[state="online"] {
+    background: #143628;
+    color: #34d399;
+}
+QLabel#statusPill[state="busy"] {
+    background: %ACCENT_SOFT%;
+    color: %ACCENT%;
+}
+QLabel#statusPill[state="offline"] {
+    background: %SURFACE_ALT%;
+    color: %TEXT_MUTED%;
+}
+QLabel#deviceTitle {
+    color: %TEXT%;
+    font-size: 20px;
+    font-weight: 700;
+}
+QFrame#heroContainer {
+    background: %SURFACE%;
+    border: 1px solid %BORDER%;
+    border-radius: 12px;
+}
+QFrame#heroActionBar {
+    background: %SURFACE%;
+    border: 0;
+    border-top: 1px solid %BORDER%;
+    border-bottom-left-radius: 11px;
+    border-bottom-right-radius: 11px;
+}
+QPushButton#heroStripBtn {
+    background: transparent;
+    color: %TEXT_SEC%;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 12px;
+    min-height: 24px;
+    font-size: %FONT_SM%px;
+}
+QPushButton#heroStripBtn:hover {
+    background: %SURF_HOVER%;
+    color: %TEXT%;
+}
+QPushButton#heroStripBtn:disabled {
+    color: %TEXT_MUTED%;
+    background: transparent;
+}
+QPushButton#quickAddTile {
+    background: %SURFACE%;
+    color: %TEXT_SEC%;
+    border: 1px dashed %BORDER_STRONG%;
+    border-radius: 12px;
+    padding: 18px 24px;
+    min-height: 68px;
+    font-size: %FONT_SM%px;
+}
+QPushButton#quickAddTile:hover {
+    background: %SURF_HOVER%;
+    border-color: %ACCENT%;
+    color: %TEXT%;
+}
+QLabel#codeBadge {
+    background: %SURFACE%;
+    color: %TEXT%;
+    border: 1px solid %BORDER%;
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 13px;
+    font-weight: 600;
+}
+QPushButton#miniGhostBtn {
+    background: transparent;
+    color: %TEXT_SEC%;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 3px 8px;
+    min-height: 20px;
+    font-size: 12px;
+}
+QPushButton#miniGhostBtn:hover {
+    background: %SURF_HOVER%;
+    border-color: %BORDER%;
+    color: %TEXT%;
+}
+QPushButton#barMenuBtn {
+    background: transparent;
+    color: %TEXT_SEC%;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 3px 9px;
+    min-height: 19px;
+    font-size: %FONT_SM%px;
+}
+QPushButton#barMenuBtn:hover {
+    background: %SURF_HOVER%;
+    color: %TEXT%;
+}
+QPushButton#barMenuBtn:focus {
     border-color: %BORDER_STRONG%;
 }
+QPushButton#barMenuBtn[menuOpen="true"], QPushButton#barMenuBtn:checked {
+    background: %ACCENT_SOFT%;
+    color: %TEXT%;
+}
 QPushButton#barMenuBtn:disabled {
-    background: %SURFACE%;
     color: %TEXT_MUTED%;
-    border-color: %BORDER%;
 }
 QPushButton#barMenuBtn[micLive="true"] {
     background: %DANGER_SURF%;
@@ -533,6 +741,22 @@ QMenu::separator {
     height: 1px;
     background: %BORDER%;
     margin: 4px 10px;
+}
+QMenu#remoteMenu {
+    min-width: 156px;
+    padding: 5px;
+    border-radius: 9px;
+}
+QMenu#remoteMenu::item {
+    padding: 6px 26px;
+    border-radius: 5px;
+}
+QMenu#remoteMenu::item:selected:enabled {
+    background: %ACCENT_SOFT%;
+    color: %TEXT%;
+}
+QMenu#remoteMenu::separator {
+    margin: 4px 6px;
 }
 QToolTip {
     background: %SURFACE%;

@@ -9,21 +9,24 @@
 
 #include <thread>
 
+class QAbstractButton;
 class QAction;
 class QCheckBox;
 class QCloseEvent;
 class QComboBox;
+class QFrame;
 class QLabel;
 class QLineEdit;
 class QListWidget;
 class QMessageBox;
 class QPushButton;
-class QSpinBox;
 class QStackedWidget;
 class QSystemTrayIcon;
+class DeviceHeroWidget;
 class HostSession;
 class SettingsDialog;
 class TitleBar;
+class ToggleSwitch;
 
 class AccountWindow final : public QWidget {
 public:
@@ -41,23 +44,33 @@ protected:
 
 private:
     enum class Request { none, login, devices, add_device, remove_device, logout };
+    enum class SelectionKind { none, lan, cloud };
 
-    QWidget* makeLoginPage();
-    QWidget* makeDevicesPage();
-    QWidget* makeLanPage();
-    void toggleLanMode();
-    void refreshLanPeers();
-    void toggleLanReceiving();
-    void startLanReceiving();
-    void stopLanReceiving();
-    void connectLanDevice();
-    void copyLanAddress();
+    struct SelectedTarget {
+        SelectionKind kind{SelectionKind::none};
+        QString id;       // LAN: ip address; Cloud: device id
+        QString name;
+        QString state;    // "online" | "busy" | "offline"
+        QString subtitle; // LAN: IP; Cloud: platform
+        std::uint16_t port{P2P_LAN_DEFAULT_PORT};
+        bool is_self{};
+    };
+
+    QWidget* makeSidebar(QWidget* parent);
+    QWidget* makeUnattendedBanner(QWidget* parent);
+    QWidget* makeDetailPage(QWidget* parent);
+    QWidget* makeWelcomePage(QWidget* parent);
+    QWidget* makeLoginPage(QWidget* parent);
     void makeTray();
     void restore();
     void quit();
     void openSettings();
     void setStatus(const QString& text);
     void updateControls();
+    void updateUnattendedBanner();
+    void updateDetailView();
+    void showLoginPage();
+    void showAccountMenu();
     void loadCredentials();
     void signIn(bool create);
     void completeRequest();
@@ -70,6 +83,14 @@ private:
     void toggleReceiving();
     void startReceiving();
     void stopReceiving();
+    void setUnattendedEnabled(bool enabled);
+    void startLanReceiving(const QString& override_code = {}, std::uint16_t port = P2P_LAN_DEFAULT_PORT);
+    void stopLanReceiving();
+    void editUnattendedCode();
+    void copyUnattendedInfo();
+    void refreshLanPeers();
+    void openLanConnectDialog(const QString& prefill_host = {}, const QString& prefill_name = {});
+    void connectSelectedDevice(bool diagnostics = false);
     void showAgentApproval(std::uint32_t id, int tool, std::uint64_t generation, void* monitor);
     std::uint32_t clearAgentApproval();
     void stopAgentDiagnostics();
@@ -77,7 +98,6 @@ private:
     void refreshServiceStatus();
     void toggleHostService();
     void relaunchAsAdmin();
-    void connectDevice(bool diagnostics = false);
     void closeSessions();
 
     LaunchOptions options_;
@@ -88,10 +108,17 @@ private:
     uint64_t lan_host_generation_{};
     std::unique_ptr<p2p_lan_scanner, decltype(&p2p_lan_scanner_destroy)> lan_scanner_{nullptr, p2p_lan_scanner_destroy};
     QTimer lan_scan_timer_;
-    bool lan_mode_{};
+    QString lan_host_code_;
+    std::uint16_t lan_host_port_{P2P_LAN_DEFAULT_PORT};
+    bool lan_code_visible_{};
+    QString lan_host_status_text_;
+    bool lan_host_controlled_{};
+
     QPointer<RemoteWindow> viewer_;
     QPointer<SettingsDialog> settings_dialog_;
     TitleBar* title_bar_{};
+    ToggleSwitch* unattended_switch_{};
+    QPushButton* account_btn_{};
     QWinEventNotifier account_event_;
     QTimer refresh_;
     Request request_{Request::none};
@@ -103,30 +130,47 @@ private:
     std::uint64_t service_status_generation_{};
     std::uint32_t agent_prompt_id_{};
     QPointer<QMessageBox> agent_prompt_;
-    QLabel* agent_status_{};
+    QString host_status_text_;
     bool service_status_pending_{};
     bool elevated_{};
     QString loaded_server_;
     bool hotkey_{};
     bool quitting_{};
-    QStackedWidget* pages_{};
-    QWidget *login_page_{}, *devices_page_{}, *lan_page_{};
-    QPushButton* mode_button_{};
-    QLabel *lan_local_ips_{}, *lan_host_status_{};
-    QSpinBox* lan_host_port_{};
-    QComboBox* lan_screens_{};
-    QLineEdit *lan_host_code_{}, *lan_target_host_{}, *lan_target_code_{};
-    QPushButton *lan_receive_{}, *lan_connect_{}, *lan_scan_button_{};
-    QListWidget* lan_peers_{};
+    SelectedTarget selected_;
+
+    // Left sidebar
+    QListWidget* lan_list_{};
+    QListWidget* cloud_list_{};
+    QPushButton* cloud_refresh_btn_{};
+    QPushButton* cloud_login_sidebar_btn_{};
+
+    // Right stage
+    QFrame* unattended_banner_{};
+    QLabel *unattended_pill_{}, *unattended_ip_label_{}, *unattended_code_label_{};
+    QPushButton *unattended_toggle_code_btn_{}, *unattended_copy_btn_{}, *unattended_edit_btn_{};
+    QComboBox* screens_{};
+    QStackedWidget* right_stack_{};
+    QWidget *detail_page_{}, *welcome_page_{}, *login_page_{};
+
+    // Detail page widgets
+    QLabel *detail_status_pill_{}, *detail_name_{};
+    QPushButton* detail_more_btn_{};
+    DeviceHeroWidget* hero_widget_{};
+    QPushButton *strip_btn_1_{}, *strip_btn_2_{}, *strip_btn_3_{};
+    QFrame* cloud_host_card_{};
+    QLabel *cloud_host_status_{}, *privilege_status_{};
+    QPushButton *add_device_{}, *receive_{}, *service_button_{}, *elevate_button_{};
+
+    // Welcome page widgets
+    QPushButton* welcome_login_btn_{};
+
+    // Login page widgets
     QLineEdit *server_{}, *user_{}, *password_{};
     QCheckBox* remember_{};
-    QLabel *status_{}, *account_heading_{}, *host_status_{}, *privilege_status_{};
-    QListWidget* devices_{};
-    QComboBox* screens_{};
-    QPushButton *login_{}, *register_{}, *connect_{}, *receive_{}, *refresh_button_{}, *logout_{};
-    QPushButton *add_device_{}, *remove_device_{};
-    QPushButton* connect_diagnostics_{};
-    QPushButton *service_button_{}, *elevate_button_{};
+    QPushButton *login_{}, *register_{};
+
+    QLabel* status_{};
     QSystemTrayIcon* tray_{};
+    QAction* tray_unattended_{};
     QAction* tray_receive_{};
 };

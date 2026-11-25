@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QAbstractButton>
 #include <QDialog>
 #include <QFrame>
 
@@ -12,6 +13,26 @@ void applyWin32FramelessChrome(QWidget* window, bool allow_maximize = true);
 bool handleWin32FramelessChrome(QWidget* window, void* native_msg, qintptr* result);
 void minimizeFramelessWindow(QWidget* window);
 void toggleFramelessMaximize(QWidget* window);
+
+enum class CaptionButtonKind { Minimize, Maximize, Close };
+
+class WindowCaptionButton final : public QAbstractButton {
+    Q_OBJECT
+
+public:
+    explicit WindowCaptionButton(CaptionButtonKind kind, QWidget* parent = nullptr);
+
+    void setMaximized(bool maximized);
+
+protected:
+    bool event(QEvent* event) override;
+    void paintEvent(QPaintEvent* event) override;
+
+private:
+    CaptionButtonKind kind_;
+    bool maximized_{};
+    bool hovered_{};
+};
 
 class TitleBar final : public QFrame {
     Q_OBJECT
@@ -33,9 +54,9 @@ private:
     QHBoxLayout* layout_{};
     QHBoxLayout* tools_layout_{};
     QLabel* title_label_{};
-    QPushButton* min_btn_{};
-    QPushButton* max_btn_{};
-    QPushButton* close_btn_{};
+    WindowCaptionButton* min_btn_{};
+    WindowCaptionButton* max_btn_{};
+    WindowCaptionButton* close_btn_{};
     bool allow_maximize_{true};
 };
 

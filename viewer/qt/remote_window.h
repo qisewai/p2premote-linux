@@ -15,6 +15,7 @@ class FramelessDialog;
 class QFrame;
 class QHBoxLayout;
 class QLabel;
+class QMenu;
 class QPushButton;
 class QShowEvent;
 class QStackedWidget;
@@ -22,6 +23,7 @@ class QTabBar;
 class QVBoxLayout;
 class RemoteSessionTab;
 class SettingsDialog;
+class WindowCaptionButton;
 
 class RemoteWindow final : public QWidget {
     Q_OBJECT
@@ -49,28 +51,29 @@ private:
     void onTabMoved(int from, int to);
     void closeTab(int index);
     void refreshChrome();
-    void refreshPluginMenus(RemoteSessionTab* session);
     PluginMenuLayout::Invoke pluginMenuInvoker(RemoteSessionTab* session);
-    void showPluginMenu(QPushButton* button, const QString& slot);
+    void popupToolbarMenu(QPushButton* button, QMenu* menu, bool align_right = false);
     void syncWindowControls();
     void openSettings();
     void toggleFullscreen();
     void positionFullscreenToolbar();
-    void showDisplayMenu();
-    void showAudioMenu();
-    void showActionsMenu();
+    void showControlCenterMenu();
+    void populateDisplayMenu(QMenu& menu, RemoteSessionTab* session);
+    void populateAudioMenu(QMenu& menu, RemoteSessionTab* session);
+    void populateActionsMenu(QMenu& menu, RemoteSessionTab* session);
     void shareAgentDiagnostics();
 
     QFrame* shell_{};
     QVBoxLayout* layout_{};
     QFrame* topbar_{};
+    QFrame* tab_strip_{};
     QTabBar* tabs_{};
     QPushButton* add_tab_{};
-    QPushButton *display_menu_{}, *audio_menu_{}, *input_menu_{}, *tools_menu_{}, *actions_menu_{}, *fullscreen_{};
-    QHBoxLayout* plugin_toolbar_{};
+    QPushButton* control_center_{};
+    QPushButton* exit_fullscreen_{};
+    QFrame* caption_divider_{};
     PluginMenuLayout plugin_menu_;
-    std::vector<PluginMenuLayout::Button> plugin_buttons_;
-    QPushButton *win_min_{}, *win_max_{}, *win_close_{};
+    WindowCaptionButton *win_min_{}, *win_max_{}, *win_close_{};
     QStackedWidget* stack_{};
     QFrame* statusbar_{};
     QLabel* status_text_{};
