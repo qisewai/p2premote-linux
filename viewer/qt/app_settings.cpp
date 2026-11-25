@@ -180,7 +180,7 @@ QVector<PluginSettingSpec> AppSettings::discoverPlugins() {
         const auto role = ui.value(QStringLiteral("role")).toString(QStringLiteral("viewer"));
         spec.host_config = role == QStringLiteral("host");
 #if !defined(Q_OS_WIN)
-        if (!spec.roles.contains(QStringLiteral("viewer")) || spec.permissions.contains(QStringLiteral("file_clipboard"))) continue;
+        if (!spec.roles.contains(QStringLiteral("viewer"))) continue;
         if (spec.host_config) spec.placement = PluginSettingSpec::Placement::none;
 #endif
 

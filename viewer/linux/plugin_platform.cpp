@@ -1,80 +1,18 @@
 #include "plugin_platform.h"
 
-#include <QApplication>
-#include <QClipboard>
 #include <QDir>
 #include <QLockFile>
-#include <QMimeData>
 #include <QSaveFile>
 #include <QStandardPaths>
 
 #include <openssl/rand.h>
 
-#include <atomic>
 #include <cerrno>
-#include <mutex>
 
 #include <fcntl.h>
 #include <unistd.h>
 
 namespace p2premote {
-
-struct ClipboardBridge::State {
-    std::mutex mutex;
-    std::string text;
-};
-
-namespace {
-
-std::weak_ptr<ClipboardBridge::State> clipboard_state;
-constexpr std::size_t clipboard_limit = 60 * 1024;
-
-void readClipboard(const std::shared_ptr<ClipboardBridge::State>& state) {
-    const auto* mime = QApplication::clipboard()->mimeData();
-    const auto text = mime && mime->hasText() && !mime->hasUrls() ? mime->text().toUtf8() : QByteArray{};
-    const std::lock_guard lock(state->mutex);
-    state->text = static_cast<std::size_t>(text.size()) <= clipboard_limit ? text.toStdString() : std::string{};
-}
-
-} // namespace
-
-void initializePluginClipboard() {
-    auto* clipboard = QApplication::clipboard();
-    auto state = std::make_shared<ClipboardBridge::State>();
-    clipboard_state = state;
-    QObject::connect(clipboard, &QClipboard::dataChanged, clipboard, [state] { readClipboard(state); });
-    readClipboard(state);
-}
-
-ClipboardBridge::ClipboardBridge() : state_(clipboard_state.lock()), active_(std::make_shared<std::atomic_bool>(true)) {}
-ClipboardBridge::~ClipboardBridge() { CancelWrite(); }
-bool ClipboardBridge::Available() const noexcept { return static_cast<bool>(state_); }
-
-bool ClipboardBridge::SetText(std::string_view text) {
-    if (!state_ || text.size() > clipboard_limit) return false;
-    QStringDecoder decoder(QStringDecoder::Utf8);
-    const QString value = decoder(QByteArrayView(text.data(), text.size()));
-    if (decoder.hasError()) return false;
-    auto active = active_;
-    return QMetaObject::invokeMethod(qApp, [active = std::move(active), value] {
-        if (active->load()) QApplication::clipboard()->setText(value);
-    }, Qt::QueuedConnection);
-}
-
-bool ClipboardBridge::Poll(std::uint64_t now) {
-    poll_at_ = now + 100;
-    if (!state_) return false;
-    const std::lock_guard lock(state_->mutex);
-    if (text_ == state_->text) return false;
-    text_ = state_->text;
-    return true;
-}
-
-unsigned long ClipboardBridge::Wait(std::uint64_t now) const noexcept {
-    return poll_at_ > now ? static_cast<unsigned long>(poll_at_ - now) : 0;
-}
-
-void ClipboardBridge::CancelWrite() noexcept { active_->store(false); }
 
 std::filesystem::path DefaultPluginSettingsDirectory() {
     const auto root = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);

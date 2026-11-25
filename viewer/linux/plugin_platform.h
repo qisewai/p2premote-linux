@@ -12,7 +12,9 @@
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +34,8 @@ struct LocalClipboardFile {
     std::string path, name;
 };
 
+inline constexpr std::size_t max_clipboard_files = 512;
+
 class ClipboardBridge {
 public:
     ClipboardBridge();
@@ -42,17 +46,27 @@ public:
     bool Poll(std::uint64_t now);
     unsigned long Wait(std::uint64_t now) const noexcept;
     void CancelWrite() noexcept;
+    void WatchFiles() noexcept;
     const std::vector<LocalClipboardFile>& Files() const noexcept { return files_; }
-    std::string_view FileIssue() const noexcept { return {}; }
+    std::string_view FileIssue() const noexcept { return file_issue_; }
 
     struct State;
 
 private:
     std::shared_ptr<State> state_;
-    std::shared_ptr<std::atomic_bool> active_;
+    std::shared_ptr<std::atomic_uint64_t> write_generation_;
     std::string text_;
     std::vector<LocalClipboardFile> files_;
+    std::string_view file_issue_;
+    std::uint64_t revision_{};
     std::uint64_t poll_at_{};
+    bool watch_files_{};
+};
+
+struct ClipboardFile {
+    std::string name;
+    std::uint64_t size{};
+    bool directory{};
 };
 
 struct ClipboardReadRequest {
@@ -63,11 +77,25 @@ struct ClipboardReadRequest {
 
 class FileClipboard {
 public:
-    bool Available() const noexcept { return false; }
-    std::string_view TakeError() const { return {}; }
-    std::optional<ClipboardReadRequest> TakeRequest() { return {}; }
-    bool Reply(std::uint32_t, std::optional<std::string_view>) { return false; }
-    void Clear() {}
+    explicit FileClipboard(std::function<void()> wake = {});
+    ~FileClipboard();
+    FileClipboard(const FileClipboard&) = delete;
+    FileClipboard& operator=(const FileClipboard&) = delete;
+
+    bool Available() const noexcept;
+    std::string_view Publish(std::uint32_t offer, const std::vector<ClipboardFile>& files);
+    void Clear(std::uint32_t offer = 0);
+    std::string_view TakeError();
+    std::optional<ClipboardReadRequest> TakeRequest();
+    bool Reply(std::uint32_t id, std::optional<std::string_view> data);
+
+    struct State;
+
+private:
+    struct Mount;
+    std::shared_ptr<ClipboardBridge::State> clipboard_;
+    std::shared_ptr<State> state_;
+    std::unique_ptr<Mount> mount_;
 };
 
 class PluginSettings {

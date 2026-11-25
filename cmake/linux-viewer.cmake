@@ -4,6 +4,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LINUX_LUA REQUIRED IMPORTED_TARGET lua5.4)
 pkg_check_modules(LINUX_SECRET REQUIRED IMPORTED_TARGET libsecret-1)
 pkg_check_modules(LINUX_PULSE REQUIRED IMPORTED_TARGET libpulse)
+pkg_check_modules(LINUX_FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 find_path(LIBYUV_INCLUDE_DIR libyuv.h REQUIRED)
 find_library(LIBYUV_LIBRARY NAMES yuv REQUIRED)
 find_package(ghostty-vt 1.0.1 CONFIG REQUIRED
@@ -36,6 +37,7 @@ add_executable(p2premote_linux_viewer
     viewer/linux/audio.cpp
     viewer/linux/credentials.cpp
     viewer/linux/cursor_shape.cpp
+    viewer/linux/file_clipboard.cpp
     viewer/linux/lan_discovery.cpp
     viewer/linux/plugin_platform.cpp
     viewer/linux/single_instance.cpp
@@ -53,7 +55,7 @@ target_include_directories(p2premote_linux_viewer PRIVATE
 target_include_directories(p2premote_linux_viewer SYSTEM PRIVATE
     "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
 target_link_libraries(p2premote_linux_viewer PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets OpenSSL::Crypto
-    PkgConfig::LINUX_LUA PkgConfig::LINUX_SECRET PkgConfig::LINUX_PULSE ghostty-vt::ghostty-vt
+    PkgConfig::LINUX_LUA PkgConfig::LINUX_SECRET PkgConfig::LINUX_PULSE PkgConfig::LINUX_FUSE3 ghostty-vt::ghostty-vt
     "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}")
 
 add_custom_target(p2premote_linux_plugins
@@ -90,3 +92,13 @@ target_compile_features(linux_audio_buffer_test PRIVATE cxx_std_20)
 target_compile_options(linux_audio_buffer_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME linux_audio_buffer_test COMMAND linux_audio_buffer_test)
 set_tests_properties(linux_audio_buffer_test PROPERTIES TIMEOUT 10)
+
+add_executable(linux_file_clipboard_test
+    viewer/linux/file_clipboard_test.cpp viewer/linux/file_clipboard.cpp viewer/linux/plugin_platform.cpp
+    core/src/plugin_host.cpp proto/plugin_protocol.cpp)
+target_compile_features(linux_file_clipboard_test PRIVATE cxx_std_20)
+target_compile_options(linux_file_clipboard_test PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(linux_file_clipboard_test PRIVATE core/include core/src proto/include viewer/linux)
+target_link_libraries(linux_file_clipboard_test PRIVATE Qt6::Widgets OpenSSL::Crypto PkgConfig::LINUX_LUA PkgConfig::LINUX_FUSE3)
+add_test(NAME linux_file_clipboard_test COMMAND linux_file_clipboard_test "${CMAKE_CURRENT_SOURCE_DIR}/plugins/file-clipboard")
+set_tests_properties(linux_file_clipboard_test PROPERTIES TIMEOUT 15 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

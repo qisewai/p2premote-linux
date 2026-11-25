@@ -62,7 +62,8 @@
         lua_setfield(state, -2, "mtime");
         lua_pushinteger(state, FileStamp(info));
         lua_setfield(state, -2, "stamp");
-        lua_pushboolean(state, S_ISLNK(info.st_mode));
+        const bool unsupported = exists && lua_toboolean(state, 2) && !S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode);
+        lua_pushboolean(state, S_ISLNK(info.st_mode) || unsupported);
         lua_setfield(state, -2, "reparse");
         return 1;
     }
@@ -111,6 +112,7 @@
             struct stat info{};
             if (::fstatat(directory.get(), entry->d_name, &info, AT_SYMLINK_NOFOLLOW) != 0 ||
                 (!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode))) continue;
+            if (strict && name.find('\\') != std::string_view::npos) return FsError(state, "文件名包含反斜杠");
             if (values.size() == limit) {
                 truncated = true;
                 break;

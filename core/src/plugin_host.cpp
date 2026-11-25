@@ -1490,7 +1490,6 @@ private:
         return 1;
     }
 
-#if defined(_WIN32)
     static std::uint32_t ClipboardId(lua_State* state) {
         const auto id = luaL_checkinteger(state, 1);
         if (id <= 0 || id > UINT32_MAX) luaL_argerror(state, 1, "invalid clipboard ID");
@@ -1509,11 +1508,16 @@ private:
             if (lua_type(state, -3) != LUA_TSTRING || !lua_isinteger(state, -2) || !lua_isboolean(state, -1)) return false;
             std::size_t length{};
             const auto* name = lua_tolstring(state, -3, &length);
-            if (!length || length >= 4 * MAX_PATH) return false;
-            auto wide = Utf8ToWide({name, length});
+            if (!length || length >= 4 * 260) return false;
             const auto size = lua_tointeger(state, -2);
-            if (!wide || size < 0) return false;
+            if (size < 0) return false;
+#if defined(_WIN32)
+            auto wide = Utf8ToWide({name, length});
+            if (!wide) return false;
             files.push_back({std::move(*wide), static_cast<std::uint64_t>(size), lua_toboolean(state, -1) != 0});
+#else
+            files.push_back({std::string(name, length), static_cast<std::uint64_t>(size), lua_toboolean(state, -1) != 0});
+#endif
             lua_pop(state, 4);
         }
         return true;
@@ -1525,10 +1529,18 @@ private:
         const auto offer = ClipboardId(state);
         luaL_checktype(state, 2, LUA_TTABLE);
         bool published{};
+#if !defined(_WIN32)
+        std::string_view error;
+#endif
         try {
             std::vector<ClipboardFile> files;
             if (runtime.Connected() && runtime.file_clipboard && ReadFileDescriptors(state, files)) {
+#if defined(_WIN32)
                 published = runtime.file_clipboard->Publish(offer, files);
+#else
+                error = runtime.file_clipboard->Publish(offer, files);
+                published = error.empty();
+#endif
                 if (published) {
                     runtime.file_clipboard_owner = &self;
                     runtime.clipboard->CancelWrite();
@@ -1536,6 +1548,12 @@ private:
             }
         } catch (...) {}
         lua_pushboolean(state, published);
+#if !defined(_WIN32)
+        if (!error.empty()) {
+            PushString(state, error);
+            return 2;
+        }
+#endif
         return 1;
     }
 
@@ -1557,12 +1575,6 @@ private:
         return 1;
     }
 
-#else
-    static int PublishFiles(lua_State* state) { lua_pushboolean(state, false); return 1; }
-    static int ClearPublishedFiles(lua_State*) { return 0; }
-    static int ReplyToClipboardRead(lua_State* state) { lua_pushboolean(state, false); return 1; }
-
-#endif
     static int AddMenu(lua_State* state) {
         auto& self = Self(state);
         luaL_checktype(state, 1, LUA_TTABLE);
@@ -1714,7 +1726,7 @@ private:
                 if (auto message = UiText(text, 96)) {
                     std::ranges::replace(*message, L'\n', L' ');
                     std::ranges::replace(*message, L'\r', L' ');
-                    queued = runtime.workspace.Request({PluginAction::Kind::notice, std::move(*message)});
+                    queued = runtime.workspace.Request({PluginAction::Kind::notice, std::move(*message), {}});
                 }
             }
         } catch (...) {}
@@ -3165,18 +3177,20 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
                     || manifest->ui || manifest->input || manifest->video || manifest->fs || manifest->pty)) continue;
 #if defined(_WIN32)
             if (restricted_host && (manifest->pty || manifest->fs || manifest->file_clipboard)) continue;
-#else
-            if (manifest->file_clipboard) continue;
 #endif
             const auto script = ReadFile(entry, 128 * 1024);
             if (manifest->clipboard || manifest->file_clipboard) {
                 if (!runtime.clipboard) runtime.clipboard.emplace();
-#if defined(_WIN32)
                 if (manifest->file_clipboard && !runtime.file_clipboard) {
                     runtime.clipboard->WatchFiles();
-                    if (runtime.clipboard->Available()) runtime.file_clipboard.emplace(runtime.wake.Native());
-                }
+                    if (runtime.clipboard->Available()) {
+#if defined(_WIN32)
+                        runtime.file_clipboard.emplace(runtime.wake.Native());
+#else
+                        runtime.file_clipboard.emplace([&wake = runtime.wake] { wake.Signal(); });
 #endif
+                    }
+                }
                 runtime.clipboard->Poll(TickMilliseconds());
             }
             auto plugin = std::make_unique<LuaPlugin>(std::move(*manifest), runtime);

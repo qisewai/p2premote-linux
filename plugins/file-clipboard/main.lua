@@ -23,6 +23,9 @@ local problems = {
     clipboard_changed = "剪贴板内容在同步时已变更，请重新复制文件。",
     publish_failed = "无法写入文件剪贴板，请重新复制文件。",
     manifest_invalid = "无法识别收到的文件清单，请重新复制文件。",
+    clipboard_too_large = "文件剪贴板内容超出上限。请使用远程工具里的文件传输。",
+    cache_unavailable = "无法暂存收到的文件。请检查本机临时目录和可用空间，或使用文件传输。",
+    mount_unavailable = "无法挂载虚拟文件剪贴板，请检查本机 FUSE (/dev/fuse) 是否可用。",
     peer_unavailable = "对端文件剪贴板未就绪。请确认两端已启用文件剪贴板后重试。",
     selection_expired = "复制的文件已失效，请重新复制后再粘贴。",
     source_unavailable = "源文件已变更或无法读取，请重新复制后再粘贴。",
@@ -55,6 +58,7 @@ local function collect(selection)
     for i = #selection, 1, -1 do pending[#pending + 1] = selection[i] end
     while #pending > 0 do
         local item = table.remove(pending)
+        local separator = item.path:sub(1, 1) == "/" and "/" or "\\"
         local info = fs.stat(item.path, true)
         if not info or not info.exists then return nil end
         if not info.reparse then
@@ -70,7 +74,7 @@ local function collect(selection)
                     local child = list.entries[i]
                     local name = item.name .. "\\" .. child.name
                     if #name >= 4 * 260 then return nil end
-                    pending[#pending + 1] = { name = name, path = item.path .. "\\" .. child.name }
+                    pending[#pending + 1] = { name = name, path = item.path .. separator .. child.name }
                 end
             end
         end
@@ -138,7 +142,7 @@ end)
 
 clipboard.on_error(function(code)
     report(code)
-    if code == "transfer_timeout" then stop_incoming(true) end
+    if code == "transfer_timeout" or code == "clipboard_changed" or code == "cache_unavailable" or code == "mount_unavailable" then stop_incoming(true) end
 end)
 
 local function send_read()
@@ -296,11 +300,12 @@ channel.on_message(function(kind, payload)
             return
         end
         if manifest.id <= remote_offer then return end
-        if clipboard.publish(manifest.id, manifest.files) then
+        local published, issue = clipboard.publish(manifest.id, manifest.files)
+        if published then
             stop_incoming(true)
             remote_offer = manifest.id
         else
-            report("manifest_invalid")
+            report(issue or "manifest_invalid")
         end
     elseif kind == "read" then
         serve(payload)

@@ -12,7 +12,7 @@
 
 两端安装内置 `clipboard-sync` 插件后，已授权的远控会话支持双向复制粘贴文本。连接时会先同步主控端现有的文本，随后同步两端新复制的文本，每条最多 60 KiB。可将程序旁 `plugins/clipboard-sync/plugin.json` 的 `enabled` 改为 `false`，下次连接时关闭同步。插件接口见 [Lua 插件设计](lua-plugin-design.md)。
 
-两端更新客户端后，可在 Windows 资源管理器中用 `Ctrl+C` 复制文件或文件夹，在另一端的目标目录按 `Ctrl+V` 粘贴。复制时只同步文件清单，粘贴时按需读取内容。一次复制最多 512 项，含子文件和子目录，清单上限为 60 KiB。开始粘贴前请保持会话连接和源文件可读。若要关闭文件剪贴板，把程序旁 `plugins/file-clipboard/plugin.json` 的 `enabled` 改为 `false` 并重新连接。
+两端更新客户端后，可用 `Ctrl+C` 复制文件或文件夹，在另一端的文件管理器中按 `Ctrl+V` 粘贴。两端均采用虚拟文件按需传输，仅在粘贴时读取文件内容。一次复制最多 512 项，含子文件和子目录，清单上限为 60 KiB。请保持会话连接和源文件可读。若要关闭文件剪贴板，把程序旁 `plugins/file-clipboard/plugin.json` 的 `enabled` 改为 `false` 并重新连接。
 
 Qt 主控的「输入」菜单提供快捷键、文本模板和键盘状态同步，「工具」菜单提供文件传输和远程终端，「画面」菜单提供智能画质和浮层开关。设置中的「输入与控制」「画面与音频」「画面浮层」提供对应配置。键盘同步和智能画质首次使用默认关闭。智能画质在「自动」档切换码率，分辨率独立设置。快捷输入和键盘同步需两端更新客户端。
 
@@ -378,9 +378,11 @@ ctest --preset windows-x64-qt-release
 
 Linux x86-64 主控端与 Windows 共享 Qt 主窗口、设置、会话标签和控制中心。可在「局域网直连」中选择发现的被控端，或输入地址、端口与验证码。登录账号后可在「我的设备」中连接在线设备。点击远程画面接管键鼠，F11 切换全屏，F12 释放键鼠。支持播放远端声音和从当前会话发送麦克风声音。
 
-两端使用相同的 Lua 脚本和插件协议。Linux 支持文本剪贴板、文件传输窗口、远程终端、快捷宏、键盘锁定状态、自动码率、连接状态、会话秒表和只读诊断。文件剪贴板的文件管理器直接粘贴尚未移植，可在「控制中心 → 文件传输」里传文件。账号和局域网凭据使用桌面的 Secret Service 密钥环。
+两端使用相同的 Lua 脚本和插件协议。Linux 支持文本剪贴板、文件剪贴板、文件传输窗口、远程终端、快捷宏、键盘锁定状态、自动码率、连接状态、会话秒表和只读诊断。账号和局域网凭据使用桌面的 Secret Service 密钥环。
 
-构建需要 GCC、CMake、Ninja、Xmake、Qt 6.8 或更新版本（Widgets、Network、WebSockets）、OpenSSL、libyuv、Lua 5.4、libsecret 和 PulseAudio 的开发包，以及 [libghostty-vt 1.0.1](https://lib.ghostty.org/vt/installing.html#build-from-source)。Linux 上从源码构建 libghostty-vt，可安装到 `~/.local/share/p2premote/ghostty-vt`，也可在配置时用 `CMAKE_PREFIX_PATH` 指定其前缀。MiniRTC 还需要归档解压工具、Meson 1.4 或更新版本、Autotools 和 NASM。
+Linux 文件管理器和 Windows 资源管理器可以双向复制粘贴文件或文件夹。两侧均通过虚拟文件在粘贴时按需读取内容：Linux 接收时通过用户态 FUSE3 挂载只读虚拟目录（需要 `/dev/fuse` 与 `fusermount3`），复制时不提前下载文件内容，也不占用本地临时目录空间。
+
+构建需要 GCC、CMake、Ninja、Xmake、Qt 6.8 或更新版本（Widgets、Network、WebSockets）、OpenSSL、libyuv、Lua 5.4、libsecret、PulseAudio 和 FUSE3（`fuse3`）的开发包，以及 [libghostty-vt 1.0.1](https://lib.ghostty.org/vt/installing.html#build-from-source)。Linux 上从源码构建 libghostty-vt，可安装到 `~/.local/share/p2premote/ghostty-vt`，也可在配置时用 `CMAKE_PREFIX_PATH` 指定其前缀。MiniRTC 还需要归档解压工具、Meson 1.4 或更新版本、Autotools 和 NASM。
 
 ```bash
 bash tools/minirtc_probe/Build-Linux.sh
