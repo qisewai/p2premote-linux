@@ -49,7 +49,6 @@ add_library(core STATIC
     core/src/audio_engine.cpp
     core/src/d3d11_preview.cpp
     core/src/d3d11_video.cpp
-    core/src/wgc_capturer.cpp
     core/src/dxgi_capturer.cpp
     core/src/stream_session.cpp
     core/src/minirtc_call.cpp
@@ -172,10 +171,6 @@ set_tests_properties(lan_video_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 18)
 set_tests_properties(diagnostics_transport_test PROPERTIES LABELS "loopback" TIMEOUT 12)
 set_tests_properties(idle_scroll_test continuous_scroll_test encoder_backlog_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 60
     SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
-
-add_executable(dxgi_cursor_check_test core/src/dxgi_cursor_check_test.cpp)
-target_compile_features(dxgi_cursor_check_test PRIVATE cxx_std_20)
-add_test(NAME dxgi_cursor_check_test COMMAND dxgi_cursor_check_test)
 
 add_executable(input_protocol_test proto/input_protocol_test.cpp)
 target_link_libraries(input_protocol_test PRIVATE input_protocol)

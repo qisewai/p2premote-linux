@@ -22,8 +22,8 @@ struct p2p_stream {
 
     explicit p2p_stream(QWidget* widget) : video(widget) {
         if (video) attachVideoSession(video, &session);
-        session.frameReceived = [this](VideoFrame& frame) {
-            if (video) setVideoFrame(video, frame);
+        session.frameReady = [this] {
+            if (video) video->update();
         };
         session.cursorChanged = [this](DecodedCursor cursor) {
             if (video) setVideoCursor(video, std::move(cursor));
@@ -195,13 +195,15 @@ int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* out) {
     if (!stream || !out) return P2P_ERROR;
     const auto& session = stream->session;
     const auto& m = session.metrics();
+    const auto decoded = session.decodedFrames();
     stream->notice = session.notice().toStdWString();
     const auto* plugins = session.plugins();
     *out = {stream->status.c_str(), L"H264 (MiniRTC)", stream->notice.c_str(), session.iceProtocol().constData(),
-        0, 0, m.presented, m.presented, m.presented, m.width, m.height, m.upload_bps.value_or(0),
+        0, 0, decoded, decoded, m.presented, m.width, m.height, m.upload_bps.value_or(0),
         m.download_bps.value_or(0), session.confirmedBitrate(), p2p_stream_state(stream), session.icePath(),
         session.canControl(), session.canControl(), plugins && plugins->HasMenu(), session.srtpActive(), 0, 0,
-        m.seconds, m.rtt_ms.value_or(-1), m.loss.value_or(-1), -1, -1, -1, -1};
+        m.seconds, m.rtt_ms.value_or(-1), m.loss.value_or(-1), -1, session.drawToPresentMs(), -1,
+        m.frame_wait_ms.value_or(-1)};
     return P2P_OK;
 }
 
@@ -282,10 +284,13 @@ int32_t p2p_stream_export_csv(p2p_stream* stream, const wchar_t* name) {
     if (!file.open(QIODevice::WriteOnly)) return fail(file.errorString());
     const auto& stats = stream->session.metrics();
     QTextStream out(&file);
-    out << "seconds,width,height,presented,ice_path,rtt_ms,loss_fraction,download_bps,upload_bps\n"
+    out << "seconds,width,height,presented,ice_path,rtt_ms,loss_fraction,download_bps,upload_bps,"
+           "decoded,decoded_frame_wait_ms,draw_to_present_ms\n"
         << stats.seconds << ',' << stats.width << ',' << stats.height << ',' << stats.presented << ','
         << static_cast<int>(stats.route) << ',' << stats.rtt_ms.value_or(-1) << ',' << stats.loss.value_or(-1) << ','
-        << stats.download_bps.value_or(0) << ',' << stats.upload_bps.value_or(0) << '\n';
+        << stats.download_bps.value_or(0) << ',' << stats.upload_bps.value_or(0) << ','
+        << stream->session.decodedFrames() << ',' << stats.frame_wait_ms.value_or(-1) << ','
+        << stream->session.drawToPresentMs() << '\n';
     out.flush();
     return out.status() == QTextStream::Ok && file.commit() ? P2P_OK : fail(file.errorString());
 }

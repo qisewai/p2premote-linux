@@ -1,8 +1,48 @@
 #pragma once
 
-#include "wgc_capturer.h"
+#include <d3d11.h>
+#include <windows.h>
+#include <winrt/base.h>
+
+#include <cstdint>
+#include <memory>
+#include <optional>
 
 namespace p2premote {
+
+struct FrameMetadata {
+    std::uint64_t frame_id{};
+    std::int64_t capture_qpc{};
+    unsigned width{};
+    unsigned height{};
+    std::int64_t source_qpc{};
+};
+
+struct CapturedFrame {
+    FrameMetadata metadata;
+    std::int64_t ready_qpc{};
+    // Keep the captured texture valid until its GPU work is queued.
+    std::shared_ptr<void> desktop_lease;
+    winrt::com_ptr<ID3D11Texture2D> texture;
+};
+
+struct CaptureProgress {
+    unsigned acquired{};
+    unsigned dropped{};
+    unsigned width{};
+    unsigned height{};
+};
+
+class IVideoCapturer {
+public:
+    virtual ~IVideoCapturer() = default;
+    [[nodiscard]] virtual HANDLE ReadyEvent() const noexcept = 0;
+    [[nodiscard]] virtual bool IsSourceClosed() const noexcept = 0;
+    [[nodiscard]] virtual HRESULT SourceError() const noexcept { return S_OK; }
+    virtual bool SetCursorCapture(bool enabled) noexcept = 0;
+    virtual CaptureProgress Poll() = 0;
+    virtual std::optional<CapturedFrame> TakeFrame() noexcept = 0;
+};
 
 std::unique_ptr<IVideoCapturer> StartDesktopDuplication(
     HMONITOR monitor, ID3D11Device* device, bool capture_cursor = true);

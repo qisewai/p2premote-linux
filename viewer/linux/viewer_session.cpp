@@ -8,6 +8,7 @@
 
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -154,6 +155,8 @@ void ViewerSession::open(const QString& host, quint16 port, const QString& code)
 
     key_ = QCryptographicHash::hash("p2premote-lan-v1:" + code.toUtf8(), QCryptographicHash::Sha256);
     metrics_ = {};
+    decoded_frames_.store(0, std::memory_order_relaxed);
+    draw_to_present_ms_ = 0;
     state_ = State::challenge;
     if (statusChanged) statusChanged(QStringLiteral("正在连接 %1:%2…").arg(address).arg(port));
     timeout_.start(8000);
@@ -171,6 +174,8 @@ void ViewerSession::openCloud(CloudConnection connection, const QString& device,
     cloud_ = std::move(connection);
     cloud_device_ = device;
     metrics_ = {};
+    decoded_frames_.store(0, std::memory_order_relaxed);
+    draw_to_present_ms_ = 0;
     state_ = State::approval;
     if (statusChanged) statusChanged(QStringLiteral("正在连接云端信令…"));
     timeout_.start(15000);
@@ -241,7 +246,6 @@ void ViewerSession::stop(const QString& status) {
     video_attempts_ = 0;
     video_retry_.invalidate();
     cursor_separate_ = false;
-    cursor_attempts_ = 0;
     cursor_retry_.invalidate();
     active_bitrate_ = requested_bitrate_;
     notice_.clear();
@@ -257,7 +261,7 @@ void ViewerSession::stop(const QString& status) {
         const std::lock_guard lock(frame_mutex_);
         pending_frame_ = {};
         recycled_frame_ = {};
-        pending_frame_ms_ = 0;
+        latest_frame_size_ = {};
         frame_wait_sum_ms_ = 0;
         frame_wait_samples_ = 0;
     }
@@ -513,7 +517,7 @@ void ViewerSession::startStreaming() {
     if (statusChanged) {
         if (diagnostics_) {
             statusChanged(QStringLiteral("已连接 · 只读诊断"));
-        } else if (metrics_.presented) {
+        } else if (metrics_.width) {
             statusChanged(control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看"));
         } else {
             statusChanged(QStringLiteral("已建立媒体通道，等待被控端画面…"));
@@ -538,6 +542,7 @@ void ViewerSession::receiveVideo(const MiniRtcVideoFrame* frame, const char*, si
 }
 
 void ViewerSession::queueFrame(const char* data, int width, int height, std::size_t size, std::uint64_t generation) {
+    const auto decoded_at = std::chrono::steady_clock::now();
     VideoFrame buffer;
     {
         const std::lock_guard lock(frame_mutex_);
@@ -549,8 +554,8 @@ void ViewerSession::queueFrame(const char* data, int width, int height, std::siz
     std::memcpy(buffer.nv12.data(), data, size);
     buffer.width = width;
     buffer.height = height;
+    buffer.decoded_at = decoded_at;
 
-    const auto arrived_ms = monotonicMilliseconds();
     bool notify{};
     {
         const std::lock_guard lock(frame_mutex_);
@@ -558,42 +563,49 @@ void ViewerSession::queueFrame(const char* data, int width, int height, std::siz
             recycled_frame_ = std::move(pending_frame_);
         }
         pending_frame_ = std::move(buffer);
-        pending_frame_generation_ = generation;
-        pending_frame_ms_ = arrived_ms;
+        latest_frame_size_ = {width, height};
+        latest_frame_generation_ = generation;
+        decoded_frames_.fetch_add(1, std::memory_order_relaxed);
         notify = !std::exchange(frame_update_pending_, true);
     }
     if (!notify) return;
 
+    // Wake the UI without taking the frame. Painting selects the newest frame available at that point.
     QMetaObject::invokeMethod(this, [this] {
-        VideoFrame frame;
-        std::uint64_t generation;
-        std::uint64_t arrived_ms{};
+        QSize size;
+        bool has_frame{};
         {
             const std::lock_guard lock(frame_mutex_);
             frame_update_pending_ = false;
-            frame = std::exchange(pending_frame_, {});
-            generation = pending_frame_generation_;
-            arrived_ms = pending_frame_ms_;
+            if (latest_frame_generation_ != generation_) return;
+            size = latest_frame_size_;
+            has_frame = !pending_frame_.nv12.isEmpty();
         }
-        if (generation == generation_ && frame.width > 0 && frame.height > 0 && !frame.nv12.isEmpty()) {
-            const auto now_ms = monotonicMilliseconds();
-            const double wait_ms = now_ms >= arrived_ms ? static_cast<double>(now_ms - arrived_ms) : 0.0;
-            frame_wait_sum_ms_ += wait_ms;
-            ++frame_wait_samples_;
-            metrics_.width = frame.width;
-            metrics_.height = frame.height;
-            const bool first_frame = ++metrics_.presented == 1;
-            if (frameReceived) frameReceived(frame);
-            if (transport_ready_ && state_ == State::negotiation) startStreaming();
-            else if (first_frame && state_ == State::streaming && !diagnostics_ && statusChanged) {
-                statusChanged(control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看"));
-            }
-        }
-        if (!frame.nv12.isEmpty()) {
-            const std::lock_guard lock(frame_mutex_);
-            if (recycled_frame_.nv12.isEmpty()) recycled_frame_ = std::move(frame);
+        if (size.isEmpty()) return;
+        const bool first_frame = !metrics_.width;
+        metrics_.width = size.width();
+        metrics_.height = size.height();
+        if (has_frame && frameReady) frameReady();
+        if (transport_ready_ && state_ == State::negotiation) startStreaming();
+        else if (first_frame && state_ == State::streaming && !diagnostics_ && statusChanged) {
+            statusChanged(control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看"));
         }
     }, Qt::QueuedConnection);
+}
+
+bool ViewerSession::takeLatestFrame(VideoFrame& frame) {
+    const std::lock_guard lock(frame_mutex_);
+    if (latest_frame_generation_ != generation_ || pending_frame_.nv12.isEmpty()) return false;
+    std::swap(frame, pending_frame_);
+    if (recycled_frame_.nv12.isEmpty()) recycled_frame_ = std::move(pending_frame_);
+    pending_frame_ = {};
+    return true;
+}
+
+void ViewerSession::recordFrameSwapped(double wait_ms, double draw_to_swap_ms) {
+    frame_wait_sum_ms_ += wait_ms;
+    ++frame_wait_samples_;
+    draw_to_present_ms_ += (draw_to_swap_ms - draw_to_present_ms_) / static_cast<double>(++metrics_.presented);
 }
 
 bool ViewerSession::sendInput(InputKind kind, std::uint16_t code, std::uint16_t x, std::uint16_t y) {
@@ -671,7 +683,7 @@ void ViewerSession::processData(QByteArray data, const QByteArray& label) {
         }
     } else if (label == cursor_stream && !diagnostics_ && control_allowed_) {
         if (auto cursor = decodeRemoteCursor({data.constData(), static_cast<std::size_t>(data.size())})) {
-            cursor_separate_ = true;
+            if (!std::exchange(cursor_separate_, true)) qInfo("P2P Remote: received separate cursor");
             if (cursorChanged) cursorChanged(std::move(*cursor));
         }
     } else if (label == plugin_stream && plugins_) {
@@ -744,7 +756,6 @@ void ViewerSession::applyMediaSettings() {
 }
 
 void ViewerSession::sendCursorReady() {
-    ++cursor_attempts_;
     cursor_retry_.start();
     sendInput(InputKind::cursor_ready);
 }
@@ -784,8 +795,8 @@ void ViewerSession::tick() {
         video_retry_.isValid() && video_retry_.hasExpired(1000)) {
         sendVideoSettings();
     }
-    if (canControl() && !cursor_separate_ && cursor_attempts_ < 12 &&
-        cursor_retry_.isValid() && cursor_retry_.hasExpired(1000)) {
+    const auto cursor_retry_ms = connected_since_.elapsed() < 12'000 ? 1000 : 4000;
+    if (canControl() && !cursor_separate_ && cursor_retry_.isValid() && cursor_retry_.hasExpired(cursor_retry_ms)) {
         sendCursorReady();
     }
     if (overlay_plugins_) overlay_plugins_->UpdateMetrics(metrics_);

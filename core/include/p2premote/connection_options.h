@@ -30,7 +30,6 @@ struct ConnectionOptions {
     std::uint16_t lan_port{27887};
     std::wstring lan_access_code;
     bool fixed_cadence{};
-    bool desktop_duplication{true};
     bool video_cursor{};
     bool test_present_immediate{};
 

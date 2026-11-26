@@ -1,5 +1,4 @@
 #include "dxgi_capturer.h"
-#include "dxgi_cursor_check.h"
 
 #include "qpc.h"
 
@@ -57,21 +56,16 @@ public:
 
     HANDLE ReadyEvent() const noexcept override { return timer_.get(); }
     bool IsSourceClosed() const noexcept override { return failed_; }
-    bool PreferFallbackCapture() const noexcept override { return fallback_to_wgc_; }
     HRESULT SourceError() const noexcept override { return source_error_; }
-    bool CanRestoreDxgi() const noexcept override { return capture_cursor_ || pointer_visible_; }
-    bool HasFrame() const noexcept override { return pending_.has_value(); }
 
     bool SetCursorCapture(bool enabled) noexcept override {
         if (capture_cursor_ == enabled) return true;
         capture_cursor_ = enabled;
-        cursor_check_ = {};
+        pending_.reset();
+        refresh_desktop_ = !enabled && has_desktop_copy_;
         if (!enabled) {
-            desktop_copy_ = nullptr;
             composed_ = nullptr;
             patch_staging_ = nullptr;
-            desktop_desc_ = {};
-            has_desktop_copy_ = false;
             pointer_drawn_ = false;
         }
         return true;
@@ -83,11 +77,12 @@ public:
         winrt::com_ptr<IDXGIResource> resource;
         // Avoid blocking the shared D3D device while the hardware encoder is active.
         const auto result = duplication_->AcquireNextFrame(0, &info, resource.put());
-        if (result == DXGI_ERROR_WAIT_TIMEOUT) return {};
+        if (result == DXGI_ERROR_WAIT_TIMEOUT) {
+            return !capture_cursor_ ? TakeCleanDesktopCopy() : CaptureProgress{};
+        }
         if (FAILED(result)) {
             failed_ = true;
             source_error_ = result;
-            fallback_to_wgc_ = false;
             return {};
         }
         FrameLease lease(duplication_);
@@ -108,22 +103,13 @@ public:
             pointer_changed = true;
         }
 
-        // The Viewer can draw the local pointer only when it is separable from the desktop.
-        if (!capture_cursor_ && info.LastMouseUpdateTime.QuadPart) {
-            CURSORINFO cursor{sizeof(cursor)};
-            const bool possibly_embedded = !pointer_visible_ && GetCursorInfo(&cursor)
-                && (cursor.flags & CURSOR_SHOWING)
-                && MonitorFromPoint(cursor.ptScreenPos, MONITOR_DEFAULTTONULL) == monitor_;
-            if (cursor_check_.Observe(possibly_embedded, GetTickCount64())) {
-                failed_ = true;
-                fallback_to_wgc_ = true;
-                return {};
-            }
-        }
-
         const bool desktop_updated = info.LastPresentTime.QuadPart != 0;
         if (!capture_cursor_) {
-            if (!desktop_updated) return {};
+            if (!desktop_updated) return TakeCleanDesktopCopy();
+            refresh_desktop_ = false;
+            desktop_copy_ = nullptr;
+            desktop_desc_ = {};
+            has_desktop_copy_ = false;
             CapturedFrame frame;
             frame.texture = resource.as<ID3D11Texture2D>();
             D3D11_TEXTURE2D_DESC desc{};
@@ -182,6 +168,17 @@ public:
     }
 
 private:
+    CaptureProgress TakeCleanDesktopCopy() noexcept {
+        if (!std::exchange(refresh_desktop_, false)) return {};
+        CapturedFrame frame;
+        frame.texture = std::move(desktop_copy_);
+        frame.metadata = {++frame_id_, QpcNow(), desktop_desc_.Width, desktop_desc_.Height};
+        frame.ready_qpc = frame.metadata.capture_qpc;
+        pending_ = std::move(frame);
+        has_desktop_copy_ = false;
+        return {1, 0, desktop_desc_.Width, desktop_desc_.Height};
+    }
+
     bool UpdatePointerShape(UINT buffer_size) {
         pointer_shape_.resize(buffer_size);
         UINT required{};
@@ -193,7 +190,6 @@ private:
         if (hr == DXGI_ERROR_ACCESS_LOST) {
             failed_ = true;
             source_error_ = hr;
-            fallback_to_wgc_ = false;
             return false;
         }
         if (FAILED(hr)) {
@@ -369,11 +365,10 @@ private:
     bool pointer_drawn_{};
     bool has_desktop_copy_{};
     bool capture_cursor_{true};
-    DxgiCursorCheck cursor_check_;
+    bool refresh_desktop_{};
     std::optional<CapturedFrame> pending_;
     std::uint64_t frame_id_{};
     bool failed_{};
-    bool fallback_to_wgc_{};
     HRESULT source_error_{S_OK};
 };
 

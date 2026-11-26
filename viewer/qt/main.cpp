@@ -10,8 +10,19 @@
 #include <QCommandLineParser>
 #include <QMessageBox>
 #include <QStyle>
+#if defined(__linux__)
+#include <QSurfaceFormat>
+#endif
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__)
+    // QOpenGLWidget renders through the top-level window's OpenGL surface;
+    // swapInterval must be configured on the default surface format so
+    // eglSwapBuffers does not block the GUI thread (input + video) for a full vblank.
+    auto surface_format = QSurfaceFormat::defaultFormat();
+    surface_format.setSwapInterval(0);
+    QSurfaceFormat::setDefaultFormat(surface_format);
+#endif
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("P2PRemote"));
     QCoreApplication::setApplicationName(QStringLiteral("Desktop"));

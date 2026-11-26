@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QFocusEvent>
 #include <QFontDatabase>
+#include <QFontMetrics>
 #include <QGuiApplication>
 #include <QImage>
 #include <QKeyEvent>
@@ -35,8 +36,10 @@ namespace {
 
 using p2premote::InputButton;
 using p2premote::InputKind;
+using FrameClock = std::chrono::steady_clock;
+using FrameMilliseconds = std::chrono::duration<double, std::milli>;
 
-constexpr qint64 mouse_move_min_interval_ms = 4;
+constexpr qint64 mouse_move_min_interval_ms = 2;
 constexpr int drag_tail_delay_ms = 24;
 
 std::uint16_t windowsScanCode(const QKeyEvent& event, bool xkb) {
@@ -164,6 +167,13 @@ public:
         setFocusPolicy(Qt::StrongFocus);
         setMouseTracking(true);
         setObjectName(QStringLiteral("video"));
+        connect(this, &QOpenGLWidget::frameSwapped, this, [this] {
+            const auto timing = std::exchange(pending_swap_, std::nullopt);
+            if (timing && session_ && isVisible()) {
+                session_->recordFrameSwapped(FrameMilliseconds(timing->draw_at - timing->decoded_at).count(),
+                    FrameMilliseconds(FrameClock::now() - timing->draw_at).count());
+            }
+        });
         heartbeat_.setInterval(p2premote::input_heartbeat_ms);
         connect(&heartbeat_, &QTimer::timeout, this, [this] {
             if (session_) session_->sendInput(InputKind::heartbeat);
@@ -192,16 +202,6 @@ public:
 
     bool hasFrame() const { return frame_.width > 0 && frame_.height > 0 && !frame_.nv12.isEmpty(); }
     bool capturing() const { return capturing_; }
-
-    void setFrame(VideoFrame& incoming) {
-        const bool size_changed = frame_.width != incoming.width || frame_.height != incoming.height;
-        std::swap(frame_, incoming);
-        frame_dirty_ = true;
-        if (capturing_ && size_changed) {
-            updatePointerInVideo(mapFromGlobal(QCursor::pos()));
-        }
-        update();
-    }
 
     void setRemoteCursor(DecodedCursor cursor) {
         cursor_separate_ = true;
@@ -245,6 +245,7 @@ public:
         setCapture(false);
         session_ = session;
         frame_ = {};
+        pending_swap_.reset();
         fallback_image_ = {};
         frame_dirty_ = true;
         updateSurfaceCursor();
@@ -253,6 +254,7 @@ public:
 
     void setOverlays(std::vector<p2premote::PluginOverlayItem> overlays) {
         overlays_ = std::move(overlays);
+        overlay_cache_dirty_ = true;
         update();
     }
 
@@ -339,28 +341,47 @@ void main() {
     }
 
     void paintGL() override {
-        QPainter painter(this);
+        const auto previous_width = frame_.width;
+        const auto previous_height = frame_.height;
+        const bool new_frame = session_ && session_->takeLatestFrame(frame_);
+        const auto draw_at = new_frame ? FrameClock::now() : FrameClock::time_point{};
+        if (new_frame) {
+            frame_dirty_ = true;
+            if (capturing_ && (previous_width != frame_.width || previous_height != frame_.height)) {
+                updatePointerInVideo(mapFromGlobal(QCursor::pos()));
+            }
+        }
         if (!hasFrame()) {
+            QPainter painter(this);
             painter.fillRect(rect(), QColor("#111827"));
             painter.setPen(QColor("#cbd5e1"));
             painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("等待被控端画面"));
-            paintOverlays(painter, rect());
+            paintCachedOverlays(painter, rect());
             return;
         }
         const auto area = videoRect();
-        if (gl_ready_) {
-            painter.beginNativePainting();
+        const bool has_overlays = hasVisibleOverlays();
+        if (gl_ready_ && !has_overlays) {
             drawGlFrame(area);
-            painter.endNativePainting();
         } else {
-            painter.fillRect(rect(), QColor("#111827"));
-            updateFallbackImage();
-            if (!fallback_image_.isNull()) {
-                painter.setRenderHint(QPainter::SmoothPixmapTransform);
-                painter.drawImage(area, fallback_image_);
+            QPainter painter(this);
+            if (gl_ready_) {
+                painter.beginNativePainting();
+                drawGlFrame(area);
+                painter.endNativePainting();
+            } else {
+                painter.fillRect(rect(), QColor("#111827"));
+                updateFallbackImage();
+                if (!fallback_image_.isNull()) {
+                    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+                    painter.drawImage(area, fallback_image_);
+                }
             }
+            if (has_overlays) paintCachedOverlays(painter, area);
         }
-        paintOverlays(painter, area);
+        if (new_frame && !area.isEmpty() && (gl_ready_ || !fallback_image_.isNull())) {
+            pending_swap_ = FrameTiming{frame_.decoded_at, draw_at};
+        }
     }
 
     void focusOutEvent(QFocusEvent* event) override {
@@ -510,38 +531,65 @@ private:
             frame_.width, frame_.height);
     }
 
-    void paintOverlays(QPainter& painter, const QRect& area) {
+    bool hasVisibleOverlays() const {
+        return std::ranges::any_of(overlays_, [](const auto& item) {
+            return item.visible && !item.text.empty();
+        });
+    }
+
+    void paintCachedOverlays(QPainter& painter, const QRect& area) {
+        if (area.isEmpty() || !hasVisibleOverlays()) return;
+        const qreal dpr = devicePixelRatioF();
+        if (overlay_cache_dirty_ || overlay_cache_area_ != area.size()
+            || !qFuzzyCompare(overlay_cache_dpr_, dpr)) {
+            rebuildOverlayCache(area.size(), dpr);
+        }
+        for (const auto& entry : cached_overlays_) {
+            painter.drawImage(area.topLeft() + entry.pos, entry.image);
+        }
+    }
+
+    void rebuildOverlayCache(const QSize& area_size, qreal dpr) {
         using p2premote::OverlayAnchor;
+        cached_overlays_.clear();
         std::array<int, 6> stacks{};
-        painter.save();
-        painter.setClipRect(area);
+        const QRect local_area(QPoint(0, 0), area_size);
         for (const auto& item : overlays_) {
             if (!item.visible || item.text.empty()) continue;
             auto font = item.monospace ? QFontDatabase::systemFont(QFontDatabase::FixedFont) : this->font();
             font.setPixelSize(item.font_size);
-            painter.setFont(font);
             const auto text = QString::fromStdWString(item.text);
-            const auto bounds = painter.fontMetrics().boundingRect(QRect(0, 0, std::max(1, area.width() - 32), area.height()),
+            const QFontMetrics metrics(font);
+            const auto bounds = metrics.boundingRect(QRect(0, 0, std::max(1, local_area.width() - 32), local_area.height()),
                 Qt::AlignLeft | Qt::TextWordWrap, text);
             const QSize size(bounds.width() + 18, bounds.height() + 12);
             const bool right = item.anchor == OverlayAnchor::top_right || item.anchor == OverlayAnchor::bottom_right;
             const bool bottom = item.anchor == OverlayAnchor::bottom_left || item.anchor == OverlayAnchor::bottom_right;
             const bool center = item.anchor == OverlayAnchor::top_center || item.anchor == OverlayAnchor::bottom_center;
             auto& offset = stacks[static_cast<unsigned>(item.anchor)];
-            const int x = center ? area.center().x() - size.width() / 2 :
-                (right ? area.right() - size.width() - 8 : area.left() + 8);
-            const int y = bottom ? area.bottom() - size.height() - 8 - offset : area.top() + 8 + offset;
+            const int x = center ? local_area.center().x() - size.width() / 2 :
+                (right ? local_area.right() - size.width() - 8 : local_area.left() + 8);
+            const int y = bottom ? local_area.bottom() - size.height() - 8 - offset : local_area.top() + 8 + offset;
             offset += size.height() + 6;
-            const QRect box(QPoint(x, y), size);
+
+            QImage badge(std::max(1, qRound(size.width() * dpr)), std::max(1, qRound(size.height() * dpr)),
+                QImage::Format_ARGB32_Premultiplied);
+            badge.setDevicePixelRatio(dpr);
+            badge.fill(Qt::transparent);
+            QPainter cache_painter(&badge);
+            cache_painter.setFont(font);
             auto background = item.bg_rgb == p2premote::overlay_default_color ? QColor("#162238") : QColor::fromRgb(item.bg_rgb);
             background.setAlpha(item.opacity);
-            painter.setPen(Qt::NoPen);
-            painter.setBrush(background);
-            painter.drawRoundedRect(box, 5, 5);
-            painter.setPen(item.text_rgb == p2premote::overlay_default_color ? QColor("#eef4ff") : QColor::fromRgb(item.text_rgb));
-            painter.drawText(box.adjusted(9, 6, -9, -6), Qt::AlignLeft | Qt::TextWordWrap, text);
+            cache_painter.setPen(Qt::NoPen);
+            cache_painter.setBrush(background);
+            cache_painter.drawRoundedRect(QRect(QPoint(0, 0), size), 5, 5);
+            cache_painter.setPen(item.text_rgb == p2premote::overlay_default_color ? QColor("#eef4ff") : QColor::fromRgb(item.text_rgb));
+            cache_painter.drawText(QRect(QPoint(0, 0), size).adjusted(9, 6, -9, -6), Qt::AlignLeft | Qt::TextWordWrap, text);
+            cached_overlays_.push_back({QPoint(x, y), std::move(badge)});
         }
-        painter.restore();
+        overlay_cache_area_ = area_size;
+        overlay_cache_dpr_ = dpr;
+        overlay_cache_dirty_ = false;
     }
 
     QRect videoRect() const {
@@ -640,7 +688,15 @@ private:
 
     ViewerSession* session_{};
     std::function<void()> fullscreen_;
+    struct CachedOverlay {
+        QPoint pos;
+        QImage image;
+    };
     std::vector<p2premote::PluginOverlayItem> overlays_;
+    std::vector<CachedOverlay> cached_overlays_;
+    QSize overlay_cache_area_;
+    qreal overlay_cache_dpr_{1.0};
+    bool overlay_cache_dirty_{true};
     QTimer heartbeat_;
     QTimer move_flush_timer_;
     QTimer drag_tail_timer_;
@@ -649,6 +705,8 @@ private:
     std::optional<std::pair<std::uint16_t, std::uint16_t>> last_move_sent_;
     Qt::MouseButtons pressed_buttons_{Qt::NoButton};
     VideoFrame frame_;
+    struct FrameTiming { FrameClock::time_point decoded_at, draw_at; };
+    std::optional<FrameTiming> pending_swap_;
     QImage fallback_image_;
     QOpenGLShaderProgram program_;
     QOpenGLVertexArrayObject vao_;
@@ -674,10 +732,6 @@ QWidget* createVideoSurface(std::function<void()> fullscreen, QWidget* parent) {
 
 void attachVideoSession(QWidget* widget, ViewerSession* session) {
     static_cast<VideoSurface*>(widget)->attach(session);
-}
-
-void setVideoFrame(QWidget* widget, VideoFrame& frame) {
-    static_cast<VideoSurface*>(widget)->setFrame(frame);
 }
 
 void setVideoCursor(QWidget* widget, DecodedCursor cursor) {

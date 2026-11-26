@@ -207,7 +207,7 @@ Host 和 Viewer 在局域网整桌面控制中会协商本地光标。Host 单�
 
 Viewer 状态栏显示「直写上屏」时，GPU 在一次视频处理操作里完成色彩转换和缩放，直接写入交换链。驱动不支持时使用原有的 GPU 转换和绘制路径。
 
-Host 默认优先使用 DXGI Desktop Duplication。普通桌面回退 WGC 时，「本机接收」显示实际采集方式和 DXGI 回退原因。WGC 会继续传输画面，只有探测到可用的 DXGI 帧并满足当前光标模式时才切回。
+Host 使用 DXGI Desktop Duplication 采集桌面。
 
 局域网直连会根据采集画面的变化发送视频。Host 在 GPU 上比较相邻采集帧，变化后的首帧立即进入编码，大幅变化后最多再提交 6 张重复帧以细化画质。画面静止时约每秒刷新一次，Viewer 会保留最近一帧。Host 的 `--fixed-cadence` 可恢复原先的提交策略和 H.264 GOP 配置，用于对照。
 
@@ -381,6 +381,8 @@ Linux x86-64 主控端与 Windows 共享 Qt 主窗口、设置、会话标签和
 两端使用相同的 Lua 脚本和插件协议。Linux 支持文本剪贴板、文件剪贴板、文件传输窗口、远程终端、快捷宏、键盘锁定状态、自动码率、连接状态、会话秒表和只读诊断。账号和局域网凭据使用桌面的 Secret Service 密钥环。
 
 Linux 文件管理器和 Windows 资源管理器可以双向复制粘贴文件或文件夹。两侧均通过虚拟文件在粘贴时按需读取内容：Linux 接收时通过用户态 FUSE3 挂载只读虚拟目录（需要 `/dev/fuse` 与 `fusermount3`），复制时不提前下载文件内容，也不占用本地临时目录空间。
+
+Linux 主控端开始绘制时取最新的解码帧。连接状态的 FPS 统计完成窗口缓冲交换的新视频帧，CSV 同时记录解码帧数、解码到绘制的等待时间和绘制到缓冲交换的耗时。端到端回显仍需在实际连接中测量。
 
 构建需要 GCC、CMake、Ninja、Xmake、Qt 6.8 或更新版本（Widgets、Network、WebSockets）、OpenSSL、libyuv、Lua 5.4、libsecret、PulseAudio 和 FUSE3（`fuse3`）的开发包，以及 [libghostty-vt 1.0.1](https://lib.ghostty.org/vt/installing.html#build-from-source)。Linux 上从源码构建 libghostty-vt，可安装到 `~/.local/share/p2premote/ghostty-vt`，也可在配置时用 `CMAKE_PREFIX_PATH` 指定其前缀。MiniRTC 还需要归档解压工具、Meson 1.4 或更新版本、Autotools 和 NASM。
 

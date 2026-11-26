@@ -12,10 +12,12 @@
 #include <QByteArray>
 #include <QElapsedTimer>
 #include <QObject>
+#include <QSize>
 #include <QTcpSocket>
 #include <QTimer>
 #include <QWebSocket>
 
+#include <atomic>
 #include <bitset>
 #include <functional>
 #include <memory>
@@ -43,6 +45,10 @@ public:
     void setQuality(int resolution, int bitrate);
     void setAudio(p2p_audio_options_v1 options);
     void tick();
+    bool takeLatestFrame(VideoFrame& frame);
+    void recordFrameSwapped(double wait_ms, double draw_to_swap_ms);
+    std::uint64_t decodedFrames() const { return decoded_frames_.load(std::memory_order_relaxed); }
+    double drawToPresentMs() const { return metrics_.presented ? draw_to_present_ms_ : -1.0; }
     const p2premote::PluginMetrics& metrics() const { return metrics_; }
     p2premote::PluginHost* plugins() const { return plugins_.get(); }
     const std::shared_ptr<p2premote::PluginOverlays>& overlays() const { return overlay_; }
@@ -53,7 +59,7 @@ public:
     std::uint32_t confirmedBitrate() const { return confirmed_bitrate_; }
 
     std::function<void(const QString&)> statusChanged;
-    std::function<void(VideoFrame&)> frameReceived;
+    std::function<void()> frameReady;
     std::function<void(DecodedCursor)> cursorChanged;
 
 private:
@@ -125,7 +131,6 @@ private:
     QByteArray ice_protocol_;
     bool srtp_active_{};
     bool cursor_separate_{};
-    int cursor_attempts_{};
     int requested_quality_{P2P_1080P};
     int requested_bitrate_{P2P_AUTOMATIC};
     int active_bitrate_{P2P_AUTOMATIC};
@@ -143,9 +148,11 @@ private:
     std::mutex frame_mutex_;
     VideoFrame pending_frame_;
     VideoFrame recycled_frame_;
-    std::uint64_t pending_frame_generation_{};
-    std::uint64_t pending_frame_ms_{};
+    QSize latest_frame_size_;
+    std::uint64_t latest_frame_generation_{};
+    std::atomic<std::uint64_t> decoded_frames_{};
     bool frame_update_pending_{};
     double frame_wait_sum_ms_{};
     std::uint64_t frame_wait_samples_{};
+    double draw_to_present_ms_{};
 };

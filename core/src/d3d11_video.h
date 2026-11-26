@@ -29,6 +29,8 @@ private:
 class D3d11FrameDifference {
 public:
     explicit D3d11FrameDifference(ID3D11Device* device);
+    void Reset() noexcept { has_previous_ = false; }
+    [[nodiscard]] bool HasPrevious() const noexcept { return has_previous_; }
     std::optional<UINT> ChangedTiles(ID3D11Texture2D* source, UINT width, UINT height, bool active_drag = false);
     static UINT TileCount(UINT width, UINT height) noexcept;
 

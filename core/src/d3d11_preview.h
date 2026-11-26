@@ -1,6 +1,6 @@
 #pragma once
 
-#include "wgc_capturer.h"
+#include "dxgi_capturer.h"
 
 #include <p2premote/video_viewport.h>
 
