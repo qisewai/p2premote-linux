@@ -97,6 +97,7 @@ private:
     void openAgentAudit();
     void refreshServiceStatus();
     void toggleHostService();
+    bool installOrUpdateHostService(bool enable_lan, bool enable_cloud, QString* error = nullptr);
     void relaunchAsAdmin();
     void closeSessions();
 
@@ -162,6 +163,8 @@ private:
     QPushButton *lan_toggle_code_btn_{}, *lan_copy_btn_{}, *lan_edit_btn_{};
     QComboBox* screens_{};
     QLabel *local_summary_ip_{}, *local_summary_display_{}, *privilege_status_{};
+    QWidget* service_section_{};
+    QLabel* service_hint_{};
     QWidget* cloud_host_section_{};
     QLabel *cloud_host_status_{}, *cloud_guest_hint_{};
     QPushButton *add_device_{}, *receive_{}, *service_button_{}, *elevate_button_{};

@@ -11,6 +11,7 @@
 #include <winrt/Windows.Data.Json.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -33,13 +34,30 @@ struct HostConfig {
     std::wstring password;
     std::wstring installation_id;
     std::wstring device_id;
-    int monitor_index{};
     bool compatible_http{};
     bool relay_only{};
+
+    bool lan_enabled{};
+    std::uint16_t lan_port{P2P_LAN_DEFAULT_PORT};
+    std::wstring lan_access_code;
+
+    int monitor_index{};
+
+    bool HasCloud() const noexcept {
+        return !server.empty() && !user.empty() && !password.empty()
+            && !installation_id.empty() && !device_id.empty();
+    }
+
+    bool HasLan() const noexcept {
+        return lan_enabled && lan_access_code.size() >= 6 && lan_access_code.size() <= 32;
+    }
 
     ~HostConfig() {
         if (!password.empty()) {
             SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+        }
+        if (!lan_access_code.empty()) {
+            SecureZeroMemory(lan_access_code.data(), lan_access_code.size() * sizeof(wchar_t));
         }
     }
 };
@@ -71,8 +89,12 @@ std::optional<HostConfig> ParseHostConfig(const std::string& json_utf8) {
         cfg.monitor_index = static_cast<int>(obj.GetNamedNumber(L"monitor_index", 0));
         cfg.compatible_http = obj.GetNamedBoolean(L"compatible_http", false);
         cfg.relay_only = obj.GetNamedBoolean(L"relay_only", false);
-        if (cfg.server.empty() || cfg.user.empty() || cfg.password.empty() || cfg.installation_id.empty()
-            || cfg.device_id.empty()) return std::nullopt;
+        cfg.lan_enabled = obj.GetNamedBoolean(L"lan_enabled", false);
+        const double raw_port = obj.GetNamedNumber(L"lan_port", static_cast<double>(P2P_LAN_DEFAULT_PORT));
+        cfg.lan_port = (raw_port >= 1.0 && raw_port <= 65535.0)
+            ? static_cast<std::uint16_t>(raw_port) : static_cast<std::uint16_t>(P2P_LAN_DEFAULT_PORT);
+        cfg.lan_access_code = obj.GetNamedString(L"lan_access_code", L"").c_str();
+        if (!cfg.HasCloud() && !cfg.HasLan()) return std::nullopt;
         return cfg;
     } catch (...) {
         return std::nullopt;
@@ -113,24 +135,38 @@ HMONITOR SelectMonitor(int index) {
 
 struct WorkerSharedStatus {
     std::mutex mutex;
+    bool cloud_enabled{};
     int state{P2P_IDLE};
     bool desktop_control{};
+    bool lan_enabled{};
+    std::uint16_t lan_port{P2P_LAN_DEFAULT_PORT};
+    int lan_state{P2P_IDLE};
+    bool lan_desktop_control{};
     int monitor_index{};
     std::wstring user;
     std::wstring device_id;
     std::wstring status{L"服务已启动，正在初始化…"};
+    std::wstring lan_status;
 };
 
 std::string FormatStatusJson(WorkerSharedStatus& shared) {
     const std::lock_guard lock(shared.mutex);
     JsonObject obj;
     obj.SetNamedValue(L"running", JsonValue::CreateBooleanValue(true));
+    obj.SetNamedValue(L"cloud_enabled", JsonValue::CreateBooleanValue(shared.cloud_enabled));
     obj.SetNamedValue(L"state", JsonValue::CreateNumberValue(shared.state));
     obj.SetNamedValue(L"desktop_control", JsonValue::CreateBooleanValue(shared.desktop_control));
+    obj.SetNamedValue(L"lan_enabled", JsonValue::CreateBooleanValue(shared.lan_enabled));
+    obj.SetNamedValue(L"lan_port", JsonValue::CreateNumberValue(shared.lan_port));
+    obj.SetNamedValue(L"lan_state", JsonValue::CreateNumberValue(shared.lan_state));
+    obj.SetNamedValue(L"lan_desktop_control", JsonValue::CreateBooleanValue(shared.lan_desktop_control));
     obj.SetNamedValue(L"monitor_index", JsonValue::CreateNumberValue(shared.monitor_index));
     obj.SetNamedValue(L"user", JsonValue::CreateStringValue(shared.user));
     obj.SetNamedValue(L"device_id", JsonValue::CreateStringValue(shared.device_id));
-    obj.SetNamedValue(L"status", JsonValue::CreateStringValue(shared.status));
+    const auto& summary = (!shared.cloud_enabled && shared.lan_enabled && !shared.lan_status.empty())
+        ? shared.lan_status : shared.status;
+    obj.SetNamedValue(L"status", JsonValue::CreateStringValue(summary));
+    obj.SetNamedValue(L"lan_status", JsonValue::CreateStringValue(shared.lan_status));
     return winrt::to_string(obj.Stringify());
 }
 
@@ -146,6 +182,124 @@ void SetWorkerStatus(WorkerSharedStatus& shared, int state, const std::wstring& 
     if (monitor_index) shared.monitor_index = *monitor_index;
 }
 
+void SetLanWorkerStatus(WorkerSharedStatus& shared, int state, const std::wstring& status,
+    bool desktop_control = false, std::optional<std::uint16_t> port = std::nullopt,
+    std::optional<int> monitor_index = std::nullopt) {
+    const std::lock_guard lock(shared.mutex);
+    shared.lan_state = state;
+    shared.lan_desktop_control = desktop_control;
+    shared.lan_status = status;
+    if (port) shared.lan_port = *port;
+    if (monitor_index) shared.monitor_index = *monitor_index;
+}
+
+template <typename OnStatus>
+void PumpHostStream(p2p_stream* stream, HANDLE stop_event, OnStatus&& on_status) {
+    bool input_ready = false;
+    int last_state = -1;
+    bool last_desktop = false;
+    std::wstring last_status;
+    ULONGLONG next_tick = GetTickCount64() + 500;
+    ULONGLONG next_cursor = GetTickCount64() + 33;
+
+    auto publish = [&]() -> bool {
+        p2p_stream_snapshot_v1 snap{};
+        if (p2p_stream_snapshot(stream, &snap) != P2P_OK) return false;
+        input_ready = snap.input_ready != 0;
+        const bool desktop = snap.desktop_control != 0;
+        const std::wstring st = snap.status ? std::wstring(snap.status) : L"";
+        if (snap.state != last_state || desktop != last_desktop || st != last_status) {
+            last_state = snap.state;
+            last_desktop = desktop;
+            last_status = st;
+            on_status(snap.state, st, desktop);
+        }
+        return snap.state != P2P_STOPPED;
+    };
+
+    if (!publish()) return;
+
+    while (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
+        HANDLE wait_handles[3]{stop_event};
+        uint32_t kinds[3]{};
+        DWORD count = 1;
+        if (const auto event = p2p_stream_wait_handle(stream, P2P_WAIT_SESSION)) {
+            wait_handles[count] = event;
+            kinds[count++] = P2P_WAIT_SESSION;
+        }
+        if (const auto capture = p2p_stream_wait_handle(stream, P2P_WAIT_CAPTURE)) {
+            wait_handles[count] = capture;
+            kinds[count++] = P2P_WAIT_CAPTURE;
+        }
+
+        auto now = GetTickCount64();
+        ULONGLONG due = next_tick;
+        if (input_ready) due = std::min(due, next_cursor);
+        const DWORD timeout = due > now ? static_cast<DWORD>(std::min<ULONGLONG>(due - now, 200)) : 0;
+
+        const DWORD waited = MsgWaitForMultipleObjectsEx(count, wait_handles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (waited == WAIT_OBJECT_0) {
+            p2p_stream_stop(stream, L"系统服务已停止");
+            break;
+        }
+        if (waited == WAIT_FAILED) break;
+        if (waited >= WAIT_OBJECT_0 + 1 && waited < WAIT_OBJECT_0 + count) {
+            const auto kind = kinds[waited - WAIT_OBJECT_0];
+            if (p2p_stream_dispatch(stream, kind) != P2P_OK) break;
+        }
+
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        now = GetTickCount64();
+        if (now >= next_tick) {
+            next_tick = now + 500;
+            if (p2p_stream_tick(stream) != P2P_OK) break;
+        }
+        if (input_ready && now >= next_cursor) {
+            next_cursor = now + 33;
+            if (p2p_stream_poll_cursor(stream) != P2P_OK) break;
+        }
+
+        if (!publish()) break;
+    }
+}
+
+void RunLanHostLoop(const HostConfig& cfg, WorkerSharedStatus& shared, HANDLE stop_event) {
+    SetLanWorkerStatus(shared, P2P_WAITING, L"[系统服务] 正在启动局域网直连监听 (SYSTEM)…",
+        false, cfg.lan_port, cfg.monitor_index);
+    while (WaitForSingleObject(stop_event, 0) == WAIT_TIMEOUT) {
+        const p2p_lan_options_v1 lan_settings{
+            nullptr, cfg.lan_port, cfg.lan_access_code.c_str(), 1, L"", L""};
+        std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream(
+            p2p_stream_create_lan(1, nullptr, &lan_settings), p2p_stream_destroy);
+        if (!stream) {
+            const std::wstring err = p2p_last_error() ? p2p_last_error() : L"无法创建局域网接收会话";
+            SetLanWorkerStatus(shared, P2P_STOPPED, L"[系统服务] " + err, false, cfg.lan_port);
+            WaitForSingleObject(stop_event, 3000);
+            continue;
+        }
+        HMONITOR monitor = SelectMonitor(cfg.monitor_index);
+        if (p2p_stream_start(stream.get(), monitor, 60) != P2P_OK) {
+            const std::wstring err = p2p_last_error() ? p2p_last_error() : L"无法启动局域网接收";
+            SetLanWorkerStatus(shared, P2P_STOPPED, L"[系统服务] " + err, false, cfg.lan_port);
+            WaitForSingleObject(stop_event, 3000);
+            continue;
+        }
+
+        PumpHostStream(stream.get(), stop_event, [&](int state, const std::wstring& status, bool desktop_control) {
+            SetLanWorkerStatus(shared, state, L"[系统服务] " + status, desktop_control, cfg.lan_port);
+        });
+
+        if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) break;
+        stream.reset();
+        WaitForSingleObject(stop_event, 1500);
+    }
+}
+
 bool WaitAccountComplete(p2p_account* account, HANDLE stop_event, std::wstring& error) {
     HANDLE handles[]{stop_event, p2p_account_event(account)};
     for (;;) {
@@ -156,6 +310,77 @@ bool WaitAccountComplete(p2p_account* account, HANDLE stop_event, std::wstring& 
         if (rc == P2P_OK) return true;
         error = p2p_last_error() ? p2p_last_error() : L"账号登录失败";
         return false;
+    }
+}
+
+void RunCloudHostLoop(const HostConfig& cfg, WorkerSharedStatus& shared, HANDLE stop_event) {
+    const auto sleep_interruptible = [&](DWORD ms) {
+        WaitForSingleObject(stop_event, ms);
+    };
+
+    while (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
+        SetWorkerStatus(shared, P2P_WAITING, L"系统服务正在登录账号…", false, L"", cfg.user, cfg.monitor_index);
+        std::unique_ptr<p2p_account, decltype(&p2p_account_destroy)> account(p2p_account_create(), p2p_account_destroy);
+        if (!account) {
+            SetWorkerStatus(shared, P2P_STOPPED, L"核心账号模块初始化失败");
+            sleep_interruptible(3000);
+            continue;
+        }
+
+        if (p2p_account_service_login(account.get(), cfg.server.c_str(), cfg.user.c_str(), cfg.password.c_str(),
+                cfg.installation_id.c_str(), cfg.device_id.c_str(), cfg.compatible_http ? 1 : 0,
+                cfg.relay_only ? 1 : 0) != P2P_OK) {
+            SetWorkerStatus(shared, P2P_STOPPED, p2p_last_error() ? p2p_last_error() : L"账号登录请求失败");
+            sleep_interruptible(5000);
+            continue;
+        }
+
+        std::wstring login_err;
+        if (!WaitAccountComplete(account.get(), stop_event, login_err)) {
+            if (!login_err.empty()) {
+                SetWorkerStatus(shared, P2P_STOPPED, L"系统服务登录失败：" + login_err);
+                sleep_interruptible(5000);
+            }
+            continue;
+        }
+
+        const std::wstring dev_id = p2p_account_device_id(account.get()) ? p2p_account_device_id(account.get()) : L"";
+        SetWorkerStatus(shared, P2P_WAITING, L"系统服务已就绪 · 等待远程连接 (SYSTEM)", false, dev_id, cfg.user, cfg.monitor_index);
+
+        while (WaitForSingleObject(stop_event, 0) == WAIT_TIMEOUT) {
+            const p2p_connection_options_v1 settings{L"", L"", "", 0, 1, 0};
+            std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream(
+                p2p_stream_create(account.get(), 1, nullptr, nullptr, &settings), p2p_stream_destroy);
+            if (!stream) {
+                SetWorkerStatus(shared, P2P_STOPPED, p2p_last_error() ? p2p_last_error() : L"无法创建主机接收会话");
+                sleep_interruptible(3000);
+                break;
+            }
+            HMONITOR monitor = SelectMonitor(cfg.monitor_index);
+            if (p2p_stream_start(stream.get(), monitor, 60) != P2P_OK) {
+                SetWorkerStatus(shared, P2P_STOPPED, p2p_last_error() ? p2p_last_error() : L"无法启动主机接收");
+                sleep_interruptible(3000);
+                break;
+            }
+
+            PumpHostStream(stream.get(), stop_event, [&](int state, const std::wstring& status, bool desktop_control) {
+                SetWorkerStatus(shared, state, L"[系统服务] " + status, desktop_control);
+            });
+
+            if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) break;
+            stream.reset();
+            std::wstring refresh_error;
+            if (p2p_account_refresh(account.get()) != P2P_OK
+                || !WaitAccountComplete(account.get(), stop_event, refresh_error)) break;
+            const auto* current = p2p_account_device_id(account.get());
+            if (!current || cfg.device_id != current) {
+                SetWorkerStatus(shared, P2P_STOPPED, L"服务绑定的设备已移除，请在客户端重新配置", false, L"");
+                WaitForSingleObject(stop_event, INFINITE);
+                break;
+            }
+            // Stream ended (e.g. viewer disconnected or transient drop); re-listen shortly.
+            sleep_interruptible(1500);
+        }
     }
 }
 
@@ -229,7 +454,7 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
     while (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
         auto raw = ReadEncryptedConfig(directory / L"host.dat");
         if (!raw) {
-            SetWorkerStatus(shared, P2P_IDLE, L"服务运行中 · 等待绑定账号", false, L"", L"");
+            SetWorkerStatus(shared, P2P_IDLE, L"服务运行中 · 等待配置", false, L"", L"");
             sleep_interruptible(2000);
             continue;
         }
@@ -241,135 +466,39 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
             continue;
         }
 
-        SetWorkerStatus(shared, P2P_WAITING, L"系统服务正在登录账号…", false, L"", cfg->user, cfg->monitor_index);
-        std::unique_ptr<p2p_account, decltype(&p2p_account_destroy)> account(p2p_account_create(), p2p_account_destroy);
-        if (!account) {
-            SetWorkerStatus(shared, P2P_STOPPED, L"核心账号模块初始化失败");
-            sleep_interruptible(3000);
-            continue;
+        const bool run_cloud = cfg->HasCloud();
+        const bool run_lan = cfg->HasLan();
+        {
+            const std::lock_guard lock(shared.mutex);
+            shared.cloud_enabled = run_cloud;
+            shared.lan_enabled = run_lan;
+            shared.lan_port = cfg->lan_port;
+            shared.monitor_index = cfg->monitor_index;
+            if (!run_cloud) {
+                shared.state = P2P_IDLE;
+                shared.desktop_control = false;
+                shared.user.clear();
+                shared.device_id.clear();
+                shared.status.clear();
+            }
+            if (!run_lan) {
+                shared.lan_state = P2P_IDLE;
+                shared.lan_desktop_control = false;
+                shared.lan_status.clear();
+            }
         }
 
-        if (p2p_account_service_login(account.get(), cfg->server.c_str(), cfg->user.c_str(), cfg->password.c_str(),
-                cfg->installation_id.c_str(), cfg->device_id.c_str(), cfg->compatible_http ? 1 : 0,
-                cfg->relay_only ? 1 : 0) != P2P_OK) {
-            SetWorkerStatus(shared, P2P_STOPPED, p2p_last_error() ? p2p_last_error() : L"账号登录请求失败");
-            sleep_interruptible(5000);
-            continue;
-        }
-
-        std::wstring login_err;
-        if (!WaitAccountComplete(account.get(), stop_event, login_err)) {
-            if (!login_err.empty()) {
-                SetWorkerStatus(shared, P2P_STOPPED, L"系统服务登录失败：" + login_err);
-                sleep_interruptible(5000);
-            }
-            continue;
-        }
-
-        const std::wstring dev_id = p2p_account_device_id(account.get()) ? p2p_account_device_id(account.get()) : L"";
-        SetWorkerStatus(shared, P2P_WAITING, L"系统服务已就绪 · 等待远程连接 (SYSTEM)", false, dev_id, cfg->user, cfg->monitor_index);
-
-        while (WaitForSingleObject(stop_event, 0) == WAIT_TIMEOUT) {
-            const p2p_connection_options_v1 settings{L"", L"", "", 0, 1, 0};
-            std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream(
-                p2p_stream_create(account.get(), 1, nullptr, nullptr, &settings), p2p_stream_destroy);
-            if (!stream) {
-                SetWorkerStatus(shared, P2P_STOPPED, p2p_last_error() ? p2p_last_error() : L"无法创建主机接收会话");
-                sleep_interruptible(3000);
-                break;
-            }
-            HMONITOR monitor = SelectMonitor(cfg->monitor_index);
-            if (p2p_stream_start(stream.get(), monitor, 60) != P2P_OK) {
-                SetWorkerStatus(shared, P2P_STOPPED, p2p_last_error() ? p2p_last_error() : L"无法启动主机接收");
-                sleep_interruptible(3000);
-                break;
-            }
-
-            bool input_ready = false;
-            int last_state = -1;
-            std::wstring last_status;
-            ULONGLONG next_tick = GetTickCount64() + 500;
-            ULONGLONG next_cursor = GetTickCount64() + 50;
-
-            auto publish = [&]() -> bool {
-                p2p_stream_snapshot_v1 snap{};
-                if (p2p_stream_snapshot(stream.get(), &snap) != P2P_OK) return false;
-                input_ready = snap.input_ready != 0;
-                const std::wstring st = snap.status ? std::wstring(snap.status) : L"";
-                if (snap.state != last_state || st != last_status) {
-                    last_state = snap.state;
-                    last_status = st;
-                    SetWorkerStatus(shared, snap.state, L"[系统服务] " + st, snap.desktop_control != 0);
-                }
-                return snap.state != P2P_STOPPED;
-            };
-
-            if (!publish()) {
-                sleep_interruptible(2000);
-                continue;
-            }
-
-            while (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
-                HANDLE wait_handles[3]{stop_event};
-                uint32_t kinds[3]{};
-                DWORD count = 1;
-                if (const auto event = p2p_stream_wait_handle(stream.get(), P2P_WAIT_SESSION)) {
-                    wait_handles[count] = event;
-                    kinds[count++] = P2P_WAIT_SESSION;
-                }
-                if (const auto capture = p2p_stream_wait_handle(stream.get(), P2P_WAIT_CAPTURE)) {
-                    wait_handles[count] = capture;
-                    kinds[count++] = P2P_WAIT_CAPTURE;
-                }
-
-                auto now = GetTickCount64();
-                ULONGLONG due = next_tick;
-                if (input_ready) due = std::min(due, next_cursor);
-                const DWORD timeout = due > now ? static_cast<DWORD>(std::min<ULONGLONG>(due - now, 200)) : 0;
-
-                const DWORD waited = MsgWaitForMultipleObjectsEx(count, wait_handles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-                if (waited == WAIT_OBJECT_0) {
-                    p2p_stream_stop(stream.get(), L"系统服务已停止");
-                    break;
-                }
-                if (waited == WAIT_FAILED) break;
-                if (waited >= WAIT_OBJECT_0 + 1 && waited < WAIT_OBJECT_0 + count) {
-                    const auto kind = kinds[waited - WAIT_OBJECT_0];
-                    if (p2p_stream_dispatch(stream.get(), kind) != P2P_OK) break;
-                }
-
-                MSG msg{};
-                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-
-                now = GetTickCount64();
-                if (now >= next_tick) {
-                    next_tick = now + 500;
-                    if (p2p_stream_tick(stream.get()) != P2P_OK) break;
-                }
-                if (input_ready && now >= next_cursor) {
-                    next_cursor = now + 50;
-                    if (p2p_stream_poll_cursor(stream.get()) != P2P_OK) break;
-                }
-
-                if (!publish()) break;
-            }
-
-            if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) break;
-            stream.reset();
-            std::wstring refresh_error;
-            if (p2p_account_refresh(account.get()) != P2P_OK
-                || !WaitAccountComplete(account.get(), stop_event, refresh_error)) break;
-            const auto* current = p2p_account_device_id(account.get());
-            if (!current || cfg->device_id != current) {
-                SetWorkerStatus(shared, P2P_STOPPED, L"服务绑定的设备已移除，请在客户端重新配置", false, L"");
-                WaitForSingleObject(stop_event, INFINITE);
-                break;
-            }
-            // Stream ended (e.g. viewer disconnected or transient drop); re-listen shortly.
-            sleep_interruptible(1500);
+        if (run_cloud && run_lan) {
+            std::jthread lan_thread([&] {
+                winrt::init_apartment(winrt::apartment_type::single_threaded);
+                RunLanHostLoop(*cfg, shared, stop_event);
+            });
+            RunCloudHostLoop(*cfg, shared, stop_event);
+            if (lan_thread.joinable()) lan_thread.join();
+        } else if (run_lan) {
+            RunLanHostLoop(*cfg, shared, stop_event);
+        } else {
+            RunCloudHostLoop(*cfg, shared, stop_event);
         }
     }
 

@@ -92,20 +92,28 @@ HostServiceInfo queryHostWorkerStatus(HostServiceInfo info) {
         if (doc.isObject()) {
             const auto obj = doc.object();
             info.pipe_connected = true;
-            info.state = obj.value(QStringLiteral("state")).toInt();
-            info.desktop_control = obj.value(QStringLiteral("desktop_control")).toBool();
-            info.monitor_index = obj.value(QStringLiteral("monitor_index")).toInt();
             info.user = obj.value(QStringLiteral("user")).toString();
             info.device_id = obj.value(QStringLiteral("device_id")).toString();
+            info.cloud_enabled = obj.contains(QStringLiteral("cloud_enabled"))
+                ? obj.value(QStringLiteral("cloud_enabled")).toBool()
+                : !info.device_id.isEmpty();
+            info.state = obj.value(QStringLiteral("state")).toInt();
+            info.desktop_control = obj.value(QStringLiteral("desktop_control")).toBool();
+            info.lan_enabled = obj.value(QStringLiteral("lan_enabled")).toBool();
+            const int port = obj.value(QStringLiteral("lan_port")).toInt(P2P_LAN_DEFAULT_PORT);
+            info.lan_port = (port >= 1 && port <= 65535)
+                ? static_cast<std::uint16_t>(port) : static_cast<std::uint16_t>(P2P_LAN_DEFAULT_PORT);
+            info.lan_state = obj.value(QStringLiteral("lan_state")).toInt();
+            info.lan_desktop_control = obj.value(QStringLiteral("lan_desktop_control")).toBool();
+            info.monitor_index = obj.value(QStringLiteral("monitor_index")).toInt();
             info.status = obj.value(QStringLiteral("status")).toString();
+            info.lan_status = obj.value(QStringLiteral("lan_status")).toString();
         }
     }
     return info;
 }
 
-bool installHostService(const QString& server, const QString& user, const std::wstring& password,
-    const QString& installation_id, const QString& device_id, int monitor_index,
-    bool compatible_http, bool relay_only, QString* error) {
+bool installHostService(const HostServiceConfig& config, QString* error) {
     const auto exe = serviceExePath();
     if (!QFileInfo::exists(QString::fromStdWString(exe))) {
         if (error) *error = QStringLiteral("未找到 p2premote_service.exe，请重新解压完整客户端。");
@@ -113,14 +121,22 @@ bool installHostService(const QString& server, const QString& user, const std::w
     }
 
     QJsonObject obj;
-    obj.insert(QStringLiteral("server"), server);
-    obj.insert(QStringLiteral("user"), user);
-    obj.insert(QStringLiteral("password"), QString::fromStdWString(password));
-    obj.insert(QStringLiteral("installation_id"), installation_id);
-    obj.insert(QStringLiteral("device_id"), device_id);
-    obj.insert(QStringLiteral("monitor_index"), monitor_index);
-    obj.insert(QStringLiteral("compatible_http"), compatible_http);
-    obj.insert(QStringLiteral("relay_only"), relay_only);
+    if (!config.server.isEmpty() && !config.user.isEmpty() && !config.password.empty()
+            && !config.installation_id.isEmpty() && !config.device_id.isEmpty()) {
+        obj.insert(QStringLiteral("server"), config.server);
+        obj.insert(QStringLiteral("user"), config.user);
+        obj.insert(QStringLiteral("password"), QString::fromStdWString(config.password));
+        obj.insert(QStringLiteral("installation_id"), config.installation_id);
+        obj.insert(QStringLiteral("device_id"), config.device_id);
+        obj.insert(QStringLiteral("compatible_http"), config.compatible_http);
+        obj.insert(QStringLiteral("relay_only"), config.relay_only);
+    }
+    obj.insert(QStringLiteral("lan_enabled"), config.lan_enabled);
+    obj.insert(QStringLiteral("lan_port"), static_cast<int>(config.lan_port ? config.lan_port : P2P_LAN_DEFAULT_PORT));
+    if (config.lan_enabled && !config.lan_access_code.empty()) {
+        obj.insert(QStringLiteral("lan_access_code"), QString::fromStdWString(config.lan_access_code));
+    }
+    obj.insert(QStringLiteral("monitor_index"), config.monitor_index);
     QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Compact);
 
     const auto suffix = UniqueSuffix();
