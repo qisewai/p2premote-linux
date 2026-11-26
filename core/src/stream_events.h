@@ -100,10 +100,21 @@ public:
     }
 
 private:
+    static constexpr std::size_t max_queued_events = 256;
+
     void Enqueue(StreamEvent event) {
-        if (events_.size() < 64) {
+        const auto snapshot = [](StreamEventType type) {
+            return type == StreamEventType::stats || type == StreamEventType::cursor;
+        };
+        if (snapshot(event.type)) {
+            std::erase_if(events_, [&](const StreamEvent& queued) { return queued.type == event.type; });
+            if (events_.size() >= max_queued_events) return;
+        } else if (events_.size() == max_queued_events) {
+            std::erase_if(events_, [&](const StreamEvent& queued) { return snapshot(queued.type); });
+        }
+        if (events_.size() < max_queued_events) {
             events_.push_back(std::move(event));
-        } else if (events_.size() == 64) {
+        } else if (events_.size() == max_queued_events) {
             events_.push_back({StreamEventType::error, {}, "会话事件队列已满"});
         }
         SetEvent(ready_.get());

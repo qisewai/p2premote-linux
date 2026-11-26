@@ -5,7 +5,11 @@
 #include <QString>
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
+
+class QObject;
 
 struct HostServiceInfo {
     bool installed{};
@@ -23,6 +27,12 @@ struct HostServiceInfo {
     QString device_id;
     QString status;
     QString lan_status;
+#if defined(Q_OS_LINUX)
+    bool enabled{};
+    bool cloud_installed{};
+    bool cloud_online{};
+    bool operator==(const HostServiceInfo&) const = default;
+#endif
 };
 
 struct HostServiceConfig {
@@ -47,3 +57,11 @@ HostServiceInfo queryHostWorkerStatus(HostServiceInfo info);
 bool installHostService(const HostServiceConfig& config, QString* error = nullptr);
 bool uninstallHostService(QString* error = nullptr);
 bool relaunchClientElevated(QString* error = nullptr);
+
+#if defined(Q_OS_LINUX)
+std::optional<HostServiceInfo> queryLinuxHostServiceInfo();
+void manageLinuxHostService(QObject* owner, bool enable, std::uint16_t port, const QString& code,
+    std::function<void(QString)> completed);
+void manageLinuxCloudService(QObject* owner, const std::optional<HostServiceConfig>& config,
+    std::function<void(QString)> completed);
+#endif

@@ -2,12 +2,24 @@
   "version": 3,
   "configurePresets": [
     {
+      "name": "linux-x64",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/linux-x64",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "P2PREMOTE_BUILD_LINUX_HOST": "ON",
+        "P2PREMOTE_BUILD_LINUX_VIEWER": "ON"
+      }
+    },
+    {
       "name": "linux-x64-viewer",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/out/build/linux-x64-viewer",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "P2PREMOTE_BUILD_LINUX_HOST": "OFF"
       }
     },
     {
@@ -42,6 +54,10 @@
   ],
   "buildPresets": [
     {
+      "name": "linux-x64",
+      "configurePreset": "linux-x64"
+    },
+    {
       "name": "linux-x64-viewer",
       "configurePreset": "linux-x64-viewer"
     },
@@ -63,6 +79,11 @@
     }
   ],
   "testPresets": [
+    {
+      "name": "linux-x64",
+      "configurePreset": "linux-x64",
+      "output": { "outputOnFailure": true }
+    },
     {
       "name": "linux-x64-viewer",
       "configurePreset": "linux-x64-viewer",

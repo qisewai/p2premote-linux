@@ -1,0 +1,21 @@
+[Unit]
+Description=P2P Remote Linux Cloud Host (Xorg + uinput)
+After=network-online.target display-manager.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=-/sbin/modprobe uinput
+ExecStart="@P2PREMOTE_LINUX_HOST_EXECUTABLE@" --cloud-service
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=15
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+LogsDirectory=p2premote
+LogsDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

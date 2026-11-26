@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=P2P Remote
+Exec="@CMAKE_INSTALL_FULL_BINDIR@/p2premote"
+Icon=computer
+Terminal=false
+Categories=Network;RemoteAccess;

@@ -20,7 +20,7 @@ if(NOT P2PREMOTE_LINUX_MINIRTC_INCLUDE OR NOT P2PREMOTE_LINUX_MINIRTC_LIBRARY)
     message(FATAL_ERROR "Build the Linux MiniRTC library with bash tools/minirtc_probe/Build-Linux.sh first.")
 endif()
 
-add_executable(p2premote_linux_viewer
+qt6_add_executable(p2premote_linux_viewer
     viewer/qt/main.cpp
     viewer/qt/account_window.cpp
     viewer/qt/agent_broker.cpp
@@ -34,12 +34,14 @@ add_executable(p2premote_linux_viewer
     viewer/qt/stream_driver.cpp
     viewer/qt/terminal_widget.cpp
     viewer/linux/account.cpp
+    viewer/linux/cloud_connection.cpp
     viewer/linux/audio.cpp
     viewer/linux/credentials.cpp
     viewer/linux/cursor_shape.cpp
     viewer/linux/file_clipboard.cpp
     viewer/linux/lan_discovery.cpp
     viewer/linux/plugin_platform.cpp
+    viewer/linux/service_control.cpp
     viewer/linux/single_instance.cpp
     viewer/linux/stream.cpp
     viewer/linux/video_surface.cpp
@@ -48,6 +50,14 @@ add_executable(p2premote_linux_viewer
     proto/input_protocol.cpp
     proto/plugin_protocol.cpp)
 set_target_properties(p2premote_linux_viewer PROPERTIES AUTOMOC ON)
+if(P2PREMOTE_BUILD_LINUX_HOST)
+    set_target_properties(p2premote_linux_viewer PROPERTIES OUTPUT_NAME p2premote)
+endif()
+set(p2premote_gui_dir "${P2PREMOTE_LINUX_APP_DIR}/gui")
+set_target_properties(p2premote_linux_viewer PROPERTIES INSTALL_RPATH "\$ORIGIN/lib;\$ORIGIN/../lib")
+target_compile_definitions(p2premote_linux_viewer PRIVATE
+    P2PREMOTE_LINUX_HOST_EXECUTABLE="${CMAKE_INSTALL_FULL_LIBEXECDIR}/p2premote/p2premote_linux_host"
+    P2PREMOTE_LINUX_PLUGIN_DIR="${CMAKE_INSTALL_FULL_DATADIR}/p2premote/plugins")
 target_compile_features(p2premote_linux_viewer PRIVATE cxx_std_20)
 target_compile_options(p2premote_linux_viewer PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(p2premote_linux_viewer PRIVATE
@@ -57,12 +67,51 @@ target_include_directories(p2premote_linux_viewer SYSTEM PRIVATE
 target_link_libraries(p2premote_linux_viewer PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets OpenSSL::Crypto
     PkgConfig::LINUX_LUA PkgConfig::LINUX_SECRET PkgConfig::LINUX_PULSE PkgConfig::LINUX_FUSE3 ghostty-vt::ghostty-vt
     "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}")
+if(TARGET Qt6::QOffscreenIntegrationPlugin)
+    qt6_import_plugins(p2premote_linux_viewer INCLUDE Qt6::QOffscreenIntegrationPlugin)
+endif()
+find_package(Qt6WaylandClient 6.8 QUIET CONFIG)
+if(TARGET Qt6::QWaylandIntegrationPlugin AND TARGET Qt6::QWaylandXdgShellIntegrationPlugin)
+    qt6_import_plugins(p2premote_linux_viewer INCLUDE
+        Qt6::QWaylandIntegrationPlugin Qt6::QWaylandXdgShellIntegrationPlugin)
+endif()
 
 add_custom_target(p2premote_linux_plugins
     COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/plugins"
         "$<TARGET_FILE_DIR:p2premote_linux_viewer>/plugins"
     VERBATIM)
 add_dependencies(p2premote_linux_viewer p2premote_linux_plugins)
+get_target_property(P2PREMOTE_LINUX_CLIENT_NAME p2premote_linux_viewer OUTPUT_NAME)
+if(NOT P2PREMOTE_LINUX_CLIENT_NAME)
+    set(P2PREMOTE_LINUX_CLIENT_NAME p2premote_linux_viewer)
+endif()
+file(RELATIVE_PATH P2PREMOTE_LINUX_CLIENT_DIR "${CMAKE_INSTALL_FULL_BINDIR}"
+    "${CMAKE_INSTALL_FULL_LIBEXECDIR}/p2premote/gui")
+configure_file(viewer/linux/launch-client.sh.in "${P2PREMOTE_LINUX_CLIENT_NAME}-launcher" @ONLY)
+install(TARGETS p2premote_linux_viewer RUNTIME DESTINATION "${p2premote_gui_dir}")
+install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/${P2PREMOTE_LINUX_CLIENT_NAME}-launcher"
+    DESTINATION "${CMAKE_INSTALL_BINDIR}" RENAME "${P2PREMOTE_LINUX_CLIENT_NAME}")
+if(P2PREMOTE_BUILD_LINUX_HOST)
+    configure_file(viewer/linux/p2premote.desktop.in p2premote.desktop @ONLY)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/p2premote.desktop" DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+endif()
+install(DIRECTORY plugins/ DESTINATION "${CMAKE_INSTALL_DATADIR}/p2premote/plugins")
+if(QT6_IS_SHARED_LIBS_BUILD AND NOT CMAKE_CROSSCOMPILING)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/p2premote-qt.conf" "[Paths]\nPrefix=.\nLibraries=lib\nPlugins=qt-plugins\n")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/p2premote-qt.conf" DESTINATION "${p2premote_gui_dir}" RENAME qt.conf)
+    qt6_generate_deploy_script(TARGET p2premote_linux_viewer OUTPUT_SCRIPT p2premote_qt_deploy CONTENT "
+qt6_deploy_runtime_dependencies(
+    EXECUTABLE [[$<TARGET_FILE:p2premote_linux_viewer>]]
+    BIN_DIR [[${p2premote_gui_dir}]]
+    LIB_DIR [[${p2premote_gui_dir}/lib]]
+    PLUGINS_DIR [[${p2premote_gui_dir}/qt-plugins]]
+    NO_TRANSLATIONS
+    PRE_EXCLUDE_REGEXES [[^libp2premote_minirtc[.]so$]])
+")
+    install(SCRIPT "${p2premote_qt_deploy}")
+else()
+    install(IMPORTED_RUNTIME_ARTIFACTS ghostty-vt::ghostty-vt LIBRARY DESTINATION "${p2premote_gui_dir}/lib")
+endif()
 
 enable_testing()
 foreach(protocol IN ITEMS input plugin)

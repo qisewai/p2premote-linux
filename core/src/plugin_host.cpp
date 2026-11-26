@@ -155,7 +155,12 @@ bool IsPlainPath(const std::filesystem::path& path, bool directory) noexcept {
 
 #else
 std::filesystem::path PluginDirectory() {
-    return (QCoreApplication::applicationDirPath() + QStringLiteral("/plugins")).toStdString();
+    const auto local = (QCoreApplication::applicationDirPath() + QStringLiteral("/plugins")).toStdString();
+#if defined(P2PREMOTE_LINUX_PLUGIN_DIR)
+    std::error_code error;
+    if (!std::filesystem::is_directory(local, error)) return P2PREMOTE_LINUX_PLUGIN_DIR;
+#endif
+    return local;
 }
 
 bool IsPlainPath(const std::filesystem::path& path, bool directory) noexcept {

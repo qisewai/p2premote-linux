@@ -340,7 +340,16 @@ int32_t p2p_stream_display_changed(p2p_stream* stream) {
 int32_t p2p_stream_tick(p2p_stream* stream) {
     return Guard([&] {
         auto& state = Required(stream);
+        const auto drain = [&] {
+            if (const auto event = state.session.Event();
+                event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
+                state.session.ProcessEvents();
+                state.PresentReadyFrame();
+            }
+        };
+        drain();
         state.session.Tick();
+        drain();
         if (!state.host) ViewerInput::UpdatePluginLocks(state.session);
         state.SyncState();
     });

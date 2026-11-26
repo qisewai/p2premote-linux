@@ -97,6 +97,10 @@ private:
     void openAgentAudit();
     void refreshServiceStatus();
     void toggleHostService();
+#if defined(Q_OS_LINUX)
+    void changeLinuxHostService(bool enabled, QString code = {});
+    void changeLinuxCloudReceiving(bool enabled, std::function<void(bool)> completed = {});
+#endif
     bool installOrUpdateHostService(bool enable_lan, bool enable_cloud, QString* error = nullptr);
     void relaunchAsAdmin();
     void closeSessions();
@@ -137,6 +141,9 @@ private:
     QPointer<QMessageBox> agent_prompt_;
     QString host_status_text_;
     bool service_status_pending_{};
+#if defined(Q_OS_LINUX)
+    bool service_operation_pending_{};
+#endif
     bool elevated_{};
     QString loaded_server_;
     bool hotkey_{};
@@ -163,6 +170,9 @@ private:
     QPushButton *lan_toggle_code_btn_{}, *lan_copy_btn_{}, *lan_edit_btn_{};
     QComboBox* screens_{};
     QLabel *local_summary_ip_{}, *local_summary_display_{}, *privilege_status_{};
+#if defined(Q_OS_LINUX)
+    QLabel* local_summary_account_{};
+#endif
     QWidget* service_section_{};
     QLabel* service_hint_{};
     QWidget* cloud_host_section_{};

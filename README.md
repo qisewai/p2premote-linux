@@ -374,7 +374,7 @@ ctest --preset windows-x64-qt-release
 
 便携目录的 `licenses/` 包含 vcpkg 提供的 Qt 与其依赖许可。Qt Base 的对应源码归档可在 [Qt 下载站](https://download.qt.io/archive/qt/6.11/6.11.3/submodules/) 获取，构建补丁来自 [vcpkg qtbase port](https://github.com/microsoft/vcpkg/tree/277978ad2eddc3b05ecf288dcd33071968cd2f79/ports/qtbase)。
 
-### Linux 主控端
+### Linux 客户端
 
 Linux x86-64 主控端与 Windows 共享 Qt 主窗口、设置、会话标签和控制中心。可在「局域网直连」中选择发现的被控端，或输入地址、端口与验证码。登录账号后可在「我的设备」中连接在线设备。点击远程画面接管键鼠，F11 切换全屏，F12 释放键鼠。支持播放远端声音和从当前会话发送麦克风声音。
 
@@ -386,17 +386,29 @@ Linux 主控端开始绘制时取最新的解码帧。连接状态的 FPS 统计
 
 构建需要 GCC、CMake、Ninja、Xmake、Qt 6.8 或更新版本（Widgets、Network、WebSockets）、OpenSSL、libyuv、Lua 5.4、libsecret、PulseAudio 和 FUSE3（`fuse3`）的开发包，以及 [libghostty-vt 1.0.1](https://lib.ghostty.org/vt/installing.html#build-from-source)。Linux 上从源码构建 libghostty-vt，可安装到 `~/.local/share/p2premote/ghostty-vt`，也可在配置时用 `CMAKE_PREFIX_PATH` 指定其前缀。MiniRTC 还需要归档解压工具、Meson 1.4 或更新版本、Autotools 和 NASM。
 
+Ubuntu 上还需安装 `libavcodec-dev libavutil-dev` 来构建 MiniRTC，以及 `libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxau-dev libsystemd-dev libpulse-dev` 来构建被控服务。
+
 ```bash
 bash tools/minirtc_probe/Build-Linux.sh
-cmake --preset linux-x64-viewer -DCMAKE_PREFIX_PATH="$HOME/.local/share/p2premote/qt/6.8.3/gcc_64"
-cmake --build --preset linux-x64-viewer
-ctest --preset linux-x64-viewer
-./out/build/linux-x64-viewer/p2premote_linux_viewer
+cmake --preset linux-x64 -DCMAKE_PREFIX_PATH="$HOME/.local/share/p2premote/qt/6.8.3/gcc_64"
+cmake --build --preset linux-x64
+ctest --preset linux-x64
+sudo cmake --install out/build/linux-x64
+sudo systemctl daemon-reload
+p2premote
 ```
 
 MiniRTC 默认安装到 `~/.local/share/p2premote/minirtc`。自定义路径时给脚本设置 `P2PREMOTE_LINUX_MINIRTC_DIR`，并把同一路径作为 CMake 的 `-DP2PREMOTE_LINUX_MINIRTC_DIR`。Xmake 可通过 `XMAKE_BIN` 指定。
 
-WSL 2 的 NAT 网络可能收不到局域网广播。可以手动填写被控端地址，或用 `ip -4 route show default` 查询本机 Windows 网关地址。Ubuntu 的构建产物按 Linux 主控端部署，接收远控依旧在 Windows 被控端开启。
+安装后，从「本机」打开「允许局域网连接」，通过桌面的 PolicyKit 授权（需要 `pkexec` 和会话中的授权代理）。客户端会设置验证码、启动 systemd 服务并启用开机接收。退出客户端后服务继续等待连接，关闭开关会停止服务并取消开机启动。Linux 被控支持 **局域网 Xorg 同屏控制**，采集跟随活动的虚拟终端，键鼠通过内核的 `/dev/uinput` 注入。登录界面和用户桌面都应运行 Xorg。服务日志可通过 `journalctl -u p2premote-host.service` 查看。
+
+使用云端被控时，登录账号，在「本机」点击「添加到云端」，再开启「云端接收」并通过管理员授权。其他设备使用同一账号登录后，可以在「我的设备」中跨网连接。`p2premote-cloud-host.service` 随系统启动，关闭客户端窗口后继续接收。退出账号前会停止本机的云端接收，从账号移除设备后现有云端会话也会结束。此功能同样使用活动的 Xorg 桌面，局域网和云端分别启停，同一时刻只接收一个控制会话。
+
+云端服务使用绑定到本机设备的登录会话。用于开机登录的配置保存在 root 专用的 `/etc/p2premote/cloud-host.conf`，关闭云端接收时移除。运行状态和错误可通过 `journalctl -u p2premote-cloud-host.service` 查看。
+
+局域网和云端被控都支持转发系统声音。主控端在会话顶部的「声音设置」中勾选「远端扬声器声音」即可收听。被控端采集当前 Xorg 用户的默认音频输出，支持 PulseAudio 和 PipeWire 的 PulseAudio 兼容服务。登录界面和没有可用音频输出的桌面可继续进行画面与键鼠控制。
+
+只需要主控端时使用原有的 `linux-x64-viewer` 预设。WSL 2 的 NAT 网络可能收不到局域网广播，可以手动填写被控端地址，或用 `ip -4 route show default` 查询本机 Windows 网关地址。
 
 ## 计时口径
 
