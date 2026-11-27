@@ -35,11 +35,11 @@ target_compile_definitions(p2premote_linux_host PRIVATE
 target_compile_features(p2premote_linux_host PRIVATE cxx_std_20)
 target_compile_options(p2premote_linux_host PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(p2premote_linux_host PRIVATE
-    proto/include core/include core/src tools/minirtc_probe host/linux viewer/linux)
+    proto/include core core/include core/src tools/minirtc_probe host/linux viewer/linux)
 target_include_directories(p2premote_linux_host SYSTEM PRIVATE
     "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
 target_link_libraries(p2premote_linux_host PRIVATE
-    Qt6::Core Qt6::Network Qt6::WebSockets OpenSSL::Crypto PkgConfig::LINUX_HOST_X11 PkgConfig::LINUX_HOST_AUDIO pthread
+    p2premote_update_core Qt6::Core Qt6::Network Qt6::WebSockets OpenSSL::Crypto PkgConfig::LINUX_HOST_X11 PkgConfig::LINUX_HOST_AUDIO pthread
     "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}")
 set_target_properties(p2premote_linux_host PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib"
@@ -145,4 +145,9 @@ if(P2PREMOTE_TEST_PYTHON)
     add_test(NAME linux_service_lifecycle_test COMMAND "${P2PREMOTE_TEST_PYTHON}"
         "${CMAKE_CURRENT_SOURCE_DIR}/host/linux/service_lifecycle_test.py" "$<TARGET_FILE:p2premote_linux_host>")
     set_tests_properties(linux_service_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 25)
+    add_test(NAME linux_tarball_install_test COMMAND "${P2PREMOTE_TEST_PYTHON}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/p2prelease/install_test.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/p2prelease/install.sh"
+        "$<TARGET_FILE:p2prelease>")
+    set_tests_properties(linux_tarball_install_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 endif()

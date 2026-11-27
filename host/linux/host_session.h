@@ -47,6 +47,7 @@ public:
     LinuxHostSession& operator=(const LinuxHostSession&) = delete;
 
     bool Valid() const noexcept { return capture_thread_.joinable(); }
+    bool PeerActive() const noexcept { return peer_active_.load(std::memory_order_acquire); }
     bool StartCloudPeer(TurnMode turn);
     bool ReceiveCloudSignal(const std::string& payload);
     void StopCloudPeer();

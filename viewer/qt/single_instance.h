@@ -13,7 +13,7 @@ public:
     SingleInstance(const SingleInstance&) = delete;
     SingleInstance& operator=(const SingleInstance&) = delete;
 
-    Result start(bool elevated_restart);
+    Result start(bool wait_for_exit);
     bool registerWindow(QWidget& window);
     void unregisterWindow();
     static bool isActivationMessage(unsigned message);

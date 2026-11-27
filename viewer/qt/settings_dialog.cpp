@@ -1,5 +1,6 @@
 #include "settings_dialog.h"
 #include "app_theme.h"
+#include "update_client.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -65,8 +66,8 @@ void addNavHeader(QListWidget* nav, const QString& text) {
 
 } // namespace
 
-SettingsDialog::SettingsDialog(QWidget* parent)
-    : FramelessDialog(QStringLiteral("设置 · P2P Remote"), true, parent) {
+SettingsDialog::SettingsDialog(QWidget* parent, UpdateClient* updater)
+    : FramelessDialog(QStringLiteral("设置 · P2P Remote"), true, parent), updater_(updater) {
     setObjectName(QStringLiteral("settingsDialog"));
     setMinimumSize(700, 480);
     resize(800, 560);
@@ -265,8 +266,96 @@ QScrollArea* SettingsDialog::buildGeneralPage() {
     card_layout->addLayout(form);
 
     layout->addWidget(card);
+
+    // Software Update card
+    QVBoxLayout* upd_layout{};
+    auto* upd_card = makeCard(container, &upd_layout);
+    auto* upd_hdr = new QHBoxLayout;
+    upd_hdr->setContentsMargins(0, 0, 0, 0);
+    upd_hdr->setSpacing(10);
+    auto* ver_lbl = new QLabel(QStringLiteral("软件更新 · 当前版本 v%1").arg(UpdateClient::currentVersion()), upd_card);
+    ver_lbl->setObjectName(QStringLiteral("cardTitle"));
+    ver_lbl->setTextFormat(Qt::PlainText);
+    upd_hdr->addWidget(ver_lbl, 1);
+
+    check_update_btn_ = new QPushButton(QStringLiteral("检查更新"), upd_card);
+    check_update_btn_->setProperty("variant", QStringLiteral("subtle"));
+    connect(check_update_btn_, &QPushButton::clicked, this, [this] {
+        if (!updater_) return;
+        updater_->applySettings(auto_check_updates_->isChecked(),
+                                auto_download_updates_->isChecked(),
+                                update_mirror_url_->text().trimmed());
+        if (updater_->state() == UpdateState::ReadyToInstall) {
+            updater_->installUpdate();
+        } else if (updater_->state() == UpdateState::Available) {
+            updater_->downloadUpdate();
+        } else {
+            updater_->checkForUpdates(true);
+        }
+    });
+    upd_hdr->addWidget(check_update_btn_);
+    upd_layout->addLayout(upd_hdr);
+
+    update_status_label_ = makeMuted(QStringLiteral("从 GitHub Releases 自动检查已签名的版本更新。"), upd_card);
+    upd_layout->addWidget(update_status_label_);
+
+    auto_check_updates_ = new QCheckBox(QStringLiteral("启动及后台定期自动检查更新"), upd_card);
+    upd_layout->addWidget(auto_check_updates_);
+
+    auto_download_updates_ = new QCheckBox(QStringLiteral("发现新版本时自动在后台下载并验签（空闲后或重启生效）"), upd_card);
+    upd_layout->addWidget(auto_download_updates_);
+
+    auto* upd_form = new QFormLayout;
+    upd_form->setHorizontalSpacing(18);
+    upd_form->setVerticalSpacing(10);
+    upd_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    update_mirror_url_ = new QLineEdit(upd_card);
+    update_mirror_url_->setPlaceholderText(QStringLiteral("留空使用默认 GitHub Releases；可填镜像前缀或自定义清单 URL"));
+    upd_form->addRow(QStringLiteral("更新源/镜像"), update_mirror_url_);
+    upd_layout->addLayout(upd_form);
+
+    if (updater_) {
+        connect(updater_, &UpdateClient::stateChanged, this, &SettingsDialog::syncUpdateStatus);
+        connect(updater_, &UpdateClient::progressChanged, this, [this] { syncUpdateStatus(); });
+        syncUpdateStatus();
+    } else {
+        check_update_btn_->setEnabled(false);
+    }
+
+    layout->addWidget(upd_card);
     layout->addStretch(1);
     return wrapScrollable(container, pages_);
+}
+
+void SettingsDialog::syncUpdateStatus() {
+    if (!updater_ || !update_status_label_ || !check_update_btn_) return;
+    const auto st = updater_->state();
+    QString msg = updater_->statusMessage();
+    if (st == UpdateState::Downloading && updater_->totalBytes() > 0) {
+        const int pct = static_cast<int>((updater_->downloadedBytes() * 100) / updater_->totalBytes());
+        msg = QStringLiteral("正在下载更新：%1%").arg(pct);
+    }
+    if (msg.isEmpty()) {
+        msg = updater_->isConfigured()
+            ? QStringLiteral("从 GitHub Releases 自动检查已签名的版本更新。")
+            : QStringLiteral("当前开发构建未配置更新签名公钥。");
+    }
+    update_status_label_->setText(msg);
+
+    if (st == UpdateState::Checking || st == UpdateState::Downloading ||
+        st == UpdateState::Verifying || st == UpdateState::Installing) {
+        check_update_btn_->setEnabled(false);
+        check_update_btn_->setText(st == UpdateState::Downloading ? QStringLiteral("下载中…") : QStringLiteral("处理中…"));
+    } else if (st == UpdateState::ReadyToInstall) {
+        check_update_btn_->setEnabled(true);
+        check_update_btn_->setText(QStringLiteral("立即重启更新"));
+    } else if (st == UpdateState::Available) {
+        check_update_btn_->setEnabled(true);
+        check_update_btn_->setText(QStringLiteral("下载更新"));
+    } else {
+        check_update_btn_->setEnabled(true);
+        check_update_btn_->setText(QStringLiteral("检查更新"));
+    }
 }
 
 QScrollArea* SettingsDialog::buildStreamAudioPage() {
@@ -492,6 +581,9 @@ void SettingsDialog::loadAppControls(const AppSettingsData& d) {
     close_to_tray_->setChecked(d.close_to_tray);
     if (auto_receive_) auto_receive_->setChecked(d.auto_receive_on_login);
     default_server_->setText(d.default_server);
+    if (auto_check_updates_) auto_check_updates_->setChecked(d.auto_check_updates);
+    if (auto_download_updates_) auto_download_updates_->setChecked(d.auto_download_updates);
+    if (update_mirror_url_) update_mirror_url_->setText(d.update_mirror_url);
 
     setComboData(quality_combo_, d.default_quality);
     setComboData(bitrate_combo_, d.default_bitrate);
@@ -510,6 +602,9 @@ AppSettingsData SettingsDialog::collectAppSettings() const {
     d.close_to_tray = close_to_tray_->isChecked();
     if (auto_receive_) d.auto_receive_on_login = auto_receive_->isChecked();
     d.default_server = default_server_->text().trimmed();
+    if (auto_check_updates_) d.auto_check_updates = auto_check_updates_->isChecked();
+    if (auto_download_updates_) d.auto_download_updates = auto_download_updates_->isChecked();
+    if (update_mirror_url_) d.update_mirror_url = update_mirror_url_->text().trimmed();
     d.default_quality = quality_combo_->currentData().toInt();
     d.default_bitrate = bitrate_combo_->currentData().toInt();
     d.show_diagnostics = show_diagnostics_->isChecked();

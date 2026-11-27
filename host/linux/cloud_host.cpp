@@ -3,23 +3,33 @@
 #include "cloud_connection.h"
 #include "host_session.h"
 #include "service_support.h"
+#include "update/update_archive.h"
 #include "x11_shm_capturer.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QFile>
+#include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
+#include <QNetworkProxyFactory>
 #include <QNetworkReply>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QSysInfo>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <QWebSocket>
 
 #include <algorithm>
 #include <csignal>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace p2premote::linux_host {
 namespace {
@@ -151,6 +161,8 @@ public:
             login();
         }
     }
+
+    bool inSession() const noexcept { return state_ == State::session; }
 
 private:
     enum class State { retry, login, opening, waiting, session, locked, standby };
@@ -335,6 +347,146 @@ private:
     std::unique_ptr<LinuxHostSession> media_;
 };
 
+#ifndef P2PREMOTE_VERSION
+#define P2PREMOTE_VERSION "0.2.0"
+#endif
+#ifndef P2PREMOTE_UPDATE_FEED_URL
+#define P2PREMOTE_UPDATE_FEED_URL ""
+#endif
+#ifndef P2PREMOTE_UPDATE_PUBLIC_KEY
+#define P2PREMOTE_UPDATE_PUBLIC_KEY ""
+#endif
+
+// Unattended periodic auto-updater for headless Linux hosts (idle-only, zero-trust Ed25519).
+class UnattendedHostUpdater final : public QObject {
+public:
+    explicit UnattendedHostUpdater(std::function<bool()> is_busy, QObject* parent = nullptr)
+        : QObject(parent), is_busy_(std::move(is_busy)) {
+        const std::string key = P2PREMOTE_UPDATE_PUBLIC_KEY;
+        const std::string feed = P2PREMOTE_UPDATE_FEED_URL;
+        if (key.empty() || feed.empty() || !p2premote::update::ParsePublicKeyBase64(key)) return;
+        QNetworkProxyFactory::setUseSystemConfiguration(true);
+        timer_.setInterval(4 * 60 * 60 * 1000);
+        connect(&timer_, &QTimer::timeout, this, &UnattendedHostUpdater::checkNow);
+        QTimer::singleShot(30 * 1000, this, [this] {
+            checkNow();
+            timer_.start();
+        });
+    }
+
+private:
+    void checkNow() {
+        if (busy_ || (!pending_install_.isEmpty() && QFile::exists(pending_install_)) ||
+            !IsUnattendedModeEnabled() || (is_busy_ && is_busy_())) return;
+        const QUrl url(QString::fromUtf8(P2PREMOTE_UPDATE_FEED_URL));
+        if (!url.isValid() || (url.scheme() != QStringLiteral("https") &&
+            !(url.scheme() == QStringLiteral("http") && QHostAddress(url.host()).isLoopback()))) {
+            return;
+        }
+        busy_ = true;
+        QNetworkRequest req(url);
+        req.setTransferTimeout(30000);
+        req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        req.setRawHeader("User-Agent", "p2premote-updater");
+        req.setRawHeader("Cache-Control", "no-cache");
+        auto* reply = network_.get(req);
+        connect(reply, &QNetworkReply::readyRead, reply, [reply] {
+            if (reply->bytesAvailable() > static_cast<qint64>(p2premote::update::kMaxManifestBytes)) reply->abort();
+        });
+        connect(reply, &QNetworkReply::finished, this, [this, reply] {
+            reply->deleteLater();
+            const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const QByteArray body = reply->readAll();
+            if (reply->error() != QNetworkReply::NoError || code != 200 ||
+                body.size() > static_cast<qsizetype>(p2premote::update::kMaxManifestBytes)) {
+                busy_ = false;
+                return;
+            }
+            const auto parsed = p2premote::update::ParseUpdateManifest(
+                std::string_view(body.constData(), static_cast<std::size_t>(body.size())));
+            if (!parsed || !p2premote::update::VerifyUpdateManifest(*parsed, "linux-x64", P2PREMOTE_UPDATE_PUBLIC_KEY) ||
+                p2premote::update::CompareVersions(parsed->version, P2PREMOTE_VERSION) <= 0) {
+                busy_ = false;
+                return;
+            }
+            downloadAndApply(*parsed);
+        });
+    }
+
+    void downloadAndApply(p2premote::update::UpdateManifest manifest) {
+        const QUrl url(QString::fromStdString(manifest.url));
+        if (!url.isValid() || (url.scheme() != QStringLiteral("https") &&
+            !(url.scheme() == QStringLiteral("http") && QHostAddress(url.host()).isLoopback()))) {
+            busy_ = false;
+            return;
+        }
+        QNetworkRequest req(url);
+        req.setTransferTimeout(60000);
+        req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        req.setRawHeader("User-Agent", "p2premote-updater");
+        auto work = std::make_shared<QTemporaryDir>(QStringLiteral("/tmp/p2premote-auto-XXXXXX"));
+        if (!work->isValid()) {
+            busy_ = false;
+            return;
+        }
+        const auto archive_path = std::filesystem::path(work->filePath(QStringLiteral("update.tar.gz")).toStdString());
+        const auto manifest_path = std::filesystem::path(work->filePath(QStringLiteral("manifest.json")).toStdString());
+        auto file = std::make_shared<QFile>(QString::fromUtf8(archive_path.c_str()));
+        if (!file->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            busy_ = false;
+            return;
+        }
+        auto* reply = network_.get(req);
+        auto written = std::make_shared<std::int64_t>(0);
+        connect(reply, &QNetworkReply::readyRead, this, [reply, file, written, limit = manifest.size] {
+            const QByteArray chunk = reply->readAll();
+            *written += chunk.size();
+            if (*written > limit || file->write(chunk) != chunk.size()) {
+                reply->abort();
+            }
+        });
+        connect(reply, &QNetworkReply::finished, this, [this, reply, file, work, manifest, archive_path, manifest_path] {
+            reply->deleteLater();
+            file->flush();
+            file->close();
+            const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            busy_ = false;
+            if (reply->error() != QNetworkReply::NoError || code != 200 ||
+                !IsUnattendedModeEnabled() || (is_busy_ && is_busy_())) {
+                return;
+            }
+            if (!p2premote::update::VerifyArchiveFile(archive_path, manifest.size, manifest.signature,
+                                                      P2PREMOTE_UPDATE_PUBLIC_KEY)) {
+                return;
+            }
+            {
+                std::ofstream mf(manifest_path, std::ios::binary | std::ios::trunc);
+                if (!mf || !(mf << p2premote::update::SerializeUpdateManifest(manifest))) {
+                    return;
+                }
+            }
+            // The transient systemd service survives stopping the host's cgroup.
+            std::error_code ec;
+            const auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
+            if (ec || self != "/usr/local/libexec/p2premote/p2premote_linux_host") return;
+            QProcess runner;
+            runner.start(QStringLiteral("/usr/bin/systemd-run"),
+                         {QStringLiteral("--quiet"), QStringLiteral("--collect"), QStringLiteral("--service-type=exec"),
+                          QString::fromStdString(self.string()), QStringLiteral("--apply-downloaded-update"), work->path()});
+            if (runner.waitForFinished(10000) && runner.exitStatus() == QProcess::NormalExit && runner.exitCode() == 0) {
+                work->setAutoRemove(false);
+                pending_install_ = work->path();
+            }
+        });
+    }
+
+    QNetworkAccessManager network_;
+    QTimer timer_;
+    std::function<bool()> is_busy_;
+    QString pending_install_;
+    bool busy_{false};
+};
+
 } // namespace
 
 bool ValidCloudHostConfig(std::string_view data) { return ParseConfig(data).has_value(); }
@@ -424,6 +576,10 @@ int RunSystemService(int argc, char** argv, HostConfig lan_base) {
     std::cout << "[host] P2P Remote Linux Host service running (lan="
               << (lan_configured ? "enabled" : "off")
               << ", cloud=" << (cloud_service ? "enabled" : "off") << ")\n" << std::flush;
+
+    UnattendedHostUpdater unattended_updater([&] {
+        return (lan_session && lan_session->PeerActive()) || (cloud_service && cloud_service->inSession());
+    });
 
     QTimer poll_timer;
     QObject::connect(&poll_timer, &QTimer::timeout, &app, [&] {

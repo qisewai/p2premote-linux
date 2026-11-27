@@ -1,6 +1,7 @@
 #include "service_support.h"
 
 #include "host_session.h"
+#include "update/update_archive.h"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -13,6 +14,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cerrno>
@@ -21,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -432,8 +435,226 @@ int UninstallHostServices() {
     return rmdir(config_directory) == 0 || errno == ENOTEMPTY ? 0 : 1;
 }
 
-static bool IsUnattendedEnabled() noexcept {
+bool IsUnattendedModeEnabled() noexcept {
     return access("/etc/p2premote/host.unattended", F_OK) == 0;
+}
+
+static bool IsUnattendedEnabled() noexcept {
+    return IsUnattendedModeEnabled();
+}
+
+int ApplyLinuxSystemUpdate(std::string_view archive_path, std::string_view manifest_path) {
+    if (geteuid() != 0) {
+        std::cerr << "Administrator authorization is required to apply a system update.\n";
+        return 1;
+    }
+#ifndef P2PREMOTE_UPDATE_PUBLIC_KEY
+    constexpr const char* embedded_key = "";
+#else
+    constexpr const char* embedded_key = P2PREMOTE_UPDATE_PUBLIC_KEY;
+#endif
+#ifndef P2PREMOTE_VERSION
+    constexpr const char* current_version = "0.2.0";
+#else
+    constexpr const char* current_version = P2PREMOTE_VERSION;
+#endif
+    if (!embedded_key || !*embedded_key) {
+        std::cerr << "Update public key is not embedded in this build.\n";
+        return 1;
+    }
+
+    const Fd lock(LockServiceChanges());
+    if (lock.get() < 0) return 1;
+
+    namespace fs = std::filesystem;
+    using namespace p2premote::update;
+    const fs::path libexec_root = "/usr/local/libexec";
+    const fs::path runtime_dir = libexec_root / "p2premote";
+    struct stat loaded{}, installed{};
+    if (stat("/proc/self/exe", &loaded) != 0 ||
+        stat((runtime_dir / "p2premote_linux_host").c_str(), &installed) != 0 ||
+        loaded.st_dev != installed.st_dev || loaded.st_ino != installed.st_ino) {
+        std::cerr << "The installed update helper has changed. Retry with the current version.\n";
+        return 1;
+    }
+    const Fd mf(open(std::string(manifest_path).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    struct stat info{};
+    std::string manifest_text;
+    if (mf.get() < 0 || fstat(mf.get(), &info) != 0 || !S_ISREG(info.st_mode) ||
+        !ReadBounded(mf.get(), manifest_text, kMaxManifestBytes)) {
+        std::cerr << "Could not open update manifest.\n";
+        return 1;
+    }
+    std::string err;
+    const auto manifest = ParseUpdateManifest(manifest_text, &err);
+    if (!manifest || !VerifyUpdateManifest(*manifest, "linux-x64", embedded_key)) {
+        std::cerr << "Invalid or unsigned Linux update manifest.\n";
+        return 1;
+    }
+    if (p2premote::update::CompareVersions(manifest->version, current_version) <= 0) {
+        std::cerr << "Refusing to downgrade or reinstall version " << manifest->version << ".\n";
+        return 1;
+    }
+    const Fd input(open(std::string(archive_path).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    if (input.get() < 0 || fstat(input.get(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_size != manifest->size) {
+        std::cerr << "Could not open the expected update archive.\n";
+        return 1;
+    }
+
+    const fs::path share_dir = "/usr/local/share/p2premote";
+    std::error_code ec;
+    std::string work_template = (libexec_root / ".p2premote-update-XXXXXX").string();
+    if (!mkdtemp(work_template.data())) {
+        std::cerr << "Could not create a private system update directory.\n";
+        return 1;
+    }
+    const fs::path work_dir(work_template);
+    struct Cleanup {
+        fs::path path;
+        ~Cleanup() { std::error_code error; fs::remove_all(path, error); }
+    } cleanup{work_dir};
+    // Verify and unpack the same private copy of the package supplied by the GUI.
+    const auto private_archive = work_dir / "update.tar.gz";
+    {
+        std::ofstream snapshot(private_archive, std::ios::binary);
+        std::array<char, 64 * 1024> buffer{};
+        auto remaining = manifest->size;
+        while (snapshot && remaining) {
+            const auto size = read(input.get(), buffer.data(), std::min<std::int64_t>(buffer.size(), remaining));
+            if (size < 0 && errno == EINTR) continue;
+            if (size <= 0) break;
+            snapshot.write(buffer.data(), size);
+            remaining -= size;
+        }
+        snapshot.close();
+        if (!snapshot || remaining) {
+            std::cerr << "Could not copy the update archive.\n";
+            return 1;
+        }
+    }
+    if (!VerifyArchiveFile(private_archive, manifest->size, manifest->signature, embedded_key, &err)) {
+        std::cerr << "Archive verification failed: " << err << "\n";
+        return 1;
+    }
+    const fs::path unpacked = work_dir / "stage";
+    if (!ExtractTarGzArchive(private_archive, unpacked, &err)) {
+        std::cerr << "Failed to extract update archive: " << err << "\n";
+        return 1;
+    }
+
+    // Support both prefix-structured archives (usr/local/libexec/p2premote) and flat runtime archives.
+    const fs::path staged_runtime = fs::exists(unpacked / "usr/local/libexec/p2premote/p2premote_linux_host")
+        ? (unpacked / "usr/local/libexec/p2premote")
+        : unpacked;
+    const fs::path staged_share = unpacked / "usr/local/share/p2premote";
+    if (!fs::is_regular_file(staged_runtime / "p2premote_linux_host")) {
+        std::cerr << "Update archive does not contain p2premote_linux_host.\n";
+        return 1;
+    }
+
+    const bool was_active = Systemctl(service_name, "is-active");
+    if (was_active && !Systemctl(service_name, "stop")) return 1;
+
+    const std::string suffix = ".old-" + std::to_string(getpid());
+    const fs::path runtime_backup = libexec_root / (".p2premote" + suffix);
+    const fs::path share_backup = fs::path("/usr/local/share") / (".p2premote" + suffix);
+    bool moved_runtime = false;
+    bool moved_share = false;
+    bool installed_share = false;
+
+    auto rollback = [&] {
+        std::error_code rec;
+        if (moved_runtime) {
+            fs::remove_all(runtime_dir, rec);
+            fs::rename(runtime_backup, runtime_dir, rec);
+        }
+        if (installed_share) fs::remove_all(share_dir, rec);
+        if (moved_share) fs::rename(share_backup, share_dir, rec);
+        Systemctl(nullptr, "daemon-reload");
+        if (was_active) Systemctl(service_name, "start");
+    };
+
+    if (fs::exists(runtime_dir, ec)) {
+        fs::remove_all(runtime_backup, ec);
+        ec.clear();
+        fs::rename(runtime_dir, runtime_backup, ec);
+        if (ec) {
+            rollback();
+            std::cerr << "Could not back up existing runtime directory: " << ec.message() << "\n";
+            return 1;
+        }
+        moved_runtime = true;
+    }
+    fs::rename(staged_runtime, runtime_dir, ec);
+    if (ec) {
+        rollback();
+        std::cerr << "Could not install new runtime directory: " << ec.message() << "\n";
+        return 1;
+    }
+
+    if (fs::is_directory(staged_share)) {
+        if (fs::exists(share_dir, ec)) {
+            fs::remove_all(share_backup, ec);
+            ec.clear();
+            fs::rename(share_dir, share_backup, ec);
+            if (ec) {
+                rollback();
+                std::cerr << "Could not back up existing share directory: " << ec.message() << "\n";
+                return 1;
+            }
+            moved_share = true;
+        }
+        fs::rename(staged_share, share_dir, ec);
+        if (ec) {
+            rollback();
+            std::cerr << "Could not install new share directory: " << ec.message() << "\n";
+            return 1;
+        }
+        installed_share = true;
+    }
+
+    if (was_active && (!Systemctl(service_name, "start") || !Systemctl(service_name, "is-active"))) {
+        std::cerr << "Updated service failed to start; rolling back to previous version.\n";
+        rollback();
+        return 1;
+    }
+
+    // Keep the existing unit and launcher available until the new runtime starts.
+    auto copy_if_present = [](const fs::path& src, const fs::path& dst, mode_t mode) {
+        std::error_code cec;
+        if (!fs::is_regular_file(src, cec) || cec) return;
+        fs::create_directories(dst.parent_path(), cec);
+        fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cec);
+        if (!cec) chmod(dst.c_str(), mode);
+    };
+    copy_if_present(runtime_dir / "units" / service_name, fs::path(systemd_directory) / service_name, 0644);
+    copy_if_present(unpacked / "usr/local/bin/p2premote", "/usr/local/bin/p2premote", 0755);
+    copy_if_present(unpacked / "etc/xdg/autostart/p2premote-clipboard.desktop",
+                    "/etc/xdg/autostart/p2premote-clipboard.desktop", 0644);
+    copy_if_present(unpacked / "usr/local/share/applications/p2premote.desktop",
+                    "/usr/local/share/applications/p2premote.desktop", 0644);
+
+    Systemctl(nullptr, "daemon-reload");
+    if (moved_runtime) fs::remove_all(runtime_backup, ec);
+    if (moved_share) fs::remove_all(share_backup, ec);
+    return 0;
+}
+
+int ApplyDownloadedLinuxUpdate(std::string_view directory) {
+    constexpr std::string_view prefix = "/tmp/p2premote-auto-";
+    if (geteuid() != 0 || !directory.starts_with(prefix)) return 1;
+    const auto name = directory.substr(prefix.size());
+    if (name.size() != 6 || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") !=
+        std::string_view::npos) return 1;
+    const std::string path(directory);
+    const Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!TrustedDirectory(dir.get())) return 1;
+    const int result = IsUnattendedModeEnabled()
+        ? ApplyLinuxSystemUpdate(path + "/update.tar.gz", path + "/manifest.json") : 1;
+    unlinkat(dir.get(), "update.tar.gz", 0);
+    unlinkat(dir.get(), "manifest.json", 0);
+    rmdir(path.c_str());
+    return result;
 }
 
 static bool IsClientAlive() noexcept {

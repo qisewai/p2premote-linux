@@ -1,0 +1,208 @@
+name: Build and publish signed releases
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p2premote-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - id: version
+        shell: bash
+        run: |
+          version=$(tr -d '\r\n' < VERSION)
+          number='(0|[1-9][0-9]{0,8})'
+          [[ $version =~ ^$number\.$number\.$number$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo 'The release tag must match VERSION.' >&2
+            exit 1
+          fi
+          test -s cmake/update-public.key
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: '3.1.1'
+      - name: Build and stage Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ([Environment]::GetEnvironmentVariable('ProgramFiles(x86)')) 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio 2022 with C++ was not found' }
+          Import-Module (Join-Path $vs 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+
+          $env:VCPKG_ROOT = Join-Path $env:RUNNER_TEMP 'p2premote-vcpkg'
+          git init -q $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT fetch --depth 1 https://github.com/microsoft/vcpkg.git 277978ad2eddc3b05ecf288dcd33071968cd2f79
+          git -C $env:VCPKG_ROOT checkout --detach FETCH_HEAD
+          & (Join-Path $env:VCPKG_ROOT 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+          $ghostty = New-Item -ItemType Directory -Force 'out/ghostty-vt'
+          $zip = Join-Path $ghostty.FullName 'ghostty-vt-windows.zip'
+          curl.exe --fail --location --retry 3 --output $zip https://release.files.ghostty.org/libghostty-vt/1.0.1/ghostty-vt-1.0.1-x86_64-windows-gnu.zip
+          if ($LASTEXITCODE -or (Get-FileHash -LiteralPath $zip).Hash -ne '8e2eb9e1822e85d786b456c8beb86f49d09c318c91f0c2913f91e7ffa12cda29') {
+            throw 'Ghostty VT archive checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $ghostty.FullName
+
+          ./tools/minirtc_probe/Build.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --preset windows-x64-qt "-DP2PREMOTE_UPDATE_FEED_URL=https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/update-windows-x64.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset windows-x64-qt-release --parallel --target p2premote_qt p2premote p2premote_service p2premote_mcp p2p_cli update_core_test update_client_test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --preset windows-x64-qt-release -R '^update_' --output-on-failure
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $stage = Join-Path $env:RUNNER_TEMP 'windows-stage'
+          cmake --install out/build/windows-x64-qt --config Release --prefix $stage
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          tar.exe -cf "$env:RUNNER_TEMP/windows-x64.tar" -C $stage .
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage-windows-x64
+          path: ${{ runner.temp }}/windows-x64.tar
+          if-no-files-found: error
+          retention-days: 3
+
+  linux:
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: '3.1.1'
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: linux_gcc_64
+      - name: Build and stage Linux
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build nasm autoconf automake libtool pkg-config patchelf \
+            libavcodec-dev libavutil-dev libyuv-dev libssl-dev liblua5.4-dev libsecret-1-dev \
+            libpulse-dev libfuse3-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
+            libxau-dev libsystemd-dev libgl1-mesa-dev zlib1g-dev libbz2-dev
+          python3 -m pip install --user 'meson==1.9.2'
+          export PATH="$HOME/.local/bin:$PATH"
+
+          deps="$RUNNER_TEMP/p2premote-deps"
+          mkdir -p "$deps/zig" "$deps/ghostty-src"
+          curl -fL --retry 3 https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz -o "$deps/zig.tar.xz"
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  $deps/zig.tar.xz" | sha256sum -c
+          tar -xJf "$deps/zig.tar.xz" --strip-components=1 -C "$deps/zig"
+          curl -fL --retry 3 https://release.files.ghostty.org/libghostty-vt/1.0.1/libghostty-vt-1.0.1.tar.gz -o "$deps/ghostty.tar.gz"
+          echo "333dfce97641ef9b536bb9e08907ad86abaaada50e8f7417b70d9284adef37aa  $deps/ghostty.tar.gz" | sha256sum -c
+          tar -xzf "$deps/ghostty.tar.gz" --strip-components=1 -C "$deps/ghostty-src"
+          (cd "$deps/ghostty-src" && "$deps/zig/zig" build -Doptimize=ReleaseFast --prefix "$deps/ghostty")
+
+          bash tools/minirtc_probe/Build-Linux.sh
+          cmake --preset linux-x64 -DCMAKE_INSTALL_PREFIX=/usr/local \
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR;$deps/ghostty" \
+            "-DP2PREMOTE_UPDATE_FEED_URL=https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update-linux-x64.json"
+          cmake --build --preset linux-x64 --parallel 4
+          ctest --preset linux-x64 -R '^update_' --output-on-failure
+          DESTDIR="$RUNNER_TEMP/linux-stage" cmake --install out/build/linux-x64
+          python3 tools/p2prelease/Bundle-LinuxRuntime.py "$RUNNER_TEMP/linux-stage/usr/local/libexec/p2premote"
+          tar -cf "$RUNNER_TEMP/linux-x64.tar" -C "$RUNNER_TEMP/linux-stage" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage-linux-x64
+          path: ${{ runner.temp }}/linux-x64.tar
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: stage-*
+          path: ${{ runner.temp }}/staged
+          merge-multiple: true
+      - name: Prepare packager and previous release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bsdiff zlib1g-dev libbz2-dev
+          cmake -S . -B "$RUNNER_TEMP/packager" -DP2PREMOTE_RELEASE_TOOLS_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/packager" --parallel --target p2prelease update_core_test
+          ctest --test-dir "$RUNNER_TEMP/packager" --output-on-failure
+
+          mkdir -p "$RUNNER_TEMP/previous"
+          for platform in windows-x64 linux-x64; do
+            mkdir -p "$RUNNER_TEMP/staged/$platform"
+            tar -xf "$RUNNER_TEMP/staged/$platform.tar" -C "$RUNNER_TEMP/staged/$platform"
+          done
+          previous=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 --exclude-drafts --exclude-pre-releases \
+            --json tagName,isLatest --jq '.[] | select(.isLatest) | .tagName')
+          if [[ "$previous" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            old_version=${previous#v}
+            if [[ "$old_version" == "$RELEASE_VERSION" || $(printf '%s\n' "$old_version" "$RELEASE_VERSION" | sort -V | tail -1) != "$RELEASE_VERSION" ]]; then
+              echo 'Release version must be newer than the current release.' >&2
+              exit 1
+            fi
+            for platform in windows-x64 linux-x64; do
+              gh release download "$previous" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/previous" \
+                --pattern "update-$platform.json" --pattern "p2premote-$old_version-$platform.tar.gz" ||
+                echo "Previous $platform assets unavailable; a full update will be published."
+            done
+          fi
+      - name: Sign and verify release assets
+        shell: bash
+        env:
+          P2PREMOTE_UPDATE_PRIVATE_KEY: ${{ secrets.P2PREMOTE_UPDATE_PRIVATE_KEY }}
+        run: |
+          bash tools/p2prelease/Prepare-Release.sh "$RUNNER_TEMP/packager/p2prelease" \
+            "$RUNNER_TEMP/staged" "$RUNNER_TEMP/previous" "$RUNNER_TEMP/release-assets"
+      - name: Publish the complete release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$RUNNER_TEMP/release-notes.md"
+          jq -r '.notes // "Signed P2P Remote update for Windows and Linux."' \
+            "$RUNNER_TEMP/release-assets/update-windows-x64.json" > "$notes"
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/release-assets/"* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "P2P Remote $GITHUB_REF_NAME" --notes-file "$notes"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

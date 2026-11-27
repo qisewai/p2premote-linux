@@ -21,6 +21,11 @@ struct AppSettingsData {
     bool auto_receive_on_login{true};
     QString default_server;
 
+    // Updates
+    bool auto_check_updates{true};
+    bool auto_download_updates{true};
+    QString update_mirror_url;
+
     // Stream & Audio defaults
     int default_quality{1};        // 0=720p, 1=1080p, 2=1440p
     int default_bitrate{1};        // 0=2M, 1=8M, 2=16M

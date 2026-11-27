@@ -12,14 +12,16 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QPushButton;
 class QScrollArea;
 class QStackedWidget;
+class UpdateClient;
 
 class SettingsDialog final : public FramelessDialog {
     Q_OBJECT
 
 public:
-    explicit SettingsDialog(QWidget* parent = nullptr);
+    explicit SettingsDialog(QWidget* parent = nullptr, UpdateClient* updater = nullptr);
 
 private:
     struct PluginFieldBinding {
@@ -62,6 +64,15 @@ private:
     QCheckBox* close_to_tray_{};
     QCheckBox* auto_receive_{};
     QLineEdit* default_server_{};
+
+    // Update controls
+    UpdateClient* updater_{};
+    QCheckBox* auto_check_updates_{};
+    QCheckBox* auto_download_updates_{};
+    QLineEdit* update_mirror_url_{};
+    QLabel* update_status_label_{};
+    QPushButton* check_update_btn_{};
+    void syncUpdateStatus();
 
     // Stream & Audio controls
     QComboBox* quality_combo_{};

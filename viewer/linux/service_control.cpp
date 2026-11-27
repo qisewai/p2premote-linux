@@ -1,4 +1,5 @@
 #include "../qt/service_control.h"
+#include "appimage.h"
 
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -14,6 +15,13 @@ const auto service_unit = QStringLiteral("p2premote-host.service");
 const auto service_executable = QString::fromUtf8(P2PREMOTE_LINUX_HOST_EXECUTABLE);
 const auto systemctl = QStringLiteral("/usr/bin/systemctl");
 const auto pkexec = QStringLiteral("/usr/bin/pkexec");
+const auto appimage_installer = QStringLiteral(R"(
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+work=$(mktemp -d /tmp/p2premote-appimage.XXXXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+TMPDIR="$work" "$1" --appimage-extract-and-run --install-and-enable-host
+)");
 
 struct UnitInfo {
     bool installed{}, enabled{};
@@ -54,7 +62,8 @@ std::optional<UnitInfo> queryUnit(const QString& unit) {
 } // namespace
 
 bool serviceExecutableExists() {
-    return QFileInfo(service_executable).isExecutable() &&
+    return QFileInfo(systemctl).isExecutable() &&
+        (QFileInfo(service_executable).isExecutable() || !appImageExecutable().isEmpty()) &&
         (geteuid() == 0 || QFileInfo(pkexec).isExecutable());
 }
 
@@ -159,6 +168,17 @@ void manageService(QObject* owner, const QString& command, const QByteArray& pay
         return;
     }
 
+    const auto image = command == QStringLiteral("--install-host-service") ? appImageExecutable() : QString{};
+    const bool install_from_image = !image.isEmpty();
+    const auto executable = install_from_image ? QStringLiteral("/usr/bin/bash") : service_executable;
+    if (!QFileInfo(executable).isExecutable()) {
+        completed(QStringLiteral("请先安装被控服务。"));
+        return;
+    }
+    const auto args = install_from_image
+        ? QStringList{QStringLiteral("-c"), appimage_installer, QStringLiteral("p2premote-appimage-install"), image}
+        : QStringList{command};
+
     auto* child = new QProcess(owner);
     QObject::connect(child, &QProcess::started, child, [child, payload] {
         if (!payload.isEmpty()) child->write(payload);
@@ -169,11 +189,19 @@ void manageService(QObject* owner, const QString& command, const QByteArray& pay
         child->deleteLater();
         completed(QStringLiteral("无法启动系统服务管理程序。"));
     });
-    QObject::connect(child, &QProcess::finished, owner, [child, completed](int result, QProcess::ExitStatus status) {
+    QObject::connect(child, &QProcess::finished, owner, [child, completed, install_from_image](int result, QProcess::ExitStatus status) {
         const auto detail = QString::fromUtf8(child->readAllStandardError()).trimmed();
         child->deleteLater();
         if (status == QProcess::NormalExit && result == 0) {
+            if (install_from_image) {
+                const auto launcher = QStringLiteral("/usr/local/bin/p2premote");
+                if (!QProcess::startDetached(launcher, {QStringLiteral("--after-update")})) {
+                    completed(QStringLiteral("被控服务已安装，请重新打开 P2P Remote。"));
+                    return;
+                }
+            }
             completed({});
+            if (install_from_image) QCoreApplication::exit(0);
         } else if (result == 126) {
             completed(QStringLiteral("已取消管理员授权。"));
         } else if (result == 127) {
@@ -183,8 +211,8 @@ void manageService(QObject* owner, const QString& command, const QByteArray& pay
         }
     });
 
-    if (geteuid() == 0) child->start(service_executable, {command});
-    else child->start(pkexec, {QStringLiteral("--disable-internal-agent"), service_executable, command});
+    if (geteuid() == 0) child->start(executable, args);
+    else child->start(pkexec, QStringList{QStringLiteral("--disable-internal-agent"), executable} + args);
 }
 
 } // namespace

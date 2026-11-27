@@ -5,7 +5,8 @@
     "qt-ui": {
       "description": "Qt 6 Widgets desktop frontend and Windows deployment tool",
       "dependencies": [
-        { "name": "qtbase", "default-features": false, "features": ["widgets", "windeployqt"] }
+        { "name": "qtbase", "default-features": false, "features": ["widgets", "windeployqt"] },
+        "bzip2"
       ]
     }
   }

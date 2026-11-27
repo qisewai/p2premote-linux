@@ -2,6 +2,7 @@
 #include "app_settings.h"
 #include "app_theme.h"
 #include "single_instance.h"
+#include "update_client.h"
 
 #if defined(__linux__)
 #include "../linux/plugin_platform.h"
@@ -30,7 +31,8 @@ int main(int argc, char* argv[]) {
     QCoreApplication::setOrganizationName(QStringLiteral("P2PRemote"));
     QCoreApplication::setApplicationName(QStringLiteral("Desktop"));
     QApplication::setApplicationDisplayName(QStringLiteral("P2P Remote"));
-    QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QApplication::setApplicationVersion(UpdateClient::currentVersion());
+    cleanPlatformUpdateLeftovers();
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("P2P Remote Qt 客户端"));
     parser.addHelpOption();
@@ -41,6 +43,9 @@ int main(int argc, char* argv[]) {
     const QCommandLineOption lan_connect(QStringLiteral("lan-connect"), QStringLiteral("局域网直连目标 IP[:端口]"), QStringLiteral("地址"));
     const QCommandLineOption lan_code(QStringLiteral("lan-code"), QStringLiteral("局域网固定被控码"), QStringLiteral("被控码"));
     parser.addOptions({stun, stun_only, relay_only, lan_connect, lan_code});
+    QCommandLineOption after_update(QStringLiteral("after-update"));
+    after_update.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(after_update);
 #if defined(Q_OS_WIN)
     const QCommandLineOption compatibility(QStringLiteral("compat-account"), QStringLiteral("使用兼容账号请求"));
     const QCommandLineOption ice(QStringLiteral("ice-trace"), QStringLiteral("记录 ICE 诊断"), QStringLiteral("目录"));
@@ -63,9 +68,10 @@ int main(int argc, char* argv[]) {
 
     SingleInstance instance;
 #if defined(Q_OS_WIN)
-    const auto launch = instance.start(parser.isSet(elevated_restart) && isProcessElevated());
+    const auto launch = instance.start(parser.isSet(after_update) ||
+        (parser.isSet(elevated_restart) && isProcessElevated()));
 #else
-    const auto launch = instance.start(false);
+    const auto launch = instance.start(parser.isSet(after_update));
 #endif
     if (launch == SingleInstance::Result::activated) return 0;
     if (launch == SingleInstance::Result::failed) {

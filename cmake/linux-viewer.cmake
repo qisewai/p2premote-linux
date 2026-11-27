@@ -33,6 +33,8 @@ qt6_add_executable(p2premote_linux_viewer
     viewer/qt/settings_dialog.cpp
     viewer/qt/stream_driver.cpp
     viewer/qt/terminal_widget.cpp
+    viewer/qt/update_client.cpp
+    viewer/qt/update_client.h
     viewer/linux/account.cpp
     viewer/linux/cloud_connection.cpp
     viewer/linux/audio.cpp
@@ -44,6 +46,7 @@ qt6_add_executable(p2premote_linux_viewer
     viewer/linux/service_control.cpp
     viewer/linux/single_instance.cpp
     viewer/linux/stream.cpp
+    viewer/linux/update_apply_linux.cpp
     viewer/linux/video_surface.cpp
     viewer/linux/viewer_session.cpp
     core/src/plugin_host.cpp
@@ -65,7 +68,7 @@ target_include_directories(p2premote_linux_viewer PRIVATE
     proto/include core/include core/src tools/minirtc_probe viewer/linux)
 target_include_directories(p2premote_linux_viewer SYSTEM PRIVATE
     "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
-target_link_libraries(p2premote_linux_viewer PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets OpenSSL::Crypto
+target_link_libraries(p2premote_linux_viewer PRIVATE p2premote_update_core Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets OpenSSL::Crypto
     PkgConfig::LINUX_LUA PkgConfig::LINUX_SECRET PkgConfig::LINUX_PULSE PkgConfig::LINUX_FUSE3 ghostty-vt::ghostty-vt
     "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}" util dl)
 if(TARGET Qt6::QOffscreenIntegrationPlugin)
@@ -152,3 +155,11 @@ target_include_directories(linux_file_clipboard_test PRIVATE core/include core/s
 target_link_libraries(linux_file_clipboard_test PRIVATE Qt6::Widgets OpenSSL::Crypto PkgConfig::LINUX_LUA PkgConfig::LINUX_FUSE3 util dl)
 add_test(NAME linux_file_clipboard_test COMMAND linux_file_clipboard_test "${CMAKE_CURRENT_SOURCE_DIR}/plugins/file-clipboard")
 set_tests_properties(linux_file_clipboard_test PROPERTIES TIMEOUT 15 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(update_client_test viewer/qt/update_client_test.cpp viewer/qt/update_client.cpp viewer/qt/update_client.h)
+set_target_properties(update_client_test PROPERTIES AUTOMOC ON)
+target_compile_features(update_client_test PRIVATE cxx_std_20)
+target_compile_options(update_client_test PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(update_client_test PRIVATE p2premote_update_core Qt6::Network)
+add_test(NAME update_client_test COMMAND update_client_test)
+set_tests_properties(update_client_test PROPERTIES TIMEOUT 15)

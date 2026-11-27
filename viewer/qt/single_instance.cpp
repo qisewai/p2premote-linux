@@ -58,12 +58,12 @@ SingleInstance::~SingleInstance() {
     if (mutex_) CloseHandle(mutex_);
 }
 
-SingleInstance::Result SingleInstance::start(bool elevated_restart) {
+SingleInstance::Result SingleInstance::start(bool wait_for_exit) {
     if (name_.empty() || !activationMessage()) return Result::failed;
 
     // Local objects are scoped to the Windows session. The SID separates users in the same session.
     const auto mutex_name = L"Local\\" + name_;
-    const QDeadlineTimer deadline(elevated_restart ? 15'000 : 5'000);
+    const QDeadlineTimer deadline(wait_for_exit ? 15'000 : 5'000);
     do {
         const auto mutex = CreateMutexExW(nullptr, mutex_name.c_str(), 0, SYNCHRONIZE);
         if (!mutex) return Result::failed;
@@ -74,7 +74,7 @@ SingleInstance::Result SingleInstance::start(bool elevated_restart) {
         CloseHandle(mutex);
 
         // A second launch may arrive before the first window exists or while it is closing.
-        if (!elevated_restart && activateExistingWindow(name_.c_str())) return Result::activated;
+        if (!wait_for_exit && activateExistingWindow(name_.c_str())) return Result::activated;
         QThread::msleep(50);
     } while (!deadline.hasExpired());
     return Result::failed;

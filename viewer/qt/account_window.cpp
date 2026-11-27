@@ -4,6 +4,7 @@
 #include "frameless_chrome.h"
 #include "settings_dialog.h"
 #include "single_instance.h"
+#include "update_client.h"
 
 #include <QAbstractButton>
 #include <QApplication>
@@ -31,6 +32,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QScreen>
@@ -751,6 +753,8 @@ AccountWindow::AccountWindow(LaunchOptions options)
     right_layout->setContentsMargins(28, 22, 28, 16);
     right_layout->setSpacing(14);
 
+    initUpdater(right_pane, right_layout);
+
     right_stack_ = new QStackedWidget(right_pane);
     local_page_ = makeLocalPage(right_stack_);
     detail_page_ = makeDetailPage(right_stack_);
@@ -793,7 +797,10 @@ AccountWindow::AccountWindow(LaunchOptions options)
         if (status_) status_->hide();
     });
 
-    connect(&AppSettings::instance(), &AppSettings::changed, this, [this](const AppSettingsData&) {
+    connect(&AppSettings::instance(), &AppSettings::changed, this, [this](const AppSettingsData& next) {
+        if (updater_) {
+            updater_->applySettings(next.auto_check_updates, next.auto_download_updates, next.update_mirror_url);
+        }
         fillDevices();
         if (local_nav_btn_ && local_status_pill_) {
             local_nav_btn_->setIcon(makeSidebarDeviceIcon(local_status_pill_->property("state").toString()));
@@ -1574,12 +1581,155 @@ bool AccountWindow::nativeEvent(const QByteArray& type, void* message, qintptr* 
 
 void AccountWindow::openSettings() {
     if (!settings_dialog_) {
-        settings_dialog_ = new SettingsDialog(this);
+        settings_dialog_ = new SettingsDialog(this, updater_);
         settings_dialog_->setAttribute(Qt::WA_DeleteOnClose);
     }
     settings_dialog_->show();
     settings_dialog_->raise();
     settings_dialog_->activateWindow();
+}
+
+bool AccountWindow::isRemoteSessionBusy() const {
+    if (viewer_) return true;
+    if (service_info_.running &&
+        ((service_info_.desktop_control && service_info_.state == P2P_STREAMING) ||
+         (service_info_.lan_desktop_control && service_info_.lan_state == P2P_STREAMING))) {
+        return true;
+    }
+#if defined(Q_OS_WIN)
+    if (host_ && foreground_control_ && foreground_state_ == P2P_STREAMING) return true;
+#endif
+    return false;
+}
+
+void AccountWindow::initUpdater(QWidget* banner_parent, QVBoxLayout* right_layout) {
+    updater_ = new UpdateClient(this);
+    updater_->setBusyChecker([this] { return isRemoteSessionBusy(); });
+    updater_->setServiceInstalledChecker([this] { return service_info_.installed; });
+
+    update_banner_ = new QFrame(banner_parent);
+    update_banner_->setObjectName(QStringLiteral("settingsCard"));
+    auto* bl = new QHBoxLayout(update_banner_);
+    bl->setContentsMargins(14, 10, 14, 10);
+    bl->setSpacing(10);
+
+    auto* left_col = new QVBoxLayout;
+    left_col->setContentsMargins(0, 0, 0, 0);
+    left_col->setSpacing(4);
+    update_banner_text_ = new QLabel(update_banner_);
+    update_banner_text_->setTextFormat(Qt::PlainText);
+    update_banner_text_->setWordWrap(true);
+    left_col->addWidget(update_banner_text_);
+
+    update_progress_ = new QProgressBar(update_banner_);
+    update_progress_->setRange(0, 100);
+    update_progress_->setFixedHeight(6);
+    update_progress_->setTextVisible(false);
+    update_progress_->hide();
+    left_col->addWidget(update_progress_);
+    bl->addLayout(left_col, 1);
+
+    update_notes_btn_ = new QPushButton(QStringLiteral("更新说明"), update_banner_);
+    update_notes_btn_->setProperty("variant", QStringLiteral("subtle"));
+    connect(update_notes_btn_, &QPushButton::clicked, this, [this] {
+        if (!updater_ || !updater_->available()) return;
+        const auto& m = *updater_->available();
+        const QString notes = m.notes.empty()
+            ? QStringLiteral("该版本未提供更新说明。")
+            : QString::fromStdString(m.notes);
+        QMessageBox::information(this,
+            QStringLiteral("P2P Remote v%1 更新说明").arg(QString::fromStdString(m.version)),
+            notes);
+    });
+    bl->addWidget(update_notes_btn_);
+
+    update_primary_btn_ = new QPushButton(QStringLiteral("下载更新"), update_banner_);
+    update_primary_btn_->setObjectName(QStringLiteral("primary"));
+    connect(update_primary_btn_, &QPushButton::clicked, this, [this] {
+        if (!updater_) return;
+        if (updater_->state() == UpdateState::ReadyToInstall) {
+            updater_->installUpdate();
+        } else if (updater_->state() == UpdateState::Available) {
+            updater_->downloadUpdate();
+        } else {
+            updater_->checkForUpdates(true);
+        }
+    });
+    bl->addWidget(update_primary_btn_);
+
+    update_skip_btn_ = new QPushButton(QStringLiteral("跳过"), update_banner_);
+    update_skip_btn_->setProperty("variant", QStringLiteral("subtle"));
+    connect(update_skip_btn_, &QPushButton::clicked, this, [this] {
+        if (updater_) updater_->skipAvailableVersion();
+    });
+    bl->addWidget(update_skip_btn_);
+
+    update_close_btn_ = new QPushButton(QStringLiteral("×"), update_banner_);
+    update_close_btn_->setProperty("variant", QStringLiteral("subtle"));
+    update_close_btn_->setFixedWidth(28);
+    connect(update_close_btn_, &QPushButton::clicked, this, [this] {
+        if (updater_) updater_->dismissBanner();
+        if (update_banner_) update_banner_->hide();
+    });
+    bl->addWidget(update_close_btn_);
+
+    update_banner_->hide();
+    right_layout->addWidget(update_banner_);
+
+    connect(updater_, &UpdateClient::stateChanged, this, &AccountWindow::refreshUpdateBanner);
+    connect(updater_, &UpdateClient::progressChanged, this, [this](qint64 done, qint64 total) {
+        if (!update_progress_ || !update_banner_text_ || total <= 0) return;
+        const int pct = static_cast<int>((done * 100) / total);
+        update_progress_->setValue(std::clamp(pct, 0, 100));
+        if (updater_ && updater_->available()) {
+            update_banner_text_->setText(QStringLiteral("正在下载 v%1（%2%）…")
+                .arg(QString::fromStdString(updater_->available()->version)).arg(pct));
+        }
+    });
+    connect(updater_, &UpdateClient::relaunchRequested, this, [this] {
+        quit();
+    });
+
+    const auto& cfg = AppSettings::instance().data();
+    updater_->applySettings(cfg.auto_check_updates, cfg.auto_download_updates, cfg.update_mirror_url);
+    updater_->startPeriodicChecks();
+}
+
+void AccountWindow::refreshUpdateBanner() {
+    if (!updater_ || !update_banner_) return;
+    const auto st = updater_->state();
+    const bool show = (st == UpdateState::Available || st == UpdateState::Downloading ||
+                       st == UpdateState::Verifying || st == UpdateState::ReadyToInstall ||
+                       st == UpdateState::Installing || st == UpdateState::Error);
+    if (!show) {
+        update_banner_->hide();
+        return;
+    }
+
+    update_banner_text_->setText(updater_->statusMessage());
+    update_progress_->setVisible(st == UpdateState::Downloading);
+    update_notes_btn_->setVisible(updater_->available().has_value() && !updater_->available()->notes.empty());
+    update_skip_btn_->setVisible(st == UpdateState::Available || st == UpdateState::ReadyToInstall);
+    update_close_btn_->setVisible(st != UpdateState::Installing);
+
+    if (st == UpdateState::Available) {
+        update_primary_btn_->setText(QStringLiteral("下载更新"));
+        update_primary_btn_->setEnabled(true);
+        update_primary_btn_->show();
+    } else if (st == UpdateState::ReadyToInstall) {
+        update_primary_btn_->setText(QStringLiteral("立即重启更新"));
+        update_primary_btn_->setEnabled(true);
+        update_primary_btn_->show();
+    } else if (st == UpdateState::Downloading || st == UpdateState::Verifying || st == UpdateState::Installing) {
+        update_primary_btn_->setText(st == UpdateState::Downloading ? QStringLiteral("下载中…") : QStringLiteral("处理中…"));
+        update_primary_btn_->setEnabled(false);
+        update_primary_btn_->show();
+    } else {
+        update_primary_btn_->setText(QStringLiteral("重试"));
+        update_primary_btn_->setEnabled(true);
+        update_primary_btn_->show();
+    }
+    update_banner_->show();
 }
 
 void AccountWindow::restore() {

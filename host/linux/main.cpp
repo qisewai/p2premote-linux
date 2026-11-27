@@ -63,6 +63,12 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--uninstall-host-service") {
         return UninstallHostServices();
     }
+    if (argc == 4 && std::string_view(argv[1]) == "--apply-update") {
+        return ApplyLinuxSystemUpdate(argv[2], argv[3]);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--apply-downloaded-update") {
+        return ApplyDownloadedLinuxUpdate(argv[2]);
+    }
 
     HostConfig cfg;
     bool system_service = false;

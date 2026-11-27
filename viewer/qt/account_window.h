@@ -20,15 +20,18 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QMessageBox;
+class QProgressBar;
 class QPushButton;
 class QStackedWidget;
 class QSocketNotifier;
 class QSystemTrayIcon;
+class QVBoxLayout;
 class DeviceHeroWidget;
 class SettingsDialog;
 class TitleBar;
 class HostSession;
 class ToggleSwitch;
+class UpdateClient;
 
 class AccountWindow final : public QWidget {
 public:
@@ -103,8 +106,19 @@ private:
     bool installOrUpdateHostService(HostConfigUpdate update, bool enable_lan, bool enable_cloud, QString* error);
 #endif
     void closeSessions();
+    void initUpdater(QWidget* banner_parent, QVBoxLayout* right_layout);
+    void refreshUpdateBanner();
+    bool isRemoteSessionBusy() const;
 
     LaunchOptions options_;
+    UpdateClient* updater_{};
+    QFrame* update_banner_{};
+    QLabel* update_banner_text_{};
+    QProgressBar* update_progress_{};
+    QPushButton* update_primary_btn_{};
+    QPushButton* update_notes_btn_{};
+    QPushButton* update_skip_btn_{};
+    QPushButton* update_close_btn_{};
     std::unique_ptr<p2p_account, decltype(&p2p_account_destroy)> account_{nullptr, p2p_account_destroy};
     QString lan_host_code_;
     std::uint16_t lan_host_port_{P2P_LAN_DEFAULT_PORT};

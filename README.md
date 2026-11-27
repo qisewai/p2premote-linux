@@ -376,6 +376,14 @@ ctest --preset windows-x64-qt-release
 
 便携目录的 `licenses/` 包含 vcpkg 提供的 Qt 与其依赖许可。Qt Base 的对应源码归档可在 [Qt 下载站](https://download.qt.io/archive/qt/6.11/6.11.3/submodules/) 获取，构建补丁来自 [vcpkg qtbase port](https://github.com/microsoft/vcpkg/tree/277978ad2eddc3b05ecf288dcd33071968cd2f79/ports/qtbase)。
 
+## GitHub 发版与客户端更新
+
+[发版工作流](.github/workflows/release.yml) 在推送与 `VERSION` 一致的 `vX.Y.Z` 标签时构建 Windows 和 Linux x64。两端测试通过后，发布任务签名并校验清单、整包和可用的增量包，随后把完整的草稿 Release 发布为最新版本。可在 Actions 手动运行工作流检查构建和打包目录。
+
+首次发版前，把 `p2prelease keygen` 生成的公钥保存到 `cmake/update-public.key`，并把对应私钥的 Base64 内容存为仓库的 Actions secret `P2PREMOTE_UPDATE_PRIVATE_KEY`。发布新版本时先更新 `VERSION` 和 `CHANGELOG.md`，再给该提交打标签并推送标签。普通的分支推送可以继续用于提交代码。
+
+桌面客户端在缓存中有与当前版本和签名匹配的整包时，会优先下载从该版本生成的 BSDIFF40 `.delta` 文件。客户端验签后在缓存中还原并复验整包，随后按正常流程提示重启。首次升级、底包缺失、没有更小的增量包或增量校验失败时，客户端会下载整包。Linux 无人值守被控服务在空闲时使用整包更新。
+
 ### Linux 客户端
 
 Linux x86-64 主控端与 Windows 共享 Qt 主窗口、设置、会话标签和控制中心。可在「局域网直连」中选择发现的被控端，或输入地址、端口与验证码。登录账号后可在「我的设备」中连接在线设备。点击远程画面接管键鼠，F11 切换全屏，F12 释放键鼠。支持播放远端声音和从当前会话发送麦克风声音。
@@ -392,7 +400,7 @@ Linux 被控端默认以最高 30 fps 检查桌面变化。局域网和云端会
 
 构建需要 GCC、CMake、Ninja、Xmake、Qt 6.8 或更新版本（Widgets、Network、WebSockets）、OpenSSL、libyuv、Lua 5.4、libsecret、PulseAudio 和 FUSE3（`fuse3`）的开发包，以及 [libghostty-vt 1.0.1](https://lib.ghostty.org/vt/installing.html#build-from-source)。Linux 上从源码构建 libghostty-vt，可安装到 `~/.local/share/p2premote/ghostty-vt`，也可在配置时用 `CMAKE_PREFIX_PATH` 指定其前缀。MiniRTC 还需要归档解压工具、Meson 1.4 或更新版本、Autotools 和 NASM。
 
-Ubuntu 上还需安装 `libavcodec-dev libavutil-dev` 来构建 MiniRTC，以及 `libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxau-dev libsystemd-dev libpulse-dev` 来构建被控服务。
+Ubuntu 上还需安装 `libavcodec-dev libavutil-dev` 来构建 MiniRTC，安装 `zlib1g-dev libbz2-dev` 来构建更新模块，以及安装 `libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxau-dev libsystemd-dev libpulse-dev` 来构建被控服务。
 
 ```bash
 bash tools/minirtc_probe/Build-Linux.sh
@@ -417,6 +425,50 @@ MiniRTC 默认安装到 `~/.local/share/p2premote/minirtc`。自定义路径时�
 局域网和云端被控都支持转发系统声音。主控端在会话顶部的「声音设置」中勾选「远端扬声器声音」即可收听。被控端采集当前 Xorg 用户的默认音频输出，支持 PulseAudio 和 PipeWire 的 PulseAudio 兼容服务。登录界面和没有可用音频输出的桌面可继续进行画面与键鼠控制。
 
 只需要主控端时使用原有的 `linux-x64-viewer` 预设。WSL 2 的 NAT 网络可能收不到局域网广播，可以手动填写被控端地址，或用 `ip -4 route show default` 查询本机 Windows 网关地址。
+
+### Linux 安装包（`.tar.gz` 与 `install.sh`）
+
+除了 AppImage，还提供包含自包含运行库与安装脚本 `install.sh` 的系统安装包，统一通过 `sudo` 安装到 `/usr/local`：
+
+- 在线一键安装（自动从 GitHub Release 拉取清单并用内置公钥校验 `Ed25519` 签名后再安装）：
+
+```bash
+curl -fsSL https://github.com/qisewai/p2premote-linux/releases/latest/download/install.sh | sudo bash
+```
+
+  可选参数：`--version <X.Y.Z>`（安装指定版本）、`--mirror <https://...>`（通过 HTTPS 镜像加速下载，仍强制验签）、`--uninstall`（卸载系统安装与被控服务，保留用户目录 `~/.config/P2PRemote` 中的个人设置）。例如：
+
+```bash
+curl -fsSL https://github.com/qisewai/p2premote-linux/releases/latest/download/install.sh | sudo bash -s -- --uninstall
+```
+
+- 离线 `.tar.gz` 安装（下载 `p2premote-<版本号>-linux-x64.tar.gz` 后解压执行，或直接指定 `--archive`）：
+
+```bash
+mkdir -p p2premote-install
+tar -xzf p2premote-<版本号>-linux-x64.tar.gz -C p2premote-install
+sudo bash p2premote-install/install.sh
+```
+
+首次安装默认关闭被控接收，需在界面「本机 → 允许远程控制本机」启用；升级安装会保留 `/etc/p2premote` 中的现有配置，刷新已部署的 `p2premote-host.service` 单元并重启原本运行中的服务，若任一步骤失败则自动回滚到升级前状态。
+
+在已配置 `linux-x64`（`CMAKE_INSTALL_PREFIX=/usr/local`）的 Linux 构建机上，安装 Python 3、`patchelf` 和 OpenSSL 后即可在本地生成可直接分发的 `.tar.gz` 与 `install.sh`：
+
+```bash
+bash tools/p2prelease/Package-LinuxTarball.sh out/build/linux-x64 dist/packages
+```
+
+### Linux AppImage
+
+在 Ubuntu 22.04 x86-64 上构建 `linux-x64` 预设，安装前缀用 `/usr/local`。准备 Python 3、`patchelf` 和 [appimagetool](https://github.com/AppImage/appimagetool/releases)，再生成主被控合一的 AppImage：
+
+```bash
+bash tools/p2prelease/Package-AppImage.sh out/build/linux-x64 dist/packages/P2PRemote-x86_64.AppImage
+```
+
+赋予 AppImage 执行权限后即可直接打开。没有可用的 FUSE 时，可加 `--appimage-extract-and-run` 参数启动。首次开启「允许远程控制本机」时，桌面会请求管理员授权，把客户端和被控服务安装到固定的系统路径，然后重新打开窗口。安装后，普通被控和无人值守继续使用现有的开关。
+
+可以从终端执行 `sudo env TMPDIR=/root ./P2PRemote-x86_64.AppImage --appimage-extract-and-run --install` 安装或更新系统副本。此命令在仅管理员可访问的目录中解包，保留现有被控配置。首次安装仍由用户开启被控。便携运行时通过下载新 AppImage 更新，已安装的副本可继续使用现有签名更新。
 
 ## 计时口径
 

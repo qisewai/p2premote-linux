@@ -40,14 +40,17 @@ add_executable(p2premote_qt WIN32
     viewer/qt/stream_driver.cpp
     viewer/qt/stream_driver.h
     viewer/qt/terminal_widget.cpp
-    viewer/qt/terminal_widget.h)
+    viewer/qt/terminal_widget.h
+    viewer/qt/update_client.cpp
+    viewer/qt/update_client.h
+    viewer/qt/update_apply_win.cpp)
 set_target_properties(p2premote_qt PROPERTIES
     AUTOMOC ON
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 target_compile_features(p2premote_qt PRIVATE cxx_std_20)
 target_compile_definitions(p2premote_qt PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(p2premote_qt PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(p2premote_qt PRIVATE p2premote_core Qt6::Widgets Qt6::Network ghostty-vt::ghostty-vt advapi32 crypt32 dwmapi shell32 windowsapp)
+target_link_libraries(p2premote_qt PRIVATE p2premote_core p2premote_update_core Qt6::Widgets Qt6::Network ghostty-vt::ghostty-vt advapi32 crypt32 dwmapi shell32 windowsapp)
 target_link_options(p2premote_qt PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 set_property(TARGET p2premote_qt APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 
@@ -82,6 +85,15 @@ add_dependencies(agent_broker_test p2p_cli p2premote_mcp)
 add_test(NAME agent_broker_test COMMAND agent_broker_test "$<TARGET_FILE:p2p_cli>" "$<TARGET_FILE:p2premote_mcp>")
 set_tests_properties(agent_broker_test PROPERTIES TIMEOUT 30)
 
+add_executable(update_client_test viewer/qt/update_client_test.cpp viewer/qt/update_client.cpp viewer/qt/update_client.h)
+set_target_properties(update_client_test PROPERTIES AUTOMOC ON MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+target_compile_features(update_client_test PRIVATE cxx_std_20)
+target_compile_definitions(update_client_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(update_client_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(update_client_test PRIVATE p2premote_update_core Qt6::Network)
+add_test(NAME update_client_test COMMAND update_client_test)
+set_tests_properties(update_client_test PROPERTIES TIMEOUT 15)
+
 install(TARGETS p2premote_qt p2premote p2premote_service p2premote_core p2premote_mcp p2p_cli RUNTIME DESTINATION .)
 install(FILES "${P2PREMOTE_MINIRTC_DIR}/p2premote_minirtc.dll" DESTINATION .)
 install(FILES "$<TARGET_FILE:ghostty-vt::ghostty-vt>" DESTINATION .)
@@ -113,7 +125,7 @@ if(VCPKG_TOOLCHAIN)
             \"--installed-bin-dir=${vcpkg_triplet_dir}/bin\"
             COMMAND_ERROR_IS_FATAL ANY)
     ")
-    foreach(port qtbase double-conversion md4c pcre2 zlib)
+    foreach(port qtbase double-conversion md4c pcre2 zlib bzip2)
         install(FILES "${vcpkg_triplet_dir}/share/${port}/copyright"
             DESTINATION licenses RENAME "${port}.txt" OPTIONAL)
     endforeach()

@@ -28,22 +28,24 @@ SingleInstance::~SingleInstance() {
     delete static_cast<QLockFile*>(mutex_);
 }
 
-SingleInstance::Result SingleInstance::start(bool) {
+SingleInstance::Result SingleInstance::start(bool wait_for_exit) {
     if (name_.empty()) return Result::failed;
     const auto name = QString::fromStdWString(name_);
     auto lock = std::make_unique<QLockFile>(name + QStringLiteral(".lock"));
     lock->setStaleLockTime(0);
-    const QDeadlineTimer pending(5000);
+    const QDeadlineTimer pending(wait_for_exit ? 15000 : 5000);
     do {
         if (lock->tryLock()) {
             mutex_ = lock.release();
             return Result::primary;
         }
         if (lock->error() != QLockFile::LockFailedError) return Result::failed;
-        QLocalSocket socket;
-        socket.connectToServer(name);
-        if (socket.waitForConnected(100) && socket.waitForReadyRead(250) && socket.read(1) == "1") {
-            return Result::activated;
+        if (!wait_for_exit) {
+            QLocalSocket socket;
+            socket.connectToServer(name);
+            if (socket.waitForConnected(100) && socket.waitForReadyRead(250) && socket.read(1) == "1") {
+                return Result::activated;
+            }
         }
         QThread::msleep(50);
     } while (!pending.hasExpired());

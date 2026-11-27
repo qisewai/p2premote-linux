@@ -63,6 +63,10 @@ void AppSettings::reload() {
     next.auto_receive_on_login = s.value(QStringLiteral("general/autoReceiveOnLogin"), true).toBool();
     next.default_server = s.value(QStringLiteral("lastServer"), QString{}).toString();
 
+    next.auto_check_updates = s.value(QStringLiteral("updater/autoCheck"), true).toBool();
+    next.auto_download_updates = s.value(QStringLiteral("updater/autoDownload"), true).toBool();
+    next.update_mirror_url = s.value(QStringLiteral("updater/mirrorUrl"), QString{}).toString();
+
     next.default_quality = std::clamp(s.value(QStringLiteral("stream/defaultQuality"), 1).toInt(), 0, 2);
     next.default_bitrate = std::clamp(s.value(QStringLiteral("stream/defaultBitrate"), 1).toInt(), 0, 2);
     next.show_diagnostics = s.value(QStringLiteral("stream/showDiagnostics"), true).toBool();
@@ -83,6 +87,9 @@ void AppSettings::save(const AppSettingsData& next) {
     if (!next.default_server.trimmed().isEmpty()) {
         s.setValue(QStringLiteral("lastServer"), next.default_server.trimmed());
     }
+    s.setValue(QStringLiteral("updater/autoCheck"), next.auto_check_updates);
+    s.setValue(QStringLiteral("updater/autoDownload"), next.auto_download_updates);
+    s.setValue(QStringLiteral("updater/mirrorUrl"), next.update_mirror_url.trimmed());
 
     s.setValue(QStringLiteral("stream/defaultQuality"), std::clamp(next.default_quality, 0, 2));
     s.setValue(QStringLiteral("stream/defaultBitrate"), std::clamp(next.default_bitrate, 0, 2));
