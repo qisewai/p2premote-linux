@@ -105,15 +105,27 @@ jobs:
         with:
           version: '6.8.3'
           arch: linux_gcc_64
-      - name: Build and stage Linux
+          modules: qtwebsockets
+      - name: Install and check Linux build dependencies
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build nasm autoconf automake libtool pkg-config patchelf \
             libavcodec-dev libavutil-dev libyuv-dev libssl-dev liblua5.4-dev libsecret-1-dev \
             libpulse-dev libfuse3-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xkb1 libxkbcommon-x11-0 \
             libxau-dev libsystemd-dev libgl1-mesa-dev zlib1g-dev libbz2-dev
           python3 -m pip install --user 'meson==1.9.2'
+          test -s "$QT_ROOT_DIR/lib/cmake/Qt6WebSockets/Qt6WebSocketsConfig.cmake"
+          libraries=$(ldd "$QT_ROOT_DIR/plugins/platforms/libqxcb.so")
+          if grep -Fq 'not found' <<<"$libraries"; then
+            printf '%s\n' "$libraries" >&2
+            exit 1
+          fi
+      - name: Build and stage Linux
+        shell: bash
+        run: |
           export PATH="$HOME/.local/bin:$PATH"
 
           deps="$RUNNER_TEMP/p2premote-deps"
