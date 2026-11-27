@@ -2,6 +2,7 @@
 
 #include <p2premote/core_api.h>
 
+#include <QString>
 #include <QTimer>
 #if defined(Q_OS_WIN)
 #include <QWinEventNotifier>
@@ -50,6 +51,9 @@ private:
     void dispatch(uint32_t kind);
     void syncWaits();
     void publish();
+    void publishIfChanged();
+    void publishSnapshot(bool force);
+    bool hasVideo() const noexcept { return state_ == P2P_STREAMING && width_ > 0 && height_ > 0; }
 
     std::unique_ptr<p2p_stream, decltype(&p2p_stream_destroy)> stream_{nullptr, p2p_stream_destroy};
 #if defined(Q_OS_WIN)
@@ -58,4 +62,8 @@ private:
     QTimer tick_, cursor_, heartbeat_;
     int state_{P2P_IDLE};
     bool input_ready_{};
+    uint32_t width_{};
+    uint32_t height_{};
+    QString status_;
+    QString notice_;
 };

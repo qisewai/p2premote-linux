@@ -22,6 +22,8 @@ add_executable(p2premote_qt WIN32
     viewer/qt/app_settings.h
     viewer/qt/app_theme.cpp
     viewer/qt/app_theme.h
+    viewer/qt/connection_stage_overlay.cpp
+    viewer/qt/connection_stage_overlay.h
     viewer/qt/credentials.cpp
     viewer/qt/frameless_chrome.cpp
     viewer/qt/frameless_chrome.h
@@ -93,6 +95,21 @@ target_compile_options(update_client_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
 target_link_libraries(update_client_test PRIVATE p2premote_update_core Qt6::Network)
 add_test(NAME update_client_test COMMAND update_client_test)
 set_tests_properties(update_client_test PROPERTIES TIMEOUT 15)
+
+add_executable(connection_stage_overlay_test
+    viewer/qt/connection_stage_overlay_test.cpp
+    viewer/qt/connection_stage_overlay.cpp
+    viewer/qt/connection_stage_overlay.h
+    viewer/qt/app_theme.cpp
+    viewer/qt/app_theme.h)
+set_target_properties(connection_stage_overlay_test PROPERTIES AUTOMOC ON MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+target_compile_features(connection_stage_overlay_test PRIVATE cxx_std_20)
+target_compile_definitions(connection_stage_overlay_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(connection_stage_overlay_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_include_directories(connection_stage_overlay_test PRIVATE core/include)
+target_link_libraries(connection_stage_overlay_test PRIVATE Qt6::Widgets)
+add_test(NAME connection_stage_overlay_test COMMAND connection_stage_overlay_test)
+set_tests_properties(connection_stage_overlay_test PROPERTIES TIMEOUT 10)
 
 install(TARGETS p2premote_qt p2premote p2premote_service p2premote_core p2premote_mcp p2p_cli RUNTIME DESTINATION .)
 install(FILES "${P2PREMOTE_MINIRTC_DIR}/p2premote_minirtc.dll" DESTINATION .)

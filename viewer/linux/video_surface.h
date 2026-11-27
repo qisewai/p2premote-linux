@@ -24,3 +24,5 @@ QWidget* createVideoSurface(std::function<void()> fullscreen, QWidget* parent);
 void attachVideoSession(QWidget* widget, ViewerSession* session);
 void setVideoCursor(QWidget* widget, DecodedCursor cursor);
 void setVideoOverlays(QWidget* widget, std::vector<p2premote::PluginOverlayItem> overlays);
+void setVideoFirstFrameCallback(QWidget* widget, std::function<void()> callback);
+void notifyVideoFrameReady(QWidget* widget);

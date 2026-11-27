@@ -129,7 +129,11 @@ ViewerSession::ViewerSession() : api_(P2PRemoteMiniRtcApi(p2premote::native_mini
 
     timeout_.setSingleShot(true);
     connect(&timeout_, &QTimer::timeout, this, [this] {
-        if (state_ == State::approval) stop(QStringLiteral("等待被控端授权超时。"));
+        if (state_ == State::streaming) {
+            if (!diagnostics_ && !metrics_.width && statusChanged) {
+                statusChanged(QStringLiteral("已连接，但暂未收到被控端画面。"));
+            }
+        } else if (state_ == State::approval) stop(QStringLiteral("等待被控端授权超时。"));
         else stop(state_ == State::negotiation ? QStringLiteral("媒体协商超时。") : QStringLiteral("连接或认证超时。"));
     });
     plugin_timer_.setInterval(50);
@@ -485,6 +489,7 @@ void ViewerSession::connectionChanged(ConnectionStatus status, const char*, size
 void ViewerSession::startStreaming() {
     state_ = State::streaming;
     timeout_.stop();
+    if (!diagnostics_ && !metrics_.width) timeout_.start(8000);
     connected_since_.start();
     if (!diagnostics_) {
         overlay_plugins_ = std::make_unique<p2premote::PluginHost>(false, p2premote::PluginHost::SendFrame{},
@@ -587,8 +592,11 @@ void ViewerSession::queueFrame(const char* data, int width, int height, std::siz
         metrics_.height = size.height();
         if (has_frame && frameReady) frameReady();
         if (transport_ready_ && state_ == State::negotiation) startStreaming();
-        else if (first_frame && state_ == State::streaming && !diagnostics_ && statusChanged) {
-            statusChanged(control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看"));
+        else if (first_frame && state_ == State::streaming && !diagnostics_) {
+            timeout_.stop();
+            if (statusChanged) {
+                statusChanged(control_allowed_ ? QStringLiteral("已连接 · H.264") : QStringLiteral("已连接 · H.264 · 仅观看"));
+            }
         }
     }, Qt::QueuedConnection);
 }

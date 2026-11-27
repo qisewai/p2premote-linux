@@ -241,6 +241,7 @@ public:
     void attach(ViewerSession* session) {
         cursor_separate_ = false;
         pointer_in_video_ = false;
+        first_frame_notified_ = false;
         remote_cursor_ = QCursor(Qt::ArrowCursor);
         setCapture(false);
         session_ = session;
@@ -249,6 +250,19 @@ public:
         fallback_image_ = {};
         frame_dirty_ = true;
         updateSurfaceCursor();
+        update();
+    }
+
+    void setFirstFrameCallback(std::function<void()> callback) {
+        on_first_frame_ = std::move(callback);
+        first_frame_notified_ = hasFrame();
+    }
+
+    void notifyFrameReady() {
+        if (!first_frame_notified_) {
+            first_frame_notified_ = true;
+            if (on_first_frame_) on_first_frame_();
+        }
         update();
     }
 
@@ -353,9 +367,7 @@ void main() {
         }
         if (!hasFrame()) {
             QPainter painter(this);
-            painter.fillRect(rect(), QColor("#111827"));
-            painter.setPen(QColor("#cbd5e1"));
-            painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("等待被控端画面"));
+            painter.fillRect(rect(), QColor("#11151d"));
             paintCachedOverlays(painter, rect());
             return;
         }
@@ -652,23 +664,24 @@ private:
 
     void key(InputKind kind, QKeyEvent* event) {
         if (!capturing_) return;
-        if (event->key() == Qt::Key_F11 || event->key() == Qt::Key_F12) {
-            event->accept();
+        event->accept();
+        if (event->key() == Qt::Key_F11 || event->key() == Qt::Key_F12) return;
+        const auto code = windowsScanCode(*event, xkb_);
+        if (!code) return;
+        const auto lock = code == 0x3a ? 0x02u : (code == 0x45 ? 0x10u : 0u);
+        if (event->isAutoRepeat()) {
+            // Qt can emit release/press pairs for a held key. Keep the remote key down until the real release.
+            if (kind == InputKind::key_down && !lock && code != 0x46) session_->sendInput(kind, code);
             return;
         }
-        const auto code = windowsScanCode(*event, xkb_);
-        if (code && !event->isAutoRepeat()) {
-            bool sync_lock{};
-            if (xkb_ && event->nativeScanCode() > 8) {
-                auto modifiers = event->nativeModifiers();
-                const auto lock = code == 0x3a ? 0x02u : (code == 0x45 ? 0x10u : 0u);
-                // Native XKB events report the modifier mask before applying this key press.
-                if (kind == InputKind::key_down) modifiers ^= lock;
-                sync_lock = session_->updateKeyboardLocks(modifiers & 0x02u, modifiers & 0x10u) && lock;
-            }
-            if (!sync_lock) session_->sendInput(kind, code);
+        bool sync_lock{};
+        if (xkb_ && event->nativeScanCode() > 8) {
+            auto modifiers = event->nativeModifiers();
+            // Native XKB events report the modifier mask before applying this key press.
+            if (kind == InputKind::key_down) modifiers ^= lock;
+            sync_lock = session_->updateKeyboardLocks(modifiers & 0x02u, modifiers & 0x10u) && lock;
         }
-        event->accept();
+        if (!sync_lock) session_->sendInput(kind, code);
     }
 
     void updatePointerInVideo(const QPointF& pos) {
@@ -688,6 +701,8 @@ private:
 
     ViewerSession* session_{};
     std::function<void()> fullscreen_;
+    std::function<void()> on_first_frame_;
+    bool first_frame_notified_{};
     struct CachedOverlay {
         QPoint pos;
         QImage image;
@@ -740,4 +755,12 @@ void setVideoCursor(QWidget* widget, DecodedCursor cursor) {
 
 void setVideoOverlays(QWidget* widget, std::vector<p2premote::PluginOverlayItem> overlays) {
     static_cast<VideoSurface*>(widget)->setOverlays(std::move(overlays));
+}
+
+void setVideoFirstFrameCallback(QWidget* widget, std::function<void()> callback) {
+    if (widget) static_cast<VideoSurface*>(widget)->setFirstFrameCallback(std::move(callback));
+}
+
+void notifyVideoFrameReady(QWidget* widget) {
+    if (widget) static_cast<VideoSurface*>(widget)->notifyFrameReady();
 }

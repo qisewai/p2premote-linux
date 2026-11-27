@@ -2,6 +2,7 @@
 #include "agent_broker.h"
 #include "app_settings.h"
 #include "app_theme.h"
+#include "connection_stage_overlay.h"
 #include "frameless_chrome.h"
 #include "plugin_dialog.h"
 #include "settings_dialog.h"
@@ -30,6 +31,7 @@
 #include <QPainterPath>
 #include <QPixmap>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QShortcut>
 #include <QShowEvent>
 #include <QStackedWidget>
@@ -468,9 +470,25 @@ public:
             const auto target = device.toStdWString();
             driver_ = std::make_unique<StreamDriver>(account, false, target.c_str(), parent_handle, options, this, diagnostics_);
         }
+        if (video_) {
+            stage_overlay_ = new ConnectionStageOverlay(this);
+            stage_overlay_->setGeometry(video_->geometry());
+            stage_overlay_->raise();
+            connect(stage_overlay_, &ConnectionStageOverlay::reconnectRequested, this, [this] {
+                if (!active() && handle()) start();
+            });
+#if !defined(Q_OS_WIN)
+            setVideoFirstFrameCallback(video_, [this] {
+                first_frame_received_ = true;
+                updateStageOverlay();
+            });
+#endif
+        }
         if (!driver_->handle()) {
             status_text_ = QString::fromWCharArray(p2p_last_error());
+            raw_status_text_ = status_text_;
             state_ = P2P_STOPPED;
+            updateStageOverlay();
             return;
         }
         const auto& defaults = AppSettings::instance().data();
@@ -484,6 +502,7 @@ public:
         });
         connect(&AppSettings::instance(), &AppSettings::changed, this, [this](const AppSettingsData&) {
             updateConnectionOverlays();
+            if (stage_overlay_) stage_overlay_->refreshTheme();
         });
         connect(&AppSettings::instance(), &AppSettings::pluginConfigChanged, this, [this](const QString& id) {
             if (overlay_configs_.erase(id.toStdWString())) updateConnectionOverlays();
@@ -496,9 +515,13 @@ public:
         connect(driver_.get(), &StreamDriver::uiCommandsReady, this, [this] {
             if (driver_ && driver_->handle()) dialogs_->poll(driver_->handle());
         });
+        updateStageOverlay();
     }
 
     ~RemoteSessionTab() override {
+#if !defined(Q_OS_WIN)
+        if (video_) setVideoFirstFrameCallback(video_, {});
+#endif
         if (dialogs_) dialogs_->closeAll();
     }
 
@@ -510,6 +533,7 @@ public:
     int state() const { return state_; }
     bool active() const { return state_ != P2P_IDLE && state_ != P2P_STOPPED; }
     bool playing() const { return state_ == P2P_STREAMING; }
+    bool waitingForVideo() const { return playing() && !diagnostics_ && !width_; }
     bool hasPluginMenu() const { return has_plugin_menu_; }
     bool canExport() const { return !diagnostics_ && !active() && seconds_ > 0; }
     int qualityIndex() const { return quality_index_; }
@@ -562,6 +586,11 @@ public:
 
     void start() {
         if (driver_ && driver_->handle()) {
+            if (!playing()) {
+                width_ = 0;
+                height_ = 0;
+                first_frame_received_ = false;
+            }
             syncVideo();
             driver_->update(p2p_stream_start(driver_->handle(), nullptr, 60));
             if (diagnostics_) return;
@@ -633,15 +662,36 @@ public:
     }
 
 protected:
+    void resizeEvent(QResizeEvent* event) override {
+        QWidget::resizeEvent(event);
+        syncStageOverlayGeometry();
+    }
+
     bool eventFilter(QObject* watched, QEvent* event) override {
         if (watched == video_ && (event->type() == QEvent::Resize || event->type() == QEvent::Show
             || event->type() == QEvent::Hide || event->type() == QEvent::DevicePixelRatioChange)) {
+            syncStageOverlayGeometry();
             syncVideo();
         }
         return QWidget::eventFilter(watched, event);
     }
 
 private:
+    void syncStageOverlayGeometry() {
+        if (!stage_overlay_ || !video_) return;
+        const QRect bounds = video_->geometry();
+        if (stage_overlay_->geometry() != bounds) {
+            stage_overlay_->setGeometry(bounds);
+        }
+    }
+
+    void updateStageOverlay() {
+        if (!stage_overlay_) return;
+        syncStageOverlayGeometry();
+        const bool has_video = (playing() && width_ > 0 && height_ > 0) || (active() && first_frame_received_);
+        stage_overlay_->setSessionState(state_, has_video, raw_status_text_, handle() != nullptr);
+    }
+
     void updateConnectionOverlays(bool force = true) {
         if (!video_ || !AppSettings::instance().data().show_diagnostics || !playing() || !video_->isVisible() ||
             window()->isMinimized()) {
@@ -685,6 +735,7 @@ private:
 
     void onSnapshot(const p2p_stream_snapshot_v1& snapshot) {
         state_ = snapshot.state;
+        if (!active() || state_ == P2P_RECONNECTING) first_frame_received_ = false;
         if (share_) share_->setEnabled(playing());
         seconds_ = snapshot.seconds;
         width_ = snapshot.width;
@@ -697,10 +748,12 @@ private:
             if (!active()) dialogs_->closeAll();
         }
 
-        status_text_ = QString::fromWCharArray(snapshot.status);
-        if (snapshot.input_ready) status_text_ += QStringLiteral("  ·  点击画面接管键鼠，F12 释放");
+        raw_status_text_ = snapshot.status ? QString::fromWCharArray(snapshot.status) : QString{};
+        status_text_ = raw_status_text_;
+        if (snapshot.input_ready && !waitingForVideo()) status_text_ += QStringLiteral("  ·  点击画面接管键鼠，F12 释放");
         notice_text_ = *snapshot.plugin_notice ? QString::fromWCharArray(snapshot.plugin_notice) : QString{};
 
+        updateStageOverlay();
         updateConnectionOverlays();
         if (on_changed_) on_changed_();
     }
@@ -711,6 +764,8 @@ private:
     std::function<void()> on_changed_;
     QPushButton* share_{};
     QWidget* video_{};
+    ConnectionStageOverlay* stage_overlay_{};
+    bool first_frame_received_{};
     std::unique_ptr<StreamDriver> driver_;
     PluginDialogManager* dialogs_{};
     int state_{P2P_IDLE};
@@ -725,6 +780,7 @@ private:
     float speaker_volume_{1.0f};
     bool mic_fallback_{true};
     bool tab_focused_{true};
+    QString raw_status_text_{QStringLiteral("正在连接设备…")};
     QString status_text_{QStringLiteral("正在连接设备…")};
     QString notice_text_;
     QTimer overlay_timer_;
@@ -1103,7 +1159,7 @@ void RemoteWindow::refreshChrome() {
     if (agent_shared) left += QStringLiteral("  ·  正在共享 Agent 只读诊断");
     if (status_text_->text() != left) status_text_->setText(left);
 
-    const bool need_statusbar = !current->noticeText().isEmpty()
+    const bool need_statusbar = !current->noticeText().isEmpty() || current->waitingForVideo()
         || (!fullscreen_mode_ && (!current->playing() || current->diagnostics() || agent_shared));
     statusbar_->setVisible(need_statusbar);
 }

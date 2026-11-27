@@ -83,6 +83,7 @@ $patches=@(
     (Join-Path $PSScriptRoot 'TrafficStats.patch')
     (Join-Path $PSScriptRoot 'DesktopLatestCapture.patch')
     (Join-Path $PSScriptRoot 'AudioQuality.patch')
+    (Join-Path $PSScriptRoot 'FastIceMediaReady.patch')
 )
 # A reused dependency checkout may contain the relay recovery experiment.
 $patchedFiles=@(

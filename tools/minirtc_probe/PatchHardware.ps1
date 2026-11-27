@@ -48,7 +48,7 @@ $text=Replace-MiniRtcSource ([IO.File]::ReadAllText((Join-Path $source $file))) 
 '@
 Set-HardwareSource $file $text
 $file='src/pc/minirtc_connection.cpp'
-$text=Replace-MiniRtcSource (Get-UpstreamText $file) '          video_payload_types_, audio_payload_types_);' @'
+$text=Replace-MiniRtcSource ([IO.File]::ReadAllText((Join-Path $source $file))) '          video_payload_types_, audio_payload_types_);' @'
           video_payload_types_, audio_payload_types_, info_.windows_d3d11_device);
 '@
 Set-HardwareSource $file $text

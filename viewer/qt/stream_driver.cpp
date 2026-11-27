@@ -54,7 +54,11 @@ void StreamDriver::initTimersAndWaits() {
 #else
     cursor_.setInterval(50);
     connect(&cursor_, &QTimer::timeout, this, [this] {
-        if (p2p_stream_state(handle()) != state_ || (p2p_stream_input_ready(handle()) != 0) != input_ready_) publish();
+        if (!hasVideo()) {
+            publishIfChanged();
+        } else if (p2p_stream_state(handle()) != state_ || (p2p_stream_input_ready(handle()) != 0) != input_ready_) {
+            publish();
+        }
         emit uiCommandsReady();
     });
 #endif
@@ -114,6 +118,8 @@ void StreamDriver::dispatch(uint32_t kind) {
         }
         if (p2p_stream_state(handle()) != state_ || (p2p_stream_input_ready(handle()) != 0) != input_ready_) {
             publish();
+        } else if (!hasVideo() && (kind == P2P_WAIT_PRESENT || kind == P2P_WAIT_SESSION)) {
+            publishIfChanged();
         }
         if (kind == P2P_WAIT_SESSION) emit uiCommandsReady();
     }
@@ -130,13 +136,34 @@ void StreamDriver::syncWaits() {
 }
 
 void StreamDriver::publish() {
+    publishSnapshot(true);
+}
+
+void StreamDriver::publishIfChanged() {
+    publishSnapshot(false);
+}
+
+void StreamDriver::publishSnapshot(bool force) {
+    if (!handle()) return;
     p2p_stream_snapshot_v1 snapshot{};
     if (p2p_stream_snapshot(handle(), &snapshot) != P2P_OK) {
         emit failed(QString::fromWCharArray(p2p_last_error()));
         return;
     }
+    const bool input_ready = snapshot.input_ready != 0;
+    const auto status = snapshot.status ? QString::fromWCharArray(snapshot.status) : QString{};
+    const auto notice = snapshot.plugin_notice ? QString::fromWCharArray(snapshot.plugin_notice) : QString{};
+    if (!force && snapshot.state == state_ && input_ready == input_ready_
+        && snapshot.width == width_ && snapshot.height == height_
+        && status == status_ && notice == notice_) {
+        return;
+    }
     state_ = snapshot.state;
-    input_ready_ = snapshot.input_ready != 0;
+    input_ready_ = input_ready;
+    width_ = snapshot.width;
+    height_ = snapshot.height;
+    status_ = status;
+    notice_ = notice;
 #if defined(Q_OS_WIN)
     runWhile(cursor_, input_ready_);
     runWhile(heartbeat_, input_ready_);

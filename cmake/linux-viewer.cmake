@@ -26,6 +26,8 @@ qt6_add_executable(p2premote_linux_viewer
     viewer/qt/agent_broker.cpp
     viewer/qt/app_settings.cpp
     viewer/qt/app_theme.cpp
+    viewer/qt/connection_stage_overlay.cpp
+    viewer/qt/connection_stage_overlay.h
     viewer/qt/frameless_chrome.cpp
     viewer/qt/plugin_dialog.cpp
     viewer/qt/plugin_menu.cpp
@@ -163,3 +165,17 @@ target_compile_options(update_client_test PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(update_client_test PRIVATE p2premote_update_core Qt6::Network)
 add_test(NAME update_client_test COMMAND update_client_test)
 set_tests_properties(update_client_test PROPERTIES TIMEOUT 15)
+
+add_executable(connection_stage_overlay_test
+    viewer/qt/connection_stage_overlay_test.cpp
+    viewer/qt/connection_stage_overlay.cpp
+    viewer/qt/connection_stage_overlay.h
+    viewer/qt/app_theme.cpp
+    viewer/qt/app_theme.h)
+set_target_properties(connection_stage_overlay_test PROPERTIES AUTOMOC ON)
+target_compile_features(connection_stage_overlay_test PRIVATE cxx_std_20)
+target_compile_options(connection_stage_overlay_test PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(connection_stage_overlay_test PRIVATE core/include)
+target_link_libraries(connection_stage_overlay_test PRIVATE Qt6::Widgets)
+add_test(NAME connection_stage_overlay_test COMMAND connection_stage_overlay_test)
+set_tests_properties(connection_stage_overlay_test PROPERTIES TIMEOUT 10 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

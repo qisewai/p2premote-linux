@@ -1,0 +1,94 @@
+diff --git a/src/pc/minirtc_connection.cpp b/src/pc/minirtc_connection.cpp
+index 5be2c1d..7cc7ea3 100644
+--- a/src/pc/minirtc_connection.cpp
++++ b/src/pc/minirtc_connection.cpp
+@@ -34,6 +34,7 @@ int MiniRtcConnection::Init() {
+                                       user_id.data(), user_id.size(),
+                                       callbacks_.user_data);
+     } else if ("disconnected" == ice_status) {
++      is_ice_transport_ready_ = false;
+       callbacks_.on_connection_status(ConnectionStatus::Disconnected,
+                                       user_id.data(), user_id.size(),
+                                       callbacks_.user_data);
+@@ -46,7 +47,10 @@ int MiniRtcConnection::Init() {
+       // b_force_i_frame_ = true;
+       LOG_INFO("Ice connected");
+     } else if ("ready" == ice_status) {
+-      is_ice_transport_ready_ = true;
++      if (is_ice_transport_ready_.exchange(true)) {
++        LOG_INFO("Ice ready (already active)");
++        return;
++      }
+       b_force_i_frame_ = true;
+       LOG_INFO("Ice ready");
+       callbacks_.on_connection_status(ConnectionStatus::Connected,
+diff --git a/src/transport/ice_component_state.h b/src/transport/ice_component_state.h
+index 55af772..33bd326 100644
+--- a/src/transport/ice_component_state.h
++++ b/src/transport/ice_component_state.h
+@@ -18,20 +18,21 @@ enum class IcePathAvailabilityChange {
+   BecameUnavailable,
+ };
+
+-// libnice requires the first nice_agent_send() to wait for READY. After a
+-// component has reached READY, libnice permits the previously selected pair to
+-// remain usable while an ICE restart temporarily moves the component through
+-// GATHERING, CONNECTING, or CONNECTED again. Keep that distinction in one
+-// thread-safe state tracker so media and congestion control use the same
+-// availability semantics.
++// The selected path becomes usable after authenticated DTLS in CONNECTED
++// or when ICE reaches READY. Keep it available through rechecks until the
++// component disconnects or fails.
+ class IceComponentStateTracker {
+  public:
++  IcePathAvailabilityChange MarkUsable() noexcept {
++    return usable_.exchange(true)
++               ? IcePathAvailabilityChange::Unchanged
++               : IcePathAvailabilityChange::BecameAvailable;
++  }
++
+   IcePathAvailabilityChange Update(NiceComponentState state) noexcept {
+     switch (state) {
+       case NICE_COMPONENT_STATE_READY:
+-        return usable_.exchange(true)
+-                   ? IcePathAvailabilityChange::Unchanged
+-                   : IcePathAvailabilityChange::BecameAvailable;
++        return MarkUsable();
+
+       case NICE_COMPONENT_STATE_DISCONNECTED:
+       case NICE_COMPONENT_STATE_FAILED:
+diff --git a/src/transport/ice_transport.cpp b/src/transport/ice_transport.cpp
+index 3c0ba8d..00a1474 100644
+--- a/src/transport/ice_transport.cpp
++++ b/src/transport/ice_transport.cpp
+@@ -577,13 +577,25 @@ void IceTransport::OnNewSelectedPair(NiceAgent* agent, guint stream_id,
+ }
+
+ void IceTransport::OnDtlsHandshakeDone(gpointer user_ptr) {
+-  if (enable_srtp_) {
+-    LOG_INFO("DTLS handshake done");
+-    if (ice_transport_controller_) {
+-      ice_transport_controller_->OnDtlsHandshakeDone(user_ptr);
+-    }
++  if (!enable_srtp_ || is_closed_) return;
++  LOG_INFO("DTLS handshake done");
++  if (!ice_transport_controller_) return;
++
++  ice_transport_controller_->OnDtlsHandshakeDone(user_ptr);
++  if (state_.load() != NICE_COMPONENT_STATE_CONNECTED ||
++      !ice_transport_controller_->IsSrtpActive() ||
++      component_state_tracker_.MarkUsable() !=
++          IcePathAvailabilityChange::BecameAvailable) {
++    return;
++  }
++
++  ice_io_statistics_->Start();
++  ice_transport_controller_->UpdateNetworkAvaliablity(true);
++  LOG_INFO("ICE media ready before all connectivity checks complete");
++  if (on_ice_status_change_) {
++    on_ice_status_change_("ready", remote_user_id_);
+   }
+ }
+
+ uint32_t GetRtpSsrc(const char* buffer, size_t size) {
+   uint32_t ssrc = 0;

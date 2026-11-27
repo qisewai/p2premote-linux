@@ -33,6 +33,7 @@ namespace {
 constexpr ULONGLONG reconnect_window_ms = 30'000;
 constexpr ULONGLONG close_grace_ms = 1'000;
 constexpr ULONGLONG video_settings_timeout_ms = 3'000;
+constexpr std::int64_t first_frame_timeout_seconds = 8;
 
 bool DiagnosticsEnabled() {
     try {
@@ -249,6 +250,7 @@ struct ActiveStream {
         : events(std::make_shared<StreamEvents>(std::move(trace))) {}
 
     ~ActiveStream() {
+        if (previous_execution_state) SetThreadExecutionState(ES_CONTINUOUS | previous_execution_state);
         if (audio_capture) audio_capture->Stop();
         audio_capture.reset();
         if (rtc) rtc->SetAudioReceiver({});
@@ -259,6 +261,7 @@ struct ActiveStream {
     }
 
     std::shared_ptr<StreamEvents> events;
+    EXECUTION_STATE previous_execution_state{};
     std::unique_ptr<ISignalTransport> signal;
     std::unique_ptr<MiniRtcCall> rtc;
     std::unique_ptr<PluginHost> overlay_plugin;
@@ -891,6 +894,9 @@ void StreamSession::ProcessEvents() {
                     if (!active.device) active.device = CreateD3d11Device(true);
                     active.pixels = std::make_unique<CapturePixels>(active.device.get());
                     impl_->ApplyVideoSettings(active, active.quality, VideoBitrateLimit(VideoBitratePreset::automatic));
+                    // Reset the display idle timer now, then keep the display on for the session.
+                    SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+                    active.previous_execution_state = SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
                     if (!impl_->StartCapture(active, true)) {
                         DisplayChanged();
                     }
@@ -1484,6 +1490,16 @@ std::wstring StreamSession::Status() const {
             return L"将在 " + std::to_wstring(seconds) + L" 秒后重连 · " + impl_->detail;
         }
         return L"自动重连第 " + std::to_wstring(retry->attempts) + L" 次 · " + impl_->detail;
+    }
+    const auto* active = impl_->active.get();
+    if (impl_->state == StreamState::streaming && active && !active->diagnostics && !active->transport_close_deadline) {
+        if (impl_->host && !impl_->stats.submitted && QpcNow() - impl_->start >= QpcFrequency() * first_frame_timeout_seconds) {
+            return impl_->detail + L" · 首帧采集超时";
+        }
+        if (!impl_->host && !impl_->stats.decoded && !impl_->stats.presented && !active->rtc->HasFrame()) {
+            return QpcNow() - impl_->start >= QpcFrequency() * first_frame_timeout_seconds
+                ? L"已连接，但暂未收到被控端画面。" : L"已建立媒体通道，等待被控端画面…";
+        }
     }
     return impl_->detail;
 }
