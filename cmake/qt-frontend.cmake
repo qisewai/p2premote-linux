@@ -109,7 +109,7 @@ set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION .)
 include(InstallRequiredSystemLibraries)
 qt_generate_deploy_app_script(TARGET p2premote_qt OUTPUT_SCRIPT qt_deploy
     DEPLOY_TOOL_OPTIONS --no-compiler-runtime --no-translations --no-opengl-sw --no-system-dxc-compiler
-        --skip-plugin-types generic,imageformats,networkinformation,styles,tls)
+        --skip-plugin-types generic,imageformats,networkinformation,styles)
 install(CODE [[
     set(QT_DEPLOY_BIN_DIR ".")
     set(QT_DEPLOY_PLUGINS_DIR ".")
