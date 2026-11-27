@@ -380,6 +380,8 @@ ctest --preset windows-x64-qt-release
 
 [发版工作流](.github/workflows/release.yml) 在推送与 `VERSION` 一致的 `vX.Y.Z` 标签时构建 Windows 和 Linux x64。两端测试通过后，发布任务签名并校验清单、整包和可用的增量包，随后把完整的草稿 Release 发布为最新版本。在 Actions 手动运行工作流可验证构建、签名和草稿上传。临时草稿会自动清理，签名后的验证产物可在对应运行中下载。
 
+工作流缓存 Windows 的 vcpkg 二进制包以及两端的 MiniRTC 库和头文件。发版配置或依赖文件推送到 `main` 时会运行构建和测试，为后续版本标签预热缓存。也可以在 `main` 手动运行来预热。工具链或依赖变化造成缓存缺失时，工作流会重新编译对应依赖。
+
 首次发版前，把 `p2prelease keygen` 生成的公钥保存到 `cmake/update-public.key`，并把对应私钥的 Base64 内容存为仓库的 Actions secret `P2PREMOTE_UPDATE_PRIVATE_KEY`。发布新版本时先更新 `VERSION` 和 `CHANGELOG.md`，再给该提交打标签并推送标签。普通的分支推送可以继续用于提交代码。
 
 桌面客户端在缓存中有与当前版本和签名匹配的整包时，会优先下载从该版本生成的 BSDIFF40 `.delta` 文件。客户端验签后在缓存中还原并复验整包，随后按正常流程提示重启。首次升级、底包缺失、没有更小的增量包或增量校验失败时，客户端会下载整包。Linux 无人值守被控服务在空闲时使用整包更新。

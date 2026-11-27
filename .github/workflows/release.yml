@@ -2,11 +2,21 @@ name: Build and publish signed releases
 
 on:
   push:
+    branches: [main]
     tags: ['v[0-9]*']
+    paths:
+      - .github/workflows/release.yml
+      - CMakeLists.txt
+      - CMakePresets.json
+      - vcpkg.json
+      - tools/minirtc_probe/**
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  XMAKE_VERSION: '3.1.1'
 
 concurrency:
   group: p2premote-release-${{ github.ref }}
@@ -27,7 +37,7 @@ jobs:
           version=$(tr -d '\r\n' < VERSION)
           number='(0|[1-9][0-9]{0,8})'
           [[ $version =~ ^$number\.$number\.$number$ ]]
-          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo 'The release tag must match VERSION.' >&2
             exit 1
           fi
@@ -38,14 +48,19 @@ jobs:
     needs: version
     runs-on: windows-2022
     timeout-minutes: 100
+    env:
+      VCPKG_REVISION: '277978ad2eddc3b05ecf288dcd33071968cd2f79'
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/out/vcpkg-binary-cache
+      VCPKG_BINARY_SOURCES: 'clear;default,readwrite'
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: xmake-io/github-action-setup-xmake@v1
         with:
-          xmake-version: '3.1.1'
-      - name: Build and stage Windows
+          xmake-version: ${{ env.XMAKE_VERSION }}
+      - name: Identify the Windows toolchain
+        id: windows-toolchain
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -54,10 +69,35 @@ jobs:
           if (!$vs) { throw 'Visual Studio 2022 with C++ was not found' }
           Import-Module (Join-Path $vs 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          if (!$env:VCToolsVersion -or !$env:WindowsSDKVersion) { throw 'MSVC or Windows SDK version is unavailable' }
+          "fingerprint=$($env:VCToolsVersion.Trim())-$($env:WindowsSDKVersion.Trim().TrimEnd([char]'\'))" >> $env:GITHUB_OUTPUT
+          "path=$vs" >> $env:GITHUB_OUTPUT
+      - name: Cache Windows vcpkg binary packages
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-windows-2022-${{ runner.arch }}-${{ env.VCPKG_REVISION }}-${{ steps.windows-toolchain.outputs.fingerprint }}-${{ hashFiles('vcpkg.json', 'CMakePresets.json', 'CMakeLists.txt') }}
+          restore-keys: vcpkg-windows-2022-${{ runner.arch }}-${{ env.VCPKG_REVISION }}-${{ steps.windows-toolchain.outputs.fingerprint }}-
+      - name: Cache Windows MiniRTC
+        uses: actions/cache@v5
+        with:
+          path: |
+            out/minirtc/minirtc.h
+            out/minirtc/p2premote_minirtc.dll
+          key: minirtc-windows-2022-${{ runner.arch }}-${{ env.XMAKE_VERSION }}-${{ steps.windows-toolchain.outputs.fingerprint }}-${{ hashFiles('tools/minirtc_probe/**') }}
+      - name: Build and stage Windows
+        shell: pwsh
+        env:
+          VS_INSTALL_PATH: ${{ steps.windows-toolchain.outputs.path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module (Join-Path $env:VS_INSTALL_PATH 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $env:VS_INSTALL_PATH -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
 
           $env:VCPKG_ROOT = Join-Path $env:RUNNER_TEMP 'p2premote-vcpkg'
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           git init -q $env:VCPKG_ROOT
-          git -C $env:VCPKG_ROOT fetch --depth 1 https://github.com/microsoft/vcpkg.git 277978ad2eddc3b05ecf288dcd33071968cd2f79
+          git -C $env:VCPKG_ROOT fetch --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_REVISION
           git -C $env:VCPKG_ROOT checkout --detach FETCH_HEAD
           & (Join-Path $env:VCPKG_ROOT 'bootstrap-vcpkg.bat') -disableMetrics
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -70,8 +110,13 @@ jobs:
           }
           Expand-Archive -LiteralPath $zip -DestinationPath $ghostty.FullName
 
-          ./tools/minirtc_probe/Build.ps1
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $miniRtcFiles = @('out/minirtc/minirtc.h', 'out/minirtc/p2premote_minirtc.dll')
+          if ($miniRtcFiles | Where-Object { (Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue).Length -le 0 }) {
+            ./tools/minirtc_probe/Build.ps1
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } else {
+            Write-Host 'Using cached Windows MiniRTC.'
+          }
           cmake --preset windows-x64-qt "-DP2PREMOTE_UPDATE_FEED_URL=https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/update-windows-x64.json"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset windows-x64-qt-release --parallel --target p2premote_qt p2premote p2premote_service p2premote_mcp p2p_cli update_core_test update_client_test
@@ -100,7 +145,7 @@ jobs:
           persist-credentials: false
       - uses: xmake-io/github-action-setup-xmake@v1
         with:
-          xmake-version: '3.1.1'
+          xmake-version: ${{ env.XMAKE_VERSION }}
       - uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.3'
@@ -123,6 +168,21 @@ jobs:
             printf '%s\n' "$libraries" >&2
             exit 1
           fi
+      - name: Identify the Linux MiniRTC toolchain
+        id: linux-toolchain
+        shell: bash
+        run: |
+          compiler=$(c++ -dumpfullversion -dumpversion)
+          packages=$(dpkg-query -W -f='${Package}=${Version}\n' libc6-dev libstdc++6 libavcodec-dev libavutil-dev zlib1g-dev)
+          fingerprint=$(printf '%s\n' "$compiler" "$packages" | sha256sum)
+          echo "fingerprint=${fingerprint%% *}" >> "$GITHUB_OUTPUT"
+      - name: Cache Linux MiniRTC
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.local/share/p2premote/minirtc/include/minirtc.h
+            ~/.local/share/p2premote/minirtc/lib/libp2premote_minirtc.so
+          key: minirtc-ubuntu-22.04-${{ runner.arch }}-${{ env.XMAKE_VERSION }}-${{ steps.linux-toolchain.outputs.fingerprint }}-${{ hashFiles('tools/minirtc_probe/**') }}
       - name: Build and stage Linux
         shell: bash
         run: |
@@ -138,7 +198,12 @@ jobs:
           tar -xzf "$deps/ghostty.tar.gz" --strip-components=1 -C "$deps/ghostty-src"
           (cd "$deps/ghostty-src" && "$deps/zig/zig" build -Doptimize=ReleaseFast --prefix "$deps/ghostty")
 
-          bash tools/minirtc_probe/Build-Linux.sh
+          minirtc="$HOME/.local/share/p2premote/minirtc"
+          if [[ -s "$minirtc/include/minirtc.h" && -s "$minirtc/lib/libp2premote_minirtc.so" ]]; then
+            echo 'Using cached Linux MiniRTC.'
+          else
+            bash tools/minirtc_probe/Build-Linux.sh
+          fi
           cmake --preset linux-x64 -DCMAKE_INSTALL_PREFIX=/usr/local \
             "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR;$deps/ghostty" \
             "-DP2PREMOTE_UPDATE_FEED_URL=https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update-linux-x64.json"
@@ -155,6 +220,7 @@ jobs:
           retention-days: 3
 
   publish:
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     needs: [version, windows, linux]
     runs-on: ubuntu-24.04
     permissions:
