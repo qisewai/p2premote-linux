@@ -30,7 +30,7 @@ public:
 
     PluginHost(bool host, SendFrame send, std::filesystem::path root = {}, Notify notify = {},
         std::filesystem::path config_root = {}, bool local_overlay = false, std::shared_ptr<PluginOverlays> overlays = {},
-        bool diagnostics_only = false);
+        bool diagnostics_only = false, bool clipboard_only = false);
     ~PluginHost();
     PluginHost(const PluginHost&) = delete;
     PluginHost& operator=(const PluginHost&) = delete;

@@ -105,7 +105,7 @@ target_compile_options(p2premote PRIVATE /W4 /permissive- /utf-8)
 target_link_options(p2premote PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 set_property(TARGET p2premote APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/host/dpi.manifest")
 
-add_executable(p2premote_service WIN32 host/service_main.cpp)
+add_executable(p2premote_service WIN32 host/service_main.cpp host/desktop_client.cpp)
 target_compile_features(p2premote_service PRIVATE cxx_std_20)
 target_compile_definitions(p2premote_service PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(p2premote_service PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -187,6 +187,14 @@ set_tests_properties(lan_video_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 18)
 set_tests_properties(diagnostics_transport_test PROPERTIES LABELS "loopback" TIMEOUT 12)
 set_tests_properties(idle_scroll_test continuous_scroll_test encoder_backlog_test PROPERTIES LABELS "gpu;loopback" TIMEOUT 60
     SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+add_executable(desktop_client_test host/desktop_client_test.cpp host/desktop_client.cpp)
+target_compile_features(desktop_client_test PRIVATE cxx_std_20)
+target_compile_definitions(desktop_client_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(desktop_client_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(desktop_client_test PRIVATE crypt32 user32 windowsapp)
+add_test(NAME desktop_client_test COMMAND desktop_client_test)
+set_tests_properties(desktop_client_test PROPERTIES TIMEOUT 10)
 
 add_executable(input_protocol_test proto/input_protocol_test.cpp)
 target_link_libraries(input_protocol_test PRIVATE input_protocol)

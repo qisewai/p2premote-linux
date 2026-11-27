@@ -47,6 +47,7 @@ qt6_add_executable(p2premote_linux_viewer
     viewer/linux/video_surface.cpp
     viewer/linux/viewer_session.cpp
     core/src/plugin_host.cpp
+    core/src/pty_session_posix.cpp
     proto/input_protocol.cpp
     proto/plugin_protocol.cpp)
 set_target_properties(p2premote_linux_viewer PROPERTIES AUTOMOC ON)
@@ -66,7 +67,7 @@ target_include_directories(p2premote_linux_viewer SYSTEM PRIVATE
     "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
 target_link_libraries(p2premote_linux_viewer PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets OpenSSL::Crypto
     PkgConfig::LINUX_LUA PkgConfig::LINUX_SECRET PkgConfig::LINUX_PULSE PkgConfig::LINUX_FUSE3 ghostty-vt::ghostty-vt
-    "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}")
+    "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}" util dl)
 if(TARGET Qt6::QOffscreenIntegrationPlugin)
     qt6_import_plugins(p2premote_linux_viewer INCLUDE Qt6::QOffscreenIntegrationPlugin)
 endif()
@@ -144,10 +145,10 @@ set_tests_properties(linux_audio_buffer_test PROPERTIES TIMEOUT 10)
 
 add_executable(linux_file_clipboard_test
     viewer/linux/file_clipboard_test.cpp viewer/linux/file_clipboard.cpp viewer/linux/plugin_platform.cpp
-    core/src/plugin_host.cpp proto/plugin_protocol.cpp)
+    core/src/plugin_host.cpp core/src/pty_session_posix.cpp proto/plugin_protocol.cpp)
 target_compile_features(linux_file_clipboard_test PRIVATE cxx_std_20)
 target_compile_options(linux_file_clipboard_test PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(linux_file_clipboard_test PRIVATE core/include core/src proto/include viewer/linux)
-target_link_libraries(linux_file_clipboard_test PRIVATE Qt6::Widgets OpenSSL::Crypto PkgConfig::LINUX_LUA PkgConfig::LINUX_FUSE3)
+target_link_libraries(linux_file_clipboard_test PRIVATE Qt6::Widgets OpenSSL::Crypto PkgConfig::LINUX_LUA PkgConfig::LINUX_FUSE3 util dl)
 add_test(NAME linux_file_clipboard_test COMMAND linux_file_clipboard_test "${CMAKE_CURRENT_SOURCE_DIR}/plugins/file-clipboard")
 set_tests_properties(linux_file_clipboard_test PROPERTIES TIMEOUT 15 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

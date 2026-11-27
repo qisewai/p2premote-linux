@@ -12,6 +12,9 @@
 #include <QStyle>
 #if defined(__linux__)
 #include <QSurfaceFormat>
+#include <QFileInfo>
+#include <QDir>
+#include <QProcess>
 #endif
 
 int main(int argc, char* argv[]) {
@@ -77,6 +80,9 @@ int main(int argc, char* argv[]) {
     }
 
 #if defined(__linux__)
+    const auto clipboard_agent = QFileInfo(QString::fromUtf8(P2PREMOTE_LINUX_HOST_EXECUTABLE)).dir()
+        .filePath(QStringLiteral("p2premote_clipboard"));
+    if (QFileInfo(clipboard_agent).isExecutable()) QProcess::startDetached(clipboard_agent, {});
     p2premote::initializePluginClipboard();
 #endif
     QApplication::setWindowIcon(app.style()->standardIcon(QStyle::SP_ComputerIcon));

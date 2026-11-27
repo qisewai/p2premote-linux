@@ -1,5 +1,6 @@
 #include "lan_signal_server.h"
 #include "uinput_injector.h"
+#include "video_frame_cadence.h"
 #include "x11_shm_capturer.h"
 
 #include <linux/input-event-codes.h>
@@ -52,10 +53,41 @@ void CheckListener() {
     server.Stop();
 }
 
+void CheckVideoCadence() {
+    using namespace p2premote::linux_host;
+    using namespace std::chrono_literals;
+    VideoFrameCadence cadence;
+    auto now = VideoFrameCadence::Clock::time_point{};
+    std::uint8_t pixels[16]{};
+    const CapturedFrame frame{2, 2, 8, pixels};
+    Check(cadence.Next(frame, 2, 2, now) == FrameSubmission::convert);
+    // Retry a prepared frame immediately if send_video did not accept it.
+    Check(cadence.Next(frame, 2, 2, now) == FrameSubmission::repeat);
+    cadence.Submitted(now);
+    for (int i = 0; i < 4; ++i) {
+        Check(cadence.Next(frame, 2, 2, now + 66ms) == FrameSubmission::skip);
+        now += 67ms;
+        Check(cadence.Next(frame, 2, 2, now) == FrameSubmission::repeat);
+        cadence.Submitted(now);
+    }
+    Check(cadence.Next(frame, 2, 2, now + 899ms) == FrameSubmission::skip);
+    now += 900ms;
+    Check(cadence.Next(frame, 2, 2, now) == FrameSubmission::repeat);
+    cadence.Submitted(now);
+    pixels[4] = 255;
+    Check(cadence.Next(frame, 2, 2, now + 33ms) == FrameSubmission::convert);
+    cadence.Submitted(now + 33ms);
+    Check(cadence.Next(frame, 4, 4, now + 66ms) == FrameSubmission::convert);
+    cadence.Submitted(now + 66ms);
+    cadence.Reset();
+    Check(cadence.Next(frame, 4, 4, now + 67ms) == FrameSubmission::convert);
+}
+
 } // namespace
 
 int main() {
     using namespace p2premote::linux_host;
+    CheckVideoCadence();
 
     // 1. Verify PS/2 Set 1 scancode mapping (standard + extended keys)
     Check(Ps2ScancodeToLinuxKey(0x01) == KEY_ESC);
@@ -71,6 +103,17 @@ int main() {
     Check(Ps2ScancodeToLinuxKey(0x11d) == KEY_RIGHTCTRL);
     Check(Ps2ScancodeToLinuxKey(0x138) == KEY_RIGHTALT);
     Check(Ps2ScancodeToLinuxKey(0x00) == 0);
+
+    // 1b. Verify Windows VK -> Linux KEY mapping for shortcut-macros InputCommand
+    Check(WindowsVkToLinuxKey(0x11) == KEY_LEFTCTRL);
+    Check(WindowsVkToLinuxKey(0x12) == KEY_LEFTALT);
+    Check(WindowsVkToLinuxKey(0x10) == KEY_LEFTSHIFT);
+    Check(WindowsVkToLinuxKey(0x5B) == KEY_LEFTMETA);
+    Check(WindowsVkToLinuxKey(0x09) == KEY_TAB);
+    Check(WindowsVkToLinuxKey(0x1B) == KEY_ESC);
+    Check(WindowsVkToLinuxKey(0x2E) == KEY_DELETE);
+    Check(WindowsVkToLinuxKey(0x4C) == KEY_L);
+    Check(WindowsVkToLinuxKey(0x00) == 0);
 
     // 2. Verify JSON extraction & MiniRTC signaling relay rewriting
     const std::string nested = "{\"type\":\"minirtc\",\"payload\":\"{\\\"type\\\":\\\"join_transmission\\\"}\"}";

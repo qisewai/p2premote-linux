@@ -131,7 +131,10 @@ std::string BaseName(const std::string& path) {
 
 bool IsSystemXorg(const std::filesystem::path& process) {
     std::error_code ec;
-    const auto path = std::filesystem::read_symlink(process / "exe", ec).string();
+    auto path = std::filesystem::read_symlink(process / "exe", ec).string();
+    // Package upgrades can replace Xorg while the active desktop still runs it.
+    constexpr std::string_view deleted = " (deleted)";
+    if (path.ends_with(deleted)) path.resize(path.size() - deleted.size());
     struct stat attributes{};
     return !ec && (path.starts_with("/usr/bin/") || path.starts_with("/usr/lib/")) &&
         (BaseName(path) == "Xorg" || BaseName(path) == "X") &&

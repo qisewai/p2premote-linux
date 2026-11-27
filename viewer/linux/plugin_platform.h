@@ -29,6 +29,7 @@
 namespace p2premote {
 
 void initializePluginClipboard();
+bool setHostLockKey(std::string_view key, bool enabled);
 
 struct LocalClipboardFile {
     std::string path, name;

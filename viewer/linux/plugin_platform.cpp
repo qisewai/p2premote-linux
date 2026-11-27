@@ -9,6 +9,7 @@
 
 #include <cerrno>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -151,6 +152,42 @@ void LinuxPluginFile::clear() noexcept {
     hash_.reset();
     id = 0;
     writable = false;
+}
+
+bool setHostLockKey(std::string_view key, bool enabled) {
+#if defined(__linux__)
+    unsigned int mask = 0;
+    if (key == "caps_lock") mask = 0x02u;      // LockMask
+    else if (key == "num_lock") mask = 0x10u;  // Mod2Mask
+    else return false;
+
+    using OpenDisplayFn = void* (*)(const char*);
+    using CloseDisplayFn = int (*)(void*);
+    using FlushFn = int (*)(void*);
+    using XkbLockModifiersFn = int (*)(void*, unsigned int, unsigned int, unsigned int);
+
+    void* lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib) return false;
+    auto open_display = reinterpret_cast<OpenDisplayFn>(dlsym(lib, "XOpenDisplay"));
+    auto close_display = reinterpret_cast<CloseDisplayFn>(dlsym(lib, "XCloseDisplay"));
+    auto flush = reinterpret_cast<FlushFn>(dlsym(lib, "XFlush"));
+    auto lock_mods = reinterpret_cast<XkbLockModifiersFn>(dlsym(lib, "XkbLockModifiers"));
+    bool ok = false;
+    if (open_display && close_display && flush && lock_mods) {
+        if (void* dpy = open_display(nullptr)) {
+            constexpr unsigned int kXkbUseCoreKbd = 0x0100u;
+            ok = lock_mods(dpy, kXkbUseCoreKbd, mask, enabled ? mask : 0u) != 0;
+            flush(dpy);
+            close_display(dpy);
+        }
+    }
+    dlclose(lib);
+    return ok;
+#else
+    (void)key;
+    (void)enabled;
+    return false;
+#endif
 }
 
 } // namespace p2premote

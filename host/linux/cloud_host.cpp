@@ -1,4 +1,5 @@
 #include "cloud_host.h"
+#include <utility>
 #include "cloud_connection.h"
 #include "host_session.h"
 #include "service_support.h"
@@ -87,7 +88,75 @@ bool EncryptedControl(const QString& sdp) {
 class CloudHost final : public QObject {
 public:
     CloudHost(CloudConfig config, HostConfig media)
-        : config_(std::move(config)), device_(config_.device.toStdString()) {
+        : config_(std::move(config)), device_(config_.device.toStdString()), media_config_(std::move(media)) {
+        retry_.setSingleShot(true);
+        deadline_.setSingleShot(true);
+        connect(&retry_, &QTimer::timeout, this, [this] {
+            if (state_ != State::retry) return;
+            if (token_.isEmpty()) login();
+            else listen();
+        });
+        connect(&deadline_, &QTimer::timeout, this, [this] {
+            if (state_ == State::standby) return;
+            if (state_ == State::session) endRoom();
+            else reconnect(true);
+        });
+        socket_.setMaxAllowedIncomingMessageSize(max_packet_bytes);
+        socket_.setMaxAllowedIncomingFrameSize(max_packet_bytes);
+        connect(&socket_, &QWebSocket::connected, this, [this] {
+            if (state_ != State::opening) return;
+            if (!cloudPeerMatches(socket_.requestUrl(), socket_.sslConfiguration().peerCertificate()) ||
+                !send("listen_internet", {})) reconnect(true);
+        });
+        connect(&socket_, &QWebSocket::textMessageReceived, this, [this](const QString& text) {
+            const auto message = QJsonDocument::fromJson(text.toUtf8());
+            if (!message.isObject()) reconnect(true);
+            else handle(message.object());
+        });
+        connect(&socket_, &QWebSocket::disconnected, this, [this] {
+            if (state_ != State::retry && state_ != State::locked && state_ != State::standby) {
+                reconnect(state_ == State::opening);
+            }
+        });
+        connect(&socket_, &QWebSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+            if (state_ != State::retry && state_ != State::locked && state_ != State::standby) {
+                reconnect(state_ == State::opening);
+            }
+        });
+    }
+
+    void start(bool active) {
+        if (active) {
+            NotifyCloudState("login", device_, false);
+            login();
+        } else {
+            state_ = State::standby;
+            NotifyCloudState("standby", device_, false);
+        }
+    }
+
+    void setActive(bool active) {
+        if (!active && state_ != State::standby) {
+            state_ = State::standby;
+            retry_.stop();
+            deadline_.stop();
+            if (auto* reply = std::exchange(login_reply_, nullptr)) reply->abort();
+            token_.clear();
+            ice_ = {};
+            if (media_) media_->StopCloudPeer();
+            socket_.abort();
+            Publish("standby");
+        } else if (active && state_ == State::standby) {
+            retry_ms_ = 500;
+            login();
+        }
+    }
+
+private:
+    enum class State { retry, login, opening, waiting, session, locked, standby };
+
+    bool ensureMedia() {
+        if (media_) return true;
         LinuxHostSession::CloudCallbacks callbacks;
         callbacks.send_signal = [this](std::string payload, std::uint64_t generation) {
             QMetaObject::invokeMethod(this, [this, payload = std::move(payload), generation] {
@@ -113,46 +182,10 @@ public:
             }, Qt::QueuedConnection);
         };
         media_ = std::make_unique<LinuxHostSession>(
-            std::move(media), std::make_unique<X11ShmCapturer>(), std::move(callbacks));
-
-        retry_.setSingleShot(true);
-        deadline_.setSingleShot(true);
-        connect(&retry_, &QTimer::timeout, this, [this] {
-            if (token_.isEmpty()) login();
-            else listen();
-        });
-        connect(&deadline_, &QTimer::timeout, this, [this] {
-            if (state_ == State::session) endRoom();
-            else reconnect(true);
-        });
-        socket_.setMaxAllowedIncomingMessageSize(max_packet_bytes);
-        socket_.setMaxAllowedIncomingFrameSize(max_packet_bytes);
-        connect(&socket_, &QWebSocket::connected, this, [this] {
-            if (!cloudPeerMatches(socket_.requestUrl(), socket_.sslConfiguration().peerCertificate()) ||
-                !send("listen_internet", {})) reconnect(true);
-        });
-        connect(&socket_, &QWebSocket::textMessageReceived, this, [this](const QString& text) {
-            const auto message = QJsonDocument::fromJson(text.toUtf8());
-            if (!message.isObject()) reconnect(true);
-            else handle(message.object());
-        });
-        connect(&socket_, &QWebSocket::disconnected, this, [this] {
-            if (state_ != State::retry && state_ != State::locked) reconnect(state_ == State::opening);
-        });
-        connect(&socket_, &QWebSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
-            if (state_ != State::retry && state_ != State::locked) reconnect(state_ == State::opening);
-        });
+            media_config_, std::make_unique<X11ShmCapturer>(), std::move(callbacks));
+        if (!media_->Valid()) media_.reset();
+        return media_ != nullptr;
     }
-
-    bool start() {
-        if (!media_->Valid()) return false;
-        NotifyCloudState("login", device_, true);
-        login();
-        return true;
-    }
-
-private:
-    enum class State { retry, login, opening, waiting, session, locked };
 
     void Publish(std::string_view status) { NotifyCloudState(status, device_); }
 
@@ -168,6 +201,7 @@ private:
             {"installationId", config_.installation}, {"serviceDeviceId", config_.device},
             {"deviceName", hostname.isEmpty() ? QStringLiteral("Linux") : hostname}, {"platform", "Linux x64"}};
         auto* reply = network_.post(request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+        login_reply_ = reply;
         reply->setReadBufferSize(max_signal_bytes + 1);
         connect(reply, &QNetworkReply::readyRead, reply, [reply] {
             if (reply->bytesAvailable() > max_signal_bytes) reply->abort();
@@ -176,10 +210,12 @@ private:
             if (!cloudPeerMatches(reply->url(), reply->sslConfiguration().peerCertificate())) reply->abort();
         });
         connect(reply, &QNetworkReply::finished, this, [this, reply] {
+            reply->deleteLater();
+            if (reply != login_reply_ || state_ != State::login) return;
+            login_reply_ = nullptr;
             const auto code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
             const auto body = reply->readAll();
             const auto error = reply->error();
-            reply->deleteLater();
             if (code == 401 || code == 403) {
                 state_ = State::locked;
                 Publish(code == 403 ? "removed" : "credentials");
@@ -227,10 +263,10 @@ private:
     }
 
     void reconnect(bool new_token) {
-        if (state_ == State::retry || state_ == State::locked) return;
+        if (state_ == State::standby || state_ == State::retry || state_ == State::locked) return;
         state_ = State::retry;
         deadline_.stop();
-        media_->StopCloudPeer();
+        if (media_) media_->StopCloudPeer();
         socket_.abort();
         if (new_token) token_.clear();
         Publish("reconnecting");
@@ -256,7 +292,7 @@ private:
             return;
         }
         if (type == "request" && state_ == State::waiting) {
-            if (!media_->StartCloudPeer(TravelMode(ice_, config_.relay_only))) {
+            if (!ensureMedia() || !media_->StartCloudPeer(TravelMode(ice_, config_.relay_only))) {
                 endRoom();
                 return;
             }
@@ -287,9 +323,11 @@ private:
 
     CloudConfig config_;
     std::string device_;
+    HostConfig media_config_;
     QByteArray token_;
     QJsonArray ice_;
     QNetworkAccessManager network_;
+    QNetworkReply* login_reply_{};
     QWebSocket socket_;
     QTimer retry_, deadline_;
     int retry_ms_{500};
@@ -301,36 +339,114 @@ private:
 
 bool ValidCloudHostConfig(std::string_view data) { return ParseConfig(data).has_value(); }
 
-int RunCloudHost(int argc, char** argv) {
-    std::optional<std::string> saved;
-    if (!LoadCloudServiceConfig(saved) || !saved) {
-        std::cerr << "[cloud] Cloud service configuration is missing or inaccessible\n";
+int RunSystemService(int argc, char** argv, HostConfig lan_base) {
+    if (const char* logs = std::getenv("LOGS_DIRECTORY"); logs && *logs) {
+        lan_base.log_dir = logs;
+    } else {
+        char temp_logs[] = "/tmp/p2premote-minirtc.XXXXXX";
+        if (mkdtemp(temp_logs)) lan_base.log_dir = temp_logs;
+        else {
+            std::cerr << "[host] Could not create a private MiniRTC log directory\n";
+            return 1;
+        }
+    }
+
+    HostConfig lan_cfg = lan_base;
+    if (!LoadServiceConfig(lan_cfg)) {
+        std::cerr << "[host] Could not read the protected P2P Remote LAN configuration\n";
         return 1;
     }
-    auto config = ParseConfig(*saved);
-    if (!config) {
-        std::cerr << "[cloud] Invalid cloud service configuration\n";
+    const bool lan_configured = lan_cfg.access_code.size() >= 6 && lan_cfg.access_code.size() <= 32;
+
+    std::optional<std::string> saved_cloud;
+    if (!LoadCloudServiceConfig(saved_cloud)) {
+        std::cerr << "[host] Could not read the protected P2P Remote cloud configuration\n";
         return 1;
     }
-    const char* logs = std::getenv("LOGS_DIRECTORY");
-    if (!logs || !*logs) {
-        std::cerr << "[cloud] Systemd must supply the protected log directory\n";
-        return 1;
+    std::optional<CloudConfig> cloud_cfg;
+    if (saved_cloud) {
+        cloud_cfg = ParseConfig(*saved_cloud);
+        if (!cloud_cfg) {
+            std::cerr << "[host] Invalid cloud service configuration\n";
+            return 1;
+        }
     }
+
     std::signal(SIGPIPE, SIG_IGN);
     std::signal(SIGINT, [](int) { stopping = 1; });
     std::signal(SIGTERM, [](int) { stopping = 1; });
 
     QCoreApplication app(argc, argv);
-    HostConfig media;
-    media.log_dir = logs;
-    CloudHost service(std::move(*config), std::move(media));
-    if (!service.start()) return 1;
-    QTimer stop_timer;
-    QObject::connect(&stop_timer, &QTimer::timeout, &app, [&] {
-        if (stopping) app.quit();
+
+    std::unique_ptr<LinuxHostSession> lan_session;
+    auto start_lan = [&]() -> bool {
+        auto next = std::make_unique<LinuxHostSession>(lan_cfg, std::make_unique<X11ShmCapturer>());
+        if (!next->Valid()) return false;
+        lan_session = std::move(next);
+        return true;
+    };
+
+    std::unique_ptr<CloudHost> cloud_service;
+    if (cloud_cfg) {
+        HostConfig media = lan_base;
+        media.access_code.clear();
+        cloud_service = std::make_unique<CloudHost>(std::move(*cloud_cfg), std::move(media));
+    }
+
+    const auto should_run = []() noexcept { return HostReceptionAllowed(); };
+    const bool initial_active = should_run();
+
+    if (lan_configured) {
+        if (initial_active) {
+            if (start_lan()) {
+                NotifyHostState("waiting", lan_cfg.port, false);
+            } else if (!cloud_service) {
+                std::cerr << "[host] Failed to initialize Linux LAN host session\n";
+                return 1;
+            } else {
+                std::cerr << "[host] Failed to initialize Linux LAN host session; continuing with cloud channel\n";
+                NotifyHostState("error", lan_cfg.port, false);
+            }
+        } else {
+            NotifyHostState("standby", lan_cfg.port, false);
+        }
+    } else {
+        NotifyHostState("off", 0, false);
+    }
+
+    if (cloud_service) {
+        cloud_service->start(initial_active);
+    } else {
+        NotifyCloudState("off", "-", false);
+    }
+    NotifyServiceReady();
+
+    std::cout << "[host] P2P Remote Linux Host service running (lan="
+              << (lan_configured ? "enabled" : "off")
+              << ", cloud=" << (cloud_service ? "enabled" : "off") << ")\n" << std::flush;
+
+    QTimer poll_timer;
+    QObject::connect(&poll_timer, &QTimer::timeout, &app, [&] {
+        if (stopping) {
+            lan_session.reset();
+            cloud_service.reset();
+            app.quit();
+            return;
+        }
+        const bool active = should_run();
+        if (lan_configured) {
+            if (active && !lan_session) {
+                if (start_lan()) NotifyHostState("waiting", lan_cfg.port, false);
+            } else if (!active && lan_session) {
+                lan_session.reset();
+                NotifyHostState("standby", lan_cfg.port, false);
+            }
+        }
+        if (cloud_service) {
+            cloud_service->setActive(active);
+        }
     });
-    stop_timer.start(100);
+    poll_timer.start(250);
     return app.exec();
 }
 

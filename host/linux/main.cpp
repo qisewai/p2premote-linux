@@ -55,7 +55,14 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--disable-cloud-service") {
         return ManageCloudHostService(false, ValidCloudHostConfig);
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--cloud-service") return RunCloudHost(argc, argv);
+    if (argc == 2 && std::string_view(argv[1]) == "--enable-unattended") return SetUnattended(true);
+    if (argc == 2 && std::string_view(argv[1]) == "--disable-unattended") return SetUnattended(false);
+    if (argc == 2 && std::string_view(argv[1]) == "--install-host-service") {
+        return InstallHostServices(ValidCloudHostConfig);
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--uninstall-host-service") {
+        return UninstallHostServices();
+    }
 
     HostConfig cfg;
     bool system_service = false;
@@ -105,9 +112,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (system_service && !LoadServiceConfig(cfg)) {
-        std::cerr << "Error: could not read the protected P2P Remote service configuration.\n";
-        return 1;
+    if (system_service) {
+        return RunSystemService(argc, argv, std::move(cfg));
     }
     if (cfg.access_code.size() < 6 || cfg.access_code.size() > 32) {
         std::cerr << "Error: --code (or P2PREMOTE_ACCESS_CODE) must be 6 to 32 characters.\n";
@@ -119,30 +125,24 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, OnSignal);
     std::signal(SIGPIPE, SIG_IGN);
 
-    if (const char* logs = std::getenv("LOGS_DIRECTORY"); system_service && logs && *logs) {
-        cfg.log_dir = logs;
-    } else {
-        char temp_logs[] = "/tmp/p2premote-minirtc.XXXXXX";
-        if (mkdtemp(temp_logs)) cfg.log_dir = temp_logs;
-        else {
-            std::cerr << "Error: could not create a private MiniRTC log directory.\n";
-            return 1;
-        }
+    char temp_logs[] = "/tmp/p2premote-minirtc.XXXXXX";
+    if (mkdtemp(temp_logs)) cfg.log_dir = temp_logs;
+    else {
+        std::cerr << "Error: could not create a private MiniRTC log directory.\n";
+        return 1;
     }
 
-    auto capturer = std::make_unique<X11ShmCapturer>();
-    LinuxHostSession session(cfg, std::move(capturer));
-    if (!session.Valid()) {
+    auto session = std::make_unique<LinuxHostSession>(cfg, std::make_unique<X11ShmCapturer>());
+    if (!session->Valid()) {
         std::cerr << "Error: failed to initialize Linux host session.\n";
         return 1;
     }
 
-    if (system_service) NotifyHostState("waiting", cfg.port, true);
     std::cout << "[host] P2P Remote Linux Host running (backend=X11Shm+uinput, fps="
               << cfg.fps << ", max_height=" << cfg.max_height << ")\n" << std::flush;
 
     while (!g_stop.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     std::cout << "[host] shutting down...\n" << std::flush;
     return 0;

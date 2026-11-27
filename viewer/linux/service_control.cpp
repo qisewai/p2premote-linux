@@ -11,7 +11,6 @@
 namespace {
 
 const auto service_unit = QStringLiteral("p2premote-host.service");
-const auto cloud_unit = QStringLiteral("p2premote-cloud-host.service");
 const auto service_executable = QString::fromUtf8(P2PREMOTE_LINUX_HOST_EXECUTABLE);
 const auto systemctl = QStringLiteral("/usr/bin/systemctl");
 const auto pkexec = QStringLiteral("/usr/bin/pkexec");
@@ -60,69 +59,93 @@ bool serviceExecutableExists() {
 }
 
 std::optional<HostServiceInfo> queryLinuxHostServiceInfo() {
-    const auto lan = queryUnit(service_unit);
-    const auto cloud = queryUnit(cloud_unit);
-    if (!lan || !cloud) return std::nullopt;
+    const auto unit = queryUnit(service_unit);
+    if (!unit) return std::nullopt;
 
     HostServiceInfo info;
-    info.installed = lan->installed;
-    info.enabled = lan->enabled;
-    info.lan_enabled = lan->state == QStringLiteral("active");
-    info.cloud_installed = cloud->installed;
-    const bool cloud_running = cloud->state == QStringLiteral("active");
-    info.cloud_enabled = cloud->enabled || cloud_running;
-    info.running = info.lan_enabled || cloud_running;
+    const bool marker = QFileInfo::exists(QStringLiteral("/etc/p2premote/host.enabled"));
+    info.needs_cleanup = QFileInfo::exists(QStringLiteral("/etc/p2premote/host.inactive"));
+    const bool active = unit->state == QStringLiteral("active");
+    info.installed = marker || info.needs_cleanup || unit->enabled || active;
+    info.unattended = QFileInfo::exists(QStringLiteral("/etc/p2premote/host.unattended"));
+    info.enabled = unit->enabled;
+    info.cloud_installed = unit->installed;
+    info.running = active;
 
-    if (lan->state == QStringLiteral("activating")) {
+    QString lan_state;
+    QString cloud_state;
+    const auto fields = unit->status.split(u' ');
+    if (fields.size() >= 3 && fields[0] == QStringLiteral("p2premote") &&
+        fields[1].startsWith(QStringLiteral("lan=")) && fields[2].startsWith(QStringLiteral("cloud="))) {
+        const auto lan_parts = fields[1].mid(4).split(u':');
+        if (lan_parts.size() == 2) {
+            lan_state = lan_parts[0];
+            const auto port = lan_parts[1].toUInt();
+            if (port >= 1 && port <= 65535) info.lan_port = static_cast<std::uint16_t>(port);
+        }
+        const auto cloud_value = fields[2].mid(6);
+        const auto sep = cloud_value.indexOf(u':');
+        if (sep >= 0) {
+            cloud_state = cloud_value.left(sep);
+            const auto device = cloud_value.mid(sep + 1);
+            if (device != QStringLiteral("-")) info.device_id = device;
+        }
+    }
+
+    info.lan_enabled = active && !lan_state.isEmpty() && lan_state != QStringLiteral("off");
+    info.cloud_enabled = active && !cloud_state.isEmpty() && cloud_state != QStringLiteral("off");
+
+    if (unit->state == QStringLiteral("activating")) {
         info.lan_status = QStringLiteral("被控服务正在启动");
-    } else if (lan->state == QStringLiteral("failed")) {
+    } else if (unit->state == QStringLiteral("failed")) {
         info.lan_status = QStringLiteral("被控服务启动失败，请查看 systemd 日志");
     } else if (info.lan_enabled) {
         info.lan_state = P2P_WAITING;
-        const auto fields = lan->status.split(u' ');
-        if (fields.size() == 3 && fields[0] == QStringLiteral("p2premote")) {
-            const auto port = fields[2].toUInt();
-            if (port >= 1 && port <= 65535) info.lan_port = static_cast<std::uint16_t>(port);
-            if (fields[1] == QStringLiteral("streaming")) {
-                info.lan_state = P2P_STREAMING;
-                info.lan_desktop_control = true;
-                info.lan_status = QStringLiteral("远程主控已接入");
-            } else if (fields[1] == QStringLiteral("display")) {
-                info.lan_state = P2P_NEGOTIATING;
-                info.lan_status = QStringLiteral("已连接，正在等待活动的 Xorg 桌面");
-            } else if (fields[1] == QStringLiteral("negotiating")) {
-                info.lan_state = P2P_NEGOTIATING;
-                info.lan_status = QStringLiteral("正在建立远程会话");
-            }
+        if (lan_state == QStringLiteral("streaming")) {
+            info.lan_state = P2P_STREAMING;
+            info.lan_desktop_control = true;
+            info.lan_status = QStringLiteral("远程主控已接入");
+        } else if (lan_state == QStringLiteral("display")) {
+            info.lan_state = P2P_NEGOTIATING;
+            info.lan_status = QStringLiteral("已连接，正在等待活动的 Xorg 桌面");
+        } else if (lan_state == QStringLiteral("negotiating")) {
+            info.lan_state = P2P_NEGOTIATING;
+            info.lan_status = QStringLiteral("正在建立远程会话");
+        } else if (lan_state == QStringLiteral("standby")) {
+            info.lan_state = P2P_IDLE;
+            info.lan_status = QStringLiteral("已休眠，等待前台软件启动");
         }
-        if (info.lan_status.isEmpty()) info.lan_status = QStringLiteral("系统服务正在等待连接，关闭客户端后仍继续运行");
+        if (info.lan_status.isEmpty()) info.lan_status = info.unattended
+            ? QStringLiteral("无人值守服务正在等待连接，退出客户端后仍继续运行")
+            : QStringLiteral("同网段设备已可发现此电脑，退出客户端后自动休眠断网");
     }
-    const auto fields = cloud->status.split(u' ');
-    if (fields.size() == 3 && fields[0] == QStringLiteral("p2premote-cloud")) {
-        info.device_id = fields[2];
-        const auto state = fields[1];
-        if (cloud_running && state == QStringLiteral("waiting")) {
+
+    if (info.cloud_enabled) {
+        if (cloud_state == QStringLiteral("waiting")) {
             info.status = QStringLiteral("已上线，等待同账号设备连接");
             info.state = P2P_WAITING;
             info.cloud_online = true;
-        } else if (cloud_running && state == QStringLiteral("streaming")) {
+        } else if (cloud_state == QStringLiteral("streaming")) {
             info.status = QStringLiteral("同账号设备正在远程控制本机");
             info.state = P2P_STREAMING;
             info.desktop_control = info.cloud_online = true;
-        } else if (cloud_running && (state == QStringLiteral("negotiating") || state == QStringLiteral("display"))) {
-            info.status = state == QStringLiteral("display") ? QStringLiteral("已连接，正在等待活动的 Xorg 桌面")
-                                                              : QStringLiteral("正在建立云端远程会话");
+        } else if (cloud_state == QStringLiteral("negotiating") || cloud_state == QStringLiteral("display")) {
+            info.status = cloud_state == QStringLiteral("display")
+                ? QStringLiteral("已连接，正在等待活动的 Xorg 桌面")
+                : QStringLiteral("正在建立云端远程会话");
             info.state = P2P_NEGOTIATING;
             info.cloud_online = true;
-        } else if (state == QStringLiteral("removed")) {
+        } else if (cloud_state == QStringLiteral("removed")) {
             info.status = QStringLiteral("设备已从账号移除，请重新添加本机");
-        } else if (state == QStringLiteral("credentials")) {
+        } else if (cloud_state == QStringLiteral("credentials")) {
             info.status = QStringLiteral("后台登录失效，请关闭并重新启用云端接收");
+        } else if (cloud_state == QStringLiteral("standby")) {
+            info.status = QStringLiteral("已休眠，等待前台软件启动");
+        } else {
+            info.status = QStringLiteral("正在连接云端服务器…");
         }
-    }
-    if (info.cloud_enabled && info.status.isEmpty()) {
-        info.status = cloud->state == QStringLiteral("failed") ? QStringLiteral("云端被控服务启动失败")
-                                                                 : QStringLiteral("正在连接云端服务器…");
+    } else if (unit->state == QStringLiteral("failed")) {
+        info.status = QStringLiteral("被控服务启动失败");
     }
     return info;
 }
@@ -184,4 +207,26 @@ void manageLinuxCloudService(QObject* owner, const std::optional<HostServiceConf
         payload = QJsonDocument(data).toJson(QJsonDocument::Compact);
     }
     manageService(owner, command, payload, std::move(completed));
+}
+
+void manageLinuxMasterService(QObject* owner, bool install, const HostServiceConfig& config,
+    std::function<void(QString)> completed) {
+    if (!install) {
+        manageService(owner, QStringLiteral("--uninstall-host-service"), {}, std::move(completed));
+        return;
+    }
+    QByteArray payload;
+    if (!config.server.isEmpty() && !config.user.isEmpty() && !config.password.empty() &&
+        !config.installation_id.isEmpty() && !config.device_id.isEmpty()) {
+        const QJsonObject data{{"server", config.server}, {"user", config.user},
+            {"password", QString::fromStdWString(config.password)}, {"installationId", config.installation_id},
+            {"deviceId", config.device_id}, {"relayOnly", config.relay_only}};
+        payload.append(QJsonDocument(data).toJson(QJsonDocument::Compact));
+    }
+    manageService(owner, QStringLiteral("--install-host-service"), payload, std::move(completed));
+}
+
+void changeLinuxUnattended(QObject* owner, bool enabled, std::function<void(QString)> completed) {
+    manageService(owner, enabled ? QStringLiteral("--enable-unattended") : QStringLiteral("--disable-unattended"),
+        {}, std::move(completed));
 }

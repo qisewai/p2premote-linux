@@ -12,6 +12,9 @@ namespace p2premote::linux_host {
 // Returns 0 if unmapped.
 std::uint16_t Ps2ScancodeToLinuxKey(std::uint16_t scancode) noexcept;
 
+// Maps a Windows Virtual-Key (VK_*) code used in InputCommand shortcuts to a Linux evdev KEY_* code.
+std::uint16_t WindowsVkToLinuxKey(std::uint16_t vk) noexcept;
+
 class UinputInjector final {
 public:
     UinputInjector();
@@ -27,6 +30,9 @@ public:
 
     // Applies a single decoded P2P Remote input packet (move, buttons, wheel, keys, reset).
     void Apply(const InputPacket& packet) noexcept;
+
+    // Applies a shortcut or text InputCommand (used by shortcut-macros plugin).
+    void ApplyCommand(const InputCommand& command) noexcept;
 
     // Releases all currently held keys and mouse buttons.
     void ReleaseAll() noexcept;

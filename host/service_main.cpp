@@ -1,3 +1,4 @@
+#include "desktop_client.h"
 #include "service_protocol.h"
 #include "service_storage.h"
 
@@ -9,11 +10,13 @@
 #include <userenv.h>
 #include <wtsapi32.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Foundation.Collections.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -40,6 +43,8 @@ struct HostConfig {
     bool lan_enabled{};
     std::uint16_t lan_port{P2P_LAN_DEFAULT_PORT};
     std::wstring lan_access_code;
+    bool unattended{};
+    std::wstring client_path, client_hash;
 
     int monitor_index{};
 
@@ -94,7 +99,9 @@ std::optional<HostConfig> ParseHostConfig(const std::string& json_utf8) {
         cfg.lan_port = (raw_port >= 1.0 && raw_port <= 65535.0)
             ? static_cast<std::uint16_t>(raw_port) : static_cast<std::uint16_t>(P2P_LAN_DEFAULT_PORT);
         cfg.lan_access_code = obj.GetNamedString(L"lan_access_code", L"").c_str();
-        if (!cfg.HasCloud() && !cfg.HasLan()) return std::nullopt;
+        cfg.client_path = obj.GetNamedString(L"client_path", L"");
+        cfg.client_hash = obj.GetNamedString(L"client_hash", L"");
+        cfg.unattended = obj.GetNamedBoolean(L"unattended", false);
         return cfg;
     } catch (...) {
         return std::nullopt;
@@ -142,16 +149,25 @@ struct WorkerSharedStatus {
     std::uint16_t lan_port{P2P_LAN_DEFAULT_PORT};
     int lan_state{P2P_IDLE};
     bool lan_desktop_control{};
+    bool unattended{};
     int monitor_index{};
     std::wstring user;
     std::wstring device_id;
+    std::wstring client_path, client_hash;
+    DWORD foreground_pid{};
+    std::wstring foreground_lease;
     std::wstring status{L"服务已启动，正在初始化…"};
     std::wstring lan_status;
 };
 
-std::string FormatStatusJson(WorkerSharedStatus& shared) {
+std::string FormatStatusJson(WorkerSharedStatus& shared, DWORD client_pid) {
     const std::lock_guard lock(shared.mutex);
     JsonObject obj;
+    obj.SetNamedValue(L"client_path", JsonValue::CreateStringValue(shared.client_path));
+    obj.SetNamedValue(L"client_hash", JsonValue::CreateStringValue(shared.client_hash));
+    if (shared.foreground_pid == client_pid && client_pid) {
+        obj.SetNamedValue(L"foreground_lease", JsonValue::CreateStringValue(shared.foreground_lease));
+    }
     obj.SetNamedValue(L"running", JsonValue::CreateBooleanValue(true));
     obj.SetNamedValue(L"cloud_enabled", JsonValue::CreateBooleanValue(shared.cloud_enabled));
     obj.SetNamedValue(L"state", JsonValue::CreateNumberValue(shared.state));
@@ -160,6 +176,7 @@ std::string FormatStatusJson(WorkerSharedStatus& shared) {
     obj.SetNamedValue(L"lan_port", JsonValue::CreateNumberValue(shared.lan_port));
     obj.SetNamedValue(L"lan_state", JsonValue::CreateNumberValue(shared.lan_state));
     obj.SetNamedValue(L"lan_desktop_control", JsonValue::CreateBooleanValue(shared.lan_desktop_control));
+    obj.SetNamedValue(L"unattended", JsonValue::CreateBooleanValue(shared.unattended));
     obj.SetNamedValue(L"monitor_index", JsonValue::CreateNumberValue(shared.monitor_index));
     obj.SetNamedValue(L"user", JsonValue::CreateStringValue(shared.user));
     obj.SetNamedValue(L"device_id", JsonValue::CreateStringValue(shared.device_id));
@@ -402,7 +419,7 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
         PSECURITY_DESCRIPTOR pipe_sd{};
         // Interactive clients may read and acknowledge status. They cannot create a server instance.
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100003;;;IU)", SDDL_REVISION_1, &pipe_sd, nullptr)) return;
+                L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x120003;;;IU)", SDDL_REVISION_1, &pipe_sd, nullptr)) return;
         const LocalAllocation free_sd(pipe_sd, LocalFree);
         SECURITY_ATTRIBUTES pipe_sa{sizeof(pipe_sa), pipe_sd, FALSE};
         const winrt::handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
@@ -434,7 +451,9 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
                 pipe.close();
                 continue;
             }
-            auto reply = FormatStatusJson(shared) + "\n";
+            ULONG client_pid{};
+            GetNamedPipeClientProcessId(pipe.get(), &client_pid);
+            auto reply = FormatStatusJson(shared, client_pid) + "\n";
             const auto deadline = GetTickCount64() + 750;
             DWORD size{};
             if (TransferPipeBytes(pipe.get(), event.get(), true, reply.data(),
@@ -466,19 +485,42 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
             continue;
         }
 
-        const bool run_cloud = cfg->HasCloud();
+        auto client = FindDesktopClient(cfg->client_path, cfg->client_hash);
+        const bool foreground = cfg->HasCloud() && client.requestsDiagnostics();
+        const bool run_cloud = cfg->HasCloud() && !foreground;
         const bool run_lan = cfg->HasLan();
+        // The worker owns the mutex until this configuration is revoked. An
+        // abandoned mutex also wakes the GUI stream if the worker is killed.
+        winrt::handle lease;
+        std::wstring lease_name;
+        if (foreground) {
+            PSECURITY_DESCRIPTOR sd{};
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"O:SYG:SYD:P(A;;GA;;;SY)(A;;0x120000;;;IU)", SDDL_REVISION_1, &sd, nullptr)) return 1;
+            const LocalAllocation release(sd, LocalFree);
+            SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
+            const auto suffix = UniqueSuffix();
+            if (suffix.empty()) return 1;
+            lease_name = L"Local\\P2PRemote.Foreground." + suffix;
+            lease.attach(CreateMutexW(&sa, TRUE, lease_name.c_str()));
+            if (!lease || GetLastError() == ERROR_ALREADY_EXISTS) return 1;
+        }
         {
             const std::lock_guard lock(shared.mutex);
-            shared.cloud_enabled = run_cloud;
+            shared.client_path = cfg->client_path;
+            shared.client_hash = cfg->client_hash;
+            shared.cloud_enabled = cfg->HasCloud();
+            shared.foreground_pid = foreground ? client.pid : 0;
+            shared.foreground_lease = lease_name;
             shared.lan_enabled = run_lan;
             shared.lan_port = cfg->lan_port;
+            shared.unattended = cfg->unattended;
             shared.monitor_index = cfg->monitor_index;
             if (!run_cloud) {
                 shared.state = P2P_IDLE;
                 shared.desktop_control = false;
-                shared.user.clear();
-                shared.device_id.clear();
+                shared.user = cfg->user;
+                shared.device_id = cfg->device_id;
                 shared.status.clear();
             }
             if (!run_lan) {
@@ -488,17 +530,68 @@ int RunHostWorker(const std::filesystem::path& directory, const std::wstring& st
             }
         }
 
+        if (!cfg->unattended && !client.alive()) {
+            SetWorkerStatus(shared, P2P_IDLE, L"[系统服务] 已休眠（前台软件未运行，已禁止远程连接）",
+                false, cfg->device_id, cfg->user, cfg->monitor_index);
+            if (run_lan) {
+                SetLanWorkerStatus(shared, P2P_IDLE, L"[系统服务] 已休眠（前台软件未运行）",
+                    false, cfg->lan_port, cfg->monitor_index);
+            }
+            sleep_interruptible(400);
+            continue;
+        }
+
+        const winrt::handle session_stop{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        if (!session_stop) return 1;
+        const auto active_stop = session_stop.get();
+        std::jthread client_watcher([&](std::stop_token token) {
+            while (!token.stop_requested()) {
+                HANDLE events[]{stop_event, client.process.get()};
+                const DWORD wait = WaitForMultipleObjects(client.process ? 2 : 1, events, FALSE, 250);
+                if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
+                if (!client.alive()) {
+                    if (!cfg->unattended || foreground) break;
+                    client = FindDesktopClient(cfg->client_path, cfg->client_hash);
+                }
+                if (cfg->HasCloud() && client.requestsDiagnostics() != foreground) {
+                    const std::lock_guard lock(shared.mutex);
+                    const auto busy = [](int state) {
+                        return state == P2P_APPROVAL || state == P2P_NEGOTIATING || state == P2P_STREAMING;
+                    };
+                    if (foreground || (!busy(shared.state) && !busy(shared.lan_state))) break;
+                }
+            }
+            SetEvent(active_stop);
+        });
+
         if (run_cloud && run_lan) {
             std::jthread lan_thread([&] {
                 winrt::init_apartment(winrt::apartment_type::single_threaded);
-                RunLanHostLoop(*cfg, shared, stop_event);
+                RunLanHostLoop(*cfg, shared, active_stop);
             });
-            RunCloudHostLoop(*cfg, shared, stop_event);
+            RunCloudHostLoop(*cfg, shared, active_stop);
             if (lan_thread.joinable()) lan_thread.join();
         } else if (run_lan) {
-            RunLanHostLoop(*cfg, shared, stop_event);
+            RunLanHostLoop(*cfg, shared, active_stop);
+        } else if (run_cloud) {
+            RunCloudHostLoop(*cfg, shared, active_stop);
+        } else if (foreground) {
+            WaitForSingleObject(active_stop, INFINITE);
         } else {
-            RunCloudHostLoop(*cfg, shared, stop_event);
+            SetWorkerStatus(shared, P2P_IDLE,
+                L"[系统服务] 已开启被控（待机中 · 添加本机到云端或开启局域网直连即可接入）",
+                false, L"", L"", cfg->monitor_index);
+            WaitForSingleObject(active_stop, INFINITE);
+        }
+        if (client_watcher.joinable()) {
+            client_watcher.request_stop();
+            client_watcher.join();
+        }
+        if (lease) {
+            ReleaseMutex(lease.get());
+            const std::lock_guard lock(shared.mutex);
+            shared.foreground_lease.clear();
+            shared.foreground_pid = 0;
         }
     }
 
@@ -809,27 +902,69 @@ std::filesystem::path RegisteredRuntime(SC_HANDLE service) {
     return std::filesystem::path(arguments[0]).parent_path();
 }
 
-int InstallAndStartService(const std::wstring& staging_path) {
-    if (staging_path.empty()) return 2;
-    auto config = ReadEncryptedConfig(staging_path);
-    if (!config || config->empty()) return 2;
-    struct ClearPlaintext {
-        std::string& value;
-        ~ClearPlaintext() { SecureZeroMemory(value.data(), value.size()); }
-    } clear{*config};
-    if (!ParseHostConfig(*config)) return 2;
-
-    const auto root = ServiceDirectory();
-    if (root.empty() || !EnsureProtectedDirectory(root)) return 3;
+winrt::handle LockServiceDirectory(const std::filesystem::path& root) {
     const HANDLE lock = CreateFileW((root / L"install.lock").c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
         FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (lock == INVALID_HANDLE_VALUE) return 3;
-    const winrt::handle install_lock{lock};
+    return lock == INVALID_HANDLE_VALUE ? winrt::handle{} : winrt::handle{lock};
+}
+
+int InstallAndStartService(const std::wstring& staging_path, std::wstring_view mode) {
+    const auto root = ServiceDirectory();
+    if (root.empty() || !EnsureProtectedDirectory(root)) return 3;
+    auto install_lock = LockServiceDirectory(root);
+    if (!install_lock) return 3;
     const ServiceHandle manager{OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE),
         CloseServiceHandle};
     if (!manager) return 4;
     ServiceHandle service{OpenServiceW(manager.get(), kServiceName, SERVICE_ALL_ACCESS), CloseServiceHandle};
     if (!service && GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST) return 4;
+
+    const auto previous = service ? RegisteredRuntime(service.get()) : std::filesystem::path{};
+    if (service && !IsManagedRuntime(previous)) return 4;
+    const bool patch = mode != L"--install";
+    if (patch && !service) return mode == L"--disable-cloud" ? 0 : 4;
+    auto config = ReadEncryptedConfig(patch ? previous / L"host.dat" : std::filesystem::path(staging_path));
+    if (!config || !ParseHostConfig(*config)) return 2;
+    struct ClearPlaintext {
+        std::string& value;
+        ~ClearPlaintext() { SecureZeroMemory(value.data(), value.size()); }
+    } clear{*config};
+    try {
+        auto obj = JsonObject::Parse(winrt::to_hstring(*config));
+        if (mode == L"--install" && obj.HasKey(L"update")) {
+            if (!service) return 4;
+            const auto field = obj.GetNamedString(L"update");
+            auto saved = ReadEncryptedConfig(previous / L"host.dat");
+            if (!saved) return 2;
+            ClearPlaintext clear_saved{*saved};
+            auto stored = JsonObject::Parse(winrt::to_hstring(*saved));
+            auto merge = [&](std::initializer_list<const wchar_t*> keys) {
+                for (auto key : keys) {
+                    if (obj.HasKey(key)) stored.SetNamedValue(key, obj.GetNamedValue(key));
+                    else if (stored.HasKey(key)) stored.Remove(key);
+                }
+            };
+            if (field == L"lan") merge({L"lan_enabled", L"lan_port", L"lan_access_code"});
+            else if (field == L"monitor") merge({L"monitor_index"});
+            else if (field == L"cloud") merge({L"server", L"user", L"password", L"installation_id",
+                L"device_id", L"compatible_http", L"relay_only"});
+            else return 2;
+            obj = std::move(stored);
+        } else if (mode == L"--disable-cloud") {
+            for (auto key : {L"server", L"user", L"password", L"installation_id", L"device_id"}) {
+                if (obj.HasKey(key)) obj.Remove(key);
+            }
+        } else if (mode == L"--enable-unattended" || mode == L"--disable-unattended") {
+            obj.SetNamedValue(L"unattended", JsonValue::CreateBooleanValue(mode == L"--enable-unattended"));
+        }
+        const auto image = std::filesystem::path(ExecutablePath()).parent_path() / L"p2premote_qt.exe";
+        const auto hash = ImageHash(image.wstring());
+        if (hash.empty()) return 2;
+        obj.SetNamedValue(L"client_path", JsonValue::CreateStringValue(image.wstring()));
+        obj.SetNamedValue(L"client_hash", JsonValue::CreateStringValue(hash));
+        SecureZeroMemory(config->data(), config->size());
+        *config = winrt::to_string(obj.Stringify());
+    } catch (...) { return 2; }
 
     const auto suffix = UniqueSuffix();
     if (suffix.empty()) return 3;
@@ -839,13 +974,16 @@ int InstallAndStartService(const std::wstring& staging_path) {
         return 3;
     }
     const auto command = L"\"" + (directory / runtime_files[0]).wstring() + L"\" --service";
-    std::filesystem::path previous;
+    const bool previously_running = service && ServiceState(service.get()) == SERVICE_RUNNING;
     if (service) {
-        previous = RegisteredRuntime(service.get());
-        if (!StopRegisteredService(service.get()) ||
-                !ChangeServiceConfigW(service.get(), SERVICE_WIN32_OWN_PROCESS, SERVICE_DEMAND_START,
+        if (!StopRegisteredService(service.get())) {
+            RemoveRuntime(directory);
+            return 5;
+        }
+        if (!ChangeServiceConfigW(service.get(), SERVICE_WIN32_OWN_PROCESS, SERVICE_DEMAND_START,
                     SERVICE_ERROR_NORMAL, command.c_str(), nullptr, nullptr, nullptr,
                     L"LocalSystem", nullptr, kServiceDisplayName)) {
+            if (previously_running) StartServiceW(service.get(), 0, nullptr);
             RemoveRuntime(directory);
             return 5;
         }
@@ -858,21 +996,38 @@ int InstallAndStartService(const std::wstring& staging_path) {
             return 5;
         }
     }
-    if (!previous.empty() && previous != directory) RemoveRuntime(previous);
 
     SERVICE_DESCRIPTIONW description{const_cast<LPWSTR>(kServiceDescription)};
     SC_ACTION actions[]{{SC_ACTION_RESTART, 3000}, {SC_ACTION_RESTART, 5000}, {SC_ACTION_RESTART, 10000}};
     SERVICE_FAILURE_ACTIONSW recovery{60, nullptr, nullptr, static_cast<DWORD>(std::size(actions)), actions};
-    if (!ChangeServiceConfig2W(service.get(), SERVICE_CONFIG_DESCRIPTION, &description)
-            || !ChangeServiceConfig2W(service.get(), SERVICE_CONFIG_FAILURE_ACTIONS, &recovery)) return 6;
-    if (!StartServiceW(service.get(), 0, nullptr) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) return 7;
-    if (!WaitForServiceState(service.get(), SERVICE_RUNNING)) return 7;
-    if (!ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) return 8;
+    const bool installed = ChangeServiceConfig2W(service.get(), SERVICE_CONFIG_DESCRIPTION, &description)
+        && ChangeServiceConfig2W(service.get(), SERVICE_CONFIG_FAILURE_ACTIONS, &recovery)
+        && (StartServiceW(service.get(), 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING)
+        && WaitForServiceState(service.get(), SERVICE_RUNNING)
+        && ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    if (!installed) {
+        if (!StopRegisteredService(service.get())) return 8;
+        if (previous.empty()) {
+            if (!DeleteService(service.get())) return 8;
+        } else {
+            const auto old_command = L"\"" + (previous / runtime_files[0]).wstring() + L"\" --service";
+            if (!ChangeServiceConfigW(service.get(), SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+                old_command.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) return 8;
+            if (previously_running && !StartServiceW(service.get(), 0, nullptr)) return 8;
+        }
+        RemoveRuntime(directory);
+        return 7;
+    }
+    if (!previous.empty()) RemoveRuntime(previous);
     return 0;
 }
 
 int UninstallService() {
+    const auto root = ServiceDirectory();
+    if (root.empty() || !EnsureProtectedDirectory(root)) return 3;
+    auto install_lock = LockServiceDirectory(root);
+    if (!install_lock) return 3;
     const ServiceHandle manager{OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT), CloseServiceHandle};
     if (!manager) return 4;
     const ServiceHandle service{OpenServiceW(manager.get(), kServiceName,
@@ -893,7 +1048,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     std::wstring stop_name;
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg(argv[i]);
-        if (arg == L"--service" || arg == L"--host-worker" || arg == L"--install" || arg == L"--uninstall") {
+        if (arg == L"--service" || arg == L"--host-worker" || arg == L"--install" || arg == L"--uninstall" ||
+            arg == L"--upgrade" || arg == L"--enable-unattended" || arg == L"--disable-unattended" || arg == L"--disable-cloud") {
             mode = arg;
         } else if (arg == L"--config-file" && i + 1 < argc) {
             config_file = argv[++i];
@@ -916,8 +1072,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         };
         return StartServiceCtrlDispatcherW(table) ? 0 : 1;
     }
-    if (mode == L"--install") {
-        return InstallAndStartService(config_file);
+    if (mode == L"--install" || mode == L"--upgrade" || mode == L"--enable-unattended" || mode == L"--disable-unattended" ||
+        mode == L"--disable-cloud") {
+        winrt::init_apartment();
+        return InstallAndStartService(config_file, mode);
     }
     if (mode == L"--uninstall") {
         return UninstallService();

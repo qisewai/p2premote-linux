@@ -4,6 +4,8 @@
 #include "../../host/service_storage.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
+#include <QFile>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -42,7 +44,7 @@ bool runElevatedAndWait(const std::wstring& exe, const std::wstring& params, QSt
     }
     DWORD exit_code = 1;
     if (sei.hProcess) {
-        WaitForSingleObject(sei.hProcess, 30000);
+        WaitForSingleObject(sei.hProcess, INFINITE);
         GetExitCodeProcess(sei.hProcess, &exit_code);
         CloseHandle(sei.hProcess);
     }
@@ -87,11 +89,23 @@ HostServiceInfo queryHostServiceInfo() {
 }
 
 HostServiceInfo queryHostWorkerStatus(HostServiceInfo info) {
-    if (const auto reply = ReadServiceStatus(250)) {
+    bool trusted{};
+    if (const auto reply = ReadServiceStatus(250, &trusted)) {
         const auto doc = QJsonDocument::fromJson(QByteArray::fromStdString(*reply));
         if (doc.isObject()) {
             const auto obj = doc.object();
             info.pipe_connected = true;
+            static const QString gui_hash = [] {
+                QFile image(QCoreApplication::applicationFilePath());
+                QCryptographicHash hash(QCryptographicHash::Sha256);
+                return image.open(QIODevice::ReadOnly) && hash.addData(&image)
+                    ? QString::fromLatin1(hash.result().toHex()) : QString{};
+            }();
+            const auto registered = QDir::fromNativeSeparators(obj.value(QStringLiteral("client_path")).toString());
+            info.needs_upgrade = !trusted || gui_hash.isEmpty() ||
+                gui_hash != obj.value(QStringLiteral("client_hash")).toString() ||
+                registered.compare(QCoreApplication::applicationFilePath(), Qt::CaseInsensitive) != 0;
+            if (trusted) info.foreground_lease = obj.value(QStringLiteral("foreground_lease")).toString();
             info.user = obj.value(QStringLiteral("user")).toString();
             info.device_id = obj.value(QStringLiteral("device_id")).toString();
             info.cloud_enabled = obj.contains(QStringLiteral("cloud_enabled"))
@@ -105,6 +119,7 @@ HostServiceInfo queryHostWorkerStatus(HostServiceInfo info) {
                 ? static_cast<std::uint16_t>(port) : static_cast<std::uint16_t>(P2P_LAN_DEFAULT_PORT);
             info.lan_state = obj.value(QStringLiteral("lan_state")).toInt();
             info.lan_desktop_control = obj.value(QStringLiteral("lan_desktop_control")).toBool();
+            info.unattended = obj.value(QStringLiteral("unattended")).toBool();
             info.monitor_index = obj.value(QStringLiteral("monitor_index")).toInt();
             info.status = obj.value(QStringLiteral("status")).toString();
             info.lan_status = obj.value(QStringLiteral("lan_status")).toString();
@@ -113,7 +128,7 @@ HostServiceInfo queryHostWorkerStatus(HostServiceInfo info) {
     return info;
 }
 
-bool installHostService(const HostServiceConfig& config, QString* error) {
+bool installHostService(const HostServiceConfig& config, HostConfigUpdate update, QString* error) {
     const auto exe = serviceExePath();
     if (!QFileInfo::exists(QString::fromStdWString(exe))) {
         if (error) *error = QStringLiteral("未找到 p2premote_service.exe，请重新解压完整客户端。");
@@ -121,6 +136,12 @@ bool installHostService(const HostServiceConfig& config, QString* error) {
     }
 
     QJsonObject obj;
+    switch (update) {
+    case HostConfigUpdate::lan: obj.insert(QStringLiteral("update"), QStringLiteral("lan")); break;
+    case HostConfigUpdate::cloud: obj.insert(QStringLiteral("update"), QStringLiteral("cloud")); break;
+    case HostConfigUpdate::monitor: obj.insert(QStringLiteral("update"), QStringLiteral("monitor")); break;
+    case HostConfigUpdate::install: break;
+    }
     if (!config.server.isEmpty() && !config.user.isEmpty() && !config.password.empty()
             && !config.installation_id.isEmpty() && !config.device_id.isEmpty()) {
         obj.insert(QStringLiteral("server"), config.server);
@@ -136,6 +157,7 @@ bool installHostService(const HostServiceConfig& config, QString* error) {
     if (config.lan_enabled && !config.lan_access_code.empty()) {
         obj.insert(QStringLiteral("lan_access_code"), QString::fromStdWString(config.lan_access_code));
     }
+    obj.insert(QStringLiteral("unattended"), config.unattended);
     obj.insert(QStringLiteral("monitor_index"), config.monitor_index);
     QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Compact);
 
@@ -155,6 +177,18 @@ bool installHostService(const HostServiceConfig& config, QString* error) {
     const bool ok = runElevatedAndWait(exe, params, error);
     DeleteFileW(staging.c_str());
     return ok;
+}
+
+bool upgradeHostService(QString* error) {
+    return runElevatedAndWait(serviceExePath(), L"--upgrade", error);
+}
+
+bool updateHostUnattended(bool enabled, QString* error) {
+    return runElevatedAndWait(serviceExePath(), enabled ? L"--enable-unattended" : L"--disable-unattended", error);
+}
+
+bool disableHostCloud(QString* error) {
+    return runElevatedAndWait(serviceExePath(), L"--disable-cloud", error);
 }
 
 bool uninstallHostService(QString* error) {

@@ -2,6 +2,7 @@
 
 #include "capture_backend.h"
 #include "desktop_audio.h"
+#include "clipboard_relay.h"
 #include "lan_signal_server.h"
 #include "uinput_injector.h"
 
@@ -76,6 +77,9 @@ private:
     std::unique_ptr<LinuxCaptureBackend> capturer_;
     UinputInjector injector_;
 
+    std::mutex clipboard_mutex_;
+    std::unique_ptr<ClipboardRelay> clipboard_;
+    unsigned ClipboardVt();
     std::mutex peer_mutex_;
     PeerPtr* peer_{};
     int console_lock_{-1};

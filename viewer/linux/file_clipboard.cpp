@@ -1,7 +1,7 @@
 #include "plugin_platform.h"
 
 #define FUSE_USE_VERSION 31
-#include <fuse3/fuse.h>
+#include <fuse.h>
 
 #include <QApplication>
 #include <QClipboard>

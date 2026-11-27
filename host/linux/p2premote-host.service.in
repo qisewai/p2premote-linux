@@ -1,5 +1,5 @@
 [Unit]
-Description=P2P Remote Linux Unattended Host (Xorg + uinput)
+Description=P2P Remote Linux Host (LAN + Cloud, Xorg + uinput)
 After=network-online.target display-manager.service
 Wants=network-online.target
 

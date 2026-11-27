@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <aclapi.h>
 #include <winrt/base.h>
 
 #include <optional>
@@ -12,6 +13,8 @@ inline constexpr wchar_t kServiceName[] = L"P2PRemoteService";
 inline constexpr wchar_t kServiceDisplayName[] = L"P2P Remote Host Service";
 inline constexpr wchar_t kServiceDescription[] = L"P2P Remote 无人值守后台服务";
 inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\P2PRemoteServiceStatus";
+inline constexpr wchar_t kClientWindow[] = L"P2PRemote.Host.Client";
+inline constexpr wchar_t kDiagnosticWindow[] = L"P2PRemote.Host.Diagnostics";
 inline constexpr DWORD kPipeClientAccess = FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE;
 
 inline DWORD RemainingPipeTime(ULONGLONG deadline) {
@@ -42,12 +45,29 @@ inline bool TransferPipeBytes(HANDLE pipe, HANDLE event, bool writing, void* buf
         && CompletePipeIo(pipe, operation, stop, RemainingPipeTime(deadline), size));
 }
 
-inline std::optional<std::string> ReadServiceStatus(DWORD timeout_ms) {
+inline bool SystemOwnedObject(HANDLE handle) {
+    PSID owner{};
+    PSECURITY_DESCRIPTOR descriptor{};
+    if (GetSecurityInfo(handle, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION,
+        &owner, nullptr, nullptr, nullptr, &descriptor) != ERROR_SUCCESS) return false;
+    const bool trusted = owner && IsWellKnownSid(owner, WinLocalSystemSid);
+    LocalFree(descriptor);
+    return trusted;
+}
+
+inline std::optional<std::string> ReadServiceStatus(DWORD timeout_ms, bool* trusted = nullptr) {
     const auto deadline = GetTickCount64() + timeout_ms;
     if (!WaitNamedPipeW(kPipeName, timeout_ms)) return std::nullopt;
-    HANDLE opened = CreateFileW(kPipeName, kPipeClientAccess, 0, nullptr, OPEN_EXISTING,
+    if (trusted) *trusted = false;
+    HANDLE opened = CreateFileW(kPipeName, kPipeClientAccess | (trusted ? READ_CONTROL : 0), 0, nullptr, OPEN_EXISTING,
         FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
+    if (opened == INVALID_HANDLE_VALUE && trusted && GetLastError() == ERROR_ACCESS_DENIED) {
+        trusted = nullptr; // Older services only grant data access.
+        opened = CreateFileW(kPipeName, kPipeClientAccess, 0, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
+    }
     if (opened == INVALID_HANDLE_VALUE) return std::nullopt;
+    if (trusted) *trusted = SystemOwnedObject(opened);
     const winrt::handle pipe{opened};
     const winrt::handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     if (!event) return std::nullopt;

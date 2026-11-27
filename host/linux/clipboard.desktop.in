@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=P2P Remote Clipboard
+Exec="@CMAKE_INSTALL_FULL_LIBEXECDIR@/p2premote/p2premote_clipboard"
+Terminal=false
+NoDisplay=true

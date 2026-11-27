@@ -1,10 +1,10 @@
 #include "plugin_host.h"
+#include "pty_session.h"
 #if defined(_WIN32)
 #include "agent_audit.h"
 #include "clipboard_bridge.h"
 #include "file_clipboard.h"
 #include "plugin_settings.h"
-#include "pty_session.h"
 #else
 #include "plugin_platform.h"
 #endif
@@ -1300,16 +1300,14 @@ private:
         BCRYPT_HASH_HANDLE hash{};
         std::string hash_hex;
     };
+#else
+    using FileSlot = LinuxPluginFile;
+#endif
 
     struct PtySlot {
         std::uint32_t id{};
         std::unique_ptr<PtySession> session;
     };
-
-#else
-    using FileSlot = LinuxPluginFile;
-
-#endif
     void ClearMenu() noexcept {
         for (auto& item : menu_) {
             if (item.id) {
@@ -1355,7 +1353,6 @@ private:
         }
     }
 
-#if defined(_WIN32)
     void ClearPtys() noexcept {
         for (auto& slot : ptys_) {
             if (slot.session) {
@@ -1364,11 +1361,6 @@ private:
             slot = {};
         }
     }
-
-#else
-    void ClearPtys() noexcept {}
-
-#endif
     void CaptureLockKeys(bool capture) noexcept {
         if (capture == captures_lock_keys_) return;
         captures_lock_keys_ = capture;
@@ -2352,7 +2344,13 @@ private:
     }
 
 #else
-    static int SetLocalLock(lua_State* state) { lua_pushboolean(state, false); return 1; }
+    static int SetLocalLock(lua_State* state) {
+        const auto key = CheckString(state, 1);
+        luaL_checktype(state, 2, LUA_TBOOLEAN);
+        const auto& runtime = Self(state).runtime_;
+        lua_pushboolean(state, runtime.host && runtime.Connected() && setHostLockKey(key, lua_toboolean(state, 2) != 0));
+        return 1;
+    }
 
 #endif
     static int SetIme(lua_State* state) {
@@ -2837,7 +2835,6 @@ private:
         return 1;
     }
 
-#if defined(_WIN32)
     static int PtyOpen(lua_State* state) {
         auto& self = Self(state);
         if (!self.runtime_.host || !self.runtime_.Connected()) {
@@ -2891,7 +2888,13 @@ private:
         if (slot == self.ptys_.end()) return 0;
         PtySession::Output output;
         try { output = slot->session->Read(); }
-        catch (...) { output.exit_code = ERROR_NOT_ENOUGH_MEMORY; }
+        catch (...) {
+#if defined(_WIN32)
+            output.exit_code = ERROR_NOT_ENOUGH_MEMORY;
+#else
+            output.exit_code = ENOMEM;
+#endif
+        }
         if (!output.bytes.empty()) {
             PushString(state, output.bytes);
             return 1;
@@ -2926,8 +2929,6 @@ private:
         lua_pushboolean(state, true);
         return 1;
     }
-
-#endif
     static int AddTimer(lua_State* state, bool repeating) {
         auto& self = Self(state);
         const auto ms = luaL_checkinteger(state, 1);
@@ -3021,12 +3022,10 @@ private:
         static const luaL_Reg base64[] = {
             {"encode", Base64EncodeLua}, {"decode", Base64DecodeLua}, {nullptr, nullptr}
         };
-#if defined(_WIN32)
         static const luaL_Reg pty[] = {
             {"open", PtyOpen}, {"read", PtyRead}, {"write", PtyWrite}, {"resize", PtyResize}, {"close", PtyClose},
             {nullptr, nullptr}
         };
-#endif
         static const luaL_Reg log[] = {
             {"info", [](lua_State* l) { Log(Self(l).manifest_.id, "info", CheckString(l, 1)); return 0; }},
             {"warn", [](lua_State* l) { Log(Self(l).manifest_.id, "warn", CheckString(l, 1)); return 0; }},
@@ -3071,9 +3070,7 @@ private:
         if (manifest_.sys && runtime_.host && manifest_.id == "ai-agent") Namespace(state, "sys", sys);
         if (manifest_.video) Namespace(state, "video", video);
         if (manifest_.fs) Namespace(state, "fs", fs);
-#if defined(_WIN32)
         if (manifest_.pty) Namespace(state, "pty", pty);
-#endif
         if (manifest_.overlay && !runtime_.host) Namespace(state, "overlay", overlay);
         ReadOnly(state);
         lua_setglobal(state, "p2p");
@@ -3136,9 +3133,7 @@ private:
     std::array<MenuCallback, 8> menu_{};
     std::array<DialogCallback, 4> dialogs_{};
     std::array<FileSlot, 4> files_{};
-#if defined(_WIN32)
     std::array<PtySlot, 2> ptys_{};
-#endif
     std::optional<PluginSettings> settings_;
     std::string config_result_;
     lua_Integer next_timer_{};
@@ -3147,7 +3142,7 @@ private:
 };
 
 void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
-    std::vector<std::unique_ptr<LuaPlugin>>& plugins, bool diagnostics_only) {
+    std::vector<std::unique_ptr<LuaPlugin>>& plugins, bool diagnostics_only, bool clipboard_only) {
     if (!IsPlainPath(root, true)) return;
 #if defined(_WIN32)
     const bool restricted_host = runtime.host && [] {
@@ -3165,6 +3160,8 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
 #endif
     for (const auto& directory : std::filesystem::directory_iterator(root)) {
         if (!runtime.Connected() || plugins.size() == max_plugins) break;
+        if (clipboard_only && directory.path().filename() != "clipboard-sync" &&
+            directory.path().filename() != "file-clipboard") continue;
         if (!IsPlainPath(directory.path(), true)) continue;
         try {
             std::filesystem::path entry;
@@ -3173,7 +3170,7 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
                 json_factory,
 #endif
                 directory.path(), runtime.host, entry);
-            if (!manifest) continue;
+            if (!manifest || (clipboard_only && manifest->id != "clipboard-sync" && manifest->id != "file-clipboard")) continue;
             if (diagnostics_only && (manifest->id != "ai-agent" || manifest->input || manifest->video ||
                 manifest->fs || manifest->pty || manifest->clipboard || manifest->file_clipboard)) continue;
             const bool local_overlay = manifest->overlay && !manifest->channel;
@@ -3214,8 +3211,8 @@ void LoadPlugins(const std::filesystem::path& root, PluginRuntime& runtime,
 
 struct PluginHost::Impl {
     Impl(bool host, SendFrame send, std::filesystem::path root, Notify notify, std::filesystem::path config_root,
-        bool local_overlay, std::shared_ptr<PluginOverlays> overlays, bool diagnostics_only)
-        : host(host), local_overlay(local_overlay), diagnostics_only(diagnostics_only), send(std::move(send)), root(std::move(root)),
+        bool local_overlay, std::shared_ptr<PluginOverlays> overlays, bool diagnostics_only, bool clipboard_only)
+        : host(host), local_overlay(local_overlay), diagnostics_only(diagnostics_only), clipboard_only(clipboard_only), send(std::move(send)), root(std::move(root)),
           config_root(std::move(config_root)), overlays(overlays ? std::move(overlays) : std::make_shared<PluginOverlays>()),
           workspace(std::move(notify)) {
         worker = std::jthread([this](std::stop_token stop) { Run(stop); });
@@ -3302,7 +3299,7 @@ struct PluginHost::Impl {
             PluginRuntime runtime(host, send, connected, workspace, config_root.empty() ? DefaultPluginSettingsDirectory()
                 : config_root, wake, local_overlay, *overlays, diagnostics_only);
             std::vector<std::unique_ptr<LuaPlugin>> plugins;
-            LoadPlugins(root.empty() ? PluginDirectory() : root, runtime, plugins, diagnostics_only);
+            LoadPlugins(root.empty() ? PluginDirectory() : root, runtime, plugins, diagnostics_only, clipboard_only);
             if (local_overlay && plugins.empty()) return;
             for (const auto& plugin : plugins) {
                 if (connected.load()) plugin->ConnectionChanged(true);
@@ -3405,6 +3402,7 @@ struct PluginHost::Impl {
     const bool host;
     const bool local_overlay;
     const bool diagnostics_only;
+    const bool clipboard_only;
     const SendFrame send;
     const std::filesystem::path root;
     const std::filesystem::path config_root;
@@ -3418,9 +3416,9 @@ struct PluginHost::Impl {
 };
 
 PluginHost::PluginHost(bool host, SendFrame send, std::filesystem::path root, Notify notify,
-    std::filesystem::path config_root, bool local_overlay, std::shared_ptr<PluginOverlays> overlays, bool diagnostics_only)
+    std::filesystem::path config_root, bool local_overlay, std::shared_ptr<PluginOverlays> overlays, bool diagnostics_only, bool clipboard_only)
     : impl_(std::make_unique<Impl>(host, std::move(send), std::move(root), std::move(notify),
-        std::move(config_root), local_overlay, std::move(overlays), diagnostics_only)) {}
+        std::move(config_root), local_overlay, std::move(overlays), diagnostics_only, clipboard_only)) {}
 PluginHost::~PluginHost() { Stop(); }
 
 void PluginHost::SetConnected(bool connected) noexcept {

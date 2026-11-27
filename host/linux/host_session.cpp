@@ -1,7 +1,9 @@
 #include "host_session.h"
 #include "service_support.h"
+#include "video_frame_cadence.h"
 
 #include "minirtc_desktop_video.h"
+#include <p2premote/plugin_protocol.h>
 
 #include <libyuv.h>
 #include <fcntl.h>
@@ -181,12 +183,20 @@ bool LinuxHostSession::StartPeer(TurnMode turn) {
         api_->add_data(peer, kControlStream, true) != 0 ||
         api_->add_data(peer, kPointerStream, false) != 0 ||
         api_->add_data(peer, kCursorStream, true) != 0 ||
+        api_->add_data(peer, "plugin", true) != 0 ||
         api_->init(peer, SignalOut, this) != 0) {
         api_->destroy(&peer);
         unlock();
         return false;
     }
     peer_ = peer;
+    {
+        const std::lock_guard guard(clipboard_mutex_);
+        clipboard_ = std::make_unique<ClipboardRelay>([this] { return ClipboardVt(); }, [this](unsigned vt, std::string_view frame) {
+            const std::lock_guard lock(peer_mutex_);
+            return peer_ && vt && ClipboardVt() == vt && api_->send_reliable(peer_, frame.data(), frame.size(), "plugin") == 0;
+        });
+    }
     connected_.store(false, std::memory_order_release);
     cursor_ready_.store(false, std::memory_order_release);
     force_cursor_.store(true, std::memory_order_release);
@@ -211,6 +221,12 @@ void LinuxHostSession::StopPeer() {
         ++audio_revision_;
         injector_.ReleaseAll();
     }
+    std::unique_ptr<ClipboardRelay> clipboard;
+    {
+        const std::lock_guard lock(clipboard_mutex_);
+        clipboard = std::move(clipboard_);
+    }
+    clipboard.reset();
     PeerPtr* old = nullptr;
     {
         const std::lock_guard lock(peer_mutex_);
@@ -265,11 +281,39 @@ void LinuxHostSession::DataCb(const char* data, std::size_t size, const char* re
 void LinuxHostSession::HandleData(const char* data, std::size_t size, const char* remote_peer_id,
     std::size_t remote_peer_id_size, const char* source, std::size_t source_size) {
     const std::string_view label(source, source_size);
+    if (label == "plugin") {
+        const std::string_view frame(data, size);
+        if (const auto packet = DecodePluginPacket(frame);
+            packet && packet->id == "_workspace" && packet->type == "hello") {
+            if (const auto reply = EncodePluginPacket({"_workspace", "ready", "1"})) {
+                const std::lock_guard lock(peer_mutex_);
+                if (peer_ && connected_.load(std::memory_order_acquire)) {
+                    api_->send_reliable(peer_, reply->data(), reply->size(), "plugin");
+                }
+            }
+            return;
+        }
+        const std::lock_guard lock(clipboard_mutex_);
+        if (clipboard_) clipboard_->Receive(frame);
+        return;
+    }
     if (label != kControlStream && label != kPointerStream) return;
 
     const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(data), size);
     const auto packet = DecodeInput(bytes);
-    if (!packet) return;
+    if (!packet) {
+        if (label == kControlStream) {
+            if (const auto command = DecodeInputCommand(bytes)) {
+                const std::lock_guard ilock(input_mutex_);
+                if (connected_.load(std::memory_order_acquire) && frame_sent_ && capturer_->InputAvailable() &&
+                    input_state_.AcceptCommand(*command, MonotonicMs())) {
+                    last_input_ms_ = MonotonicMs();
+                    injector_.ApplyCommand(*command);
+                }
+            }
+        }
+        return;
+    }
 
     const auto now = MonotonicMs();
     if (packet->kind == InputKind::set_video_settings && label == kControlStream) {
@@ -320,6 +364,11 @@ void LinuxHostSession::HandleData(const char* data, std::size_t size, const char
     injector_.Apply(*accepted);
 }
 
+unsigned LinuxHostSession::ClipboardVt() {
+    const std::lock_guard lock(input_mutex_);
+    return connected_.load() && frame_sent_ ? capturer_->ActiveFrameVt() : 0;
+}
+
 std::optional<DesktopAudioState> LinuxHostSession::AudioState() {
     const std::lock_guard lock(input_mutex_);
     if (!connected_.load(std::memory_order_acquire) || !frame_sent_ || !speaker_enabled_) return std::nullopt;
@@ -337,6 +386,7 @@ void LinuxHostSession::SendDesktopAudio(DesktopAudioState state, const char* dat
 
 void LinuxHostSession::CaptureLoop(std::stop_token stop) {
     const auto frame_interval = std::chrono::microseconds(1'000'000 / std::clamp(config_.fps, 5u, 60u));
+    VideoFrameCadence cadence;
     auto last_cursor_poll = std::chrono::steady_clock::now();
     auto last_stats_log = std::chrono::steady_clock::now();
     std::uint64_t frames_sent = 0;
@@ -349,8 +399,10 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
             previous_generation = generation;
             logged_first_frame = false;
             frames_sent = 0;
+            cadence.Reset();
         }
         if (!connected_.load(std::memory_order_acquire)) {
+            cadence.Reset();
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
@@ -366,6 +418,7 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
             }
             if (display_lost) {
                 frame_sent_ = false;
+                cadence.Reset();
                 PublishState("display");
             }
         }
@@ -381,21 +434,25 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
             dst_w &= ~1;
             dst_h &= ~1;
 
-            if (dst_w >= 64 && dst_h >= 64) {
-                const std::uint8_t* src_bgra = frame->bgra;
-                int src_stride = frame->stride;
-                if (dst_w != frame->width || dst_h != frame->height) {
-                    scaled_bgra_.resize(static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h) * 4u);
-                    libyuv::ARGBScale(frame->bgra, frame->stride, frame->width, frame->height,
-                        scaled_bgra_.data(), dst_w * 4, dst_w, dst_h, libyuv::kFilterBilinear);
-                    src_bgra = scaled_bgra_.data();
-                    src_stride = dst_w * 4;
-                }
+            const auto submission = dst_w >= 64 && dst_h >= 64
+                ? cadence.Next(*frame, dst_w, dst_h, tick_start) : FrameSubmission::skip;
+            if (submission != FrameSubmission::skip) {
+                if (submission == FrameSubmission::convert) {
+                    const std::uint8_t* src_bgra = frame->bgra;
+                    int src_stride = frame->stride;
+                    if (dst_w != frame->width || dst_h != frame->height) {
+                        scaled_bgra_.resize(static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h) * 4u);
+                        libyuv::ARGBScale(frame->bgra, frame->stride, frame->width, frame->height,
+                            scaled_bgra_.data(), dst_w * 4, dst_w, dst_h, libyuv::kFilterBilinear);
+                        src_bgra = scaled_bgra_.data();
+                        src_stride = dst_w * 4;
+                    }
 
-                const std::size_t luma = static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h);
-                nv12_.resize(luma + luma / 2);
-                libyuv::ARGBToNV12(src_bgra, src_stride,
-                    nv12_.data(), dst_w, nv12_.data() + luma, dst_w, dst_w, dst_h);
+                    const auto luma = static_cast<std::size_t>(dst_w) * dst_h;
+                    nv12_.resize(luma + luma / 2);
+                    libyuv::ARGBToNV12(src_bgra, src_stride,
+                        nv12_.data(), dst_w, nv12_.data() + luma, dst_w, dst_w, dst_h);
+                }
 
                 MiniRtcVideoFrame vf{};
                 vf.data = reinterpret_cast<const char*>(nv12_.data());
@@ -406,6 +463,7 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
                 const std::lock_guard lock(peer_mutex_);
                 if (peer_ && connected_.load(std::memory_order_acquire) && generation == peer_generation_.load() &&
                     api_->send_video(peer_, &vf, kVideoStream) == 0) {
+                    cadence.Submitted(tick_start);
                     capturer_->MarkFrameSent();
                     {
                         const std::lock_guard ilock(input_mutex_);
@@ -428,6 +486,8 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
                     }
                 }
             }
+        } else {
+            cadence.Reset();
         }
 
         if (cursor_ready_.load(std::memory_order_acquire) &&
