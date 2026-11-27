@@ -812,6 +812,10 @@ AccountWindow::AccountWindow(LaunchOptions options)
     loadCredentials();
     fillDevices();
     updateControls();
+    if (QSettings().value(QStringLiteral("autoLogin"), true).toBool() && remember_->isChecked() &&
+        !user_->text().isEmpty() && !password_->text().isEmpty()) {
+        QTimer::singleShot(0, this, [this] { signIn(false); });
+    }
 }
 
 AccountWindow::~AccountWindow() {
@@ -1439,7 +1443,7 @@ void AccountWindow::makeLoginPopup() {
     password_->setMaxLength(72);
     password_->setEchoMode(QLineEdit::Password);
     password_->setPlaceholderText(QStringLiteral("输入密码"));
-    remember_ = new QCheckBox(QStringLiteral("记住密码"), login_popup_);
+    remember_ = new QCheckBox(QStringLiteral("记住密码并自动登录"), login_popup_);
     fields->addRow(QStringLiteral("服务地址"), server_);
     fields->addRow(QStringLiteral("账号"), user_);
     fields->addRow(QStringLiteral("密码"), password_);
@@ -1477,7 +1481,9 @@ void AccountWindow::makeLoginPopup() {
         remember_->setChecked(false);
     });
     connect(remember_, &QCheckBox::clicked, this, [this](bool checked) {
-        if (!checked && !deleteCredentials(server_->text())) {
+        if (checked) return;
+        QSettings().setValue(QStringLiteral("autoLogin"), false);
+        if (!deleteCredentials(server_->text().trimmed())) {
             if (login_popup_status_) {
                 login_popup_status_->setText(QStringLiteral("无法删除已保存的凭据。"));
                 login_popup_status_->show();
@@ -2678,8 +2684,11 @@ void AccountWindow::completeRequest() {
     const auto request = std::exchange(request_, Request::none);
     if (result == P2P_OK) {
         if (request == Request::login) {
-            QSettings().setValue(QStringLiteral("lastServer"), pending_->server);
-            if (pending_->remember && !saveCredentials(*pending_)) {
+            const bool saved = pending_->remember && saveCredentials(*pending_);
+            QSettings settings;
+            settings.setValue(QStringLiteral("lastServer"), pending_->server);
+            settings.setValue(QStringLiteral("autoLogin"), saved);
+            if (pending_->remember && !saved) {
                 setStatus(QStringLiteral("已登录，无法保存账号凭据。"));
             } else {
                 setStatus(QString{});
@@ -2774,6 +2783,7 @@ void AccountWindow::finishSignOut() {
     request_ = Request::none;
     add_device_after_refresh_ = false;
     active_credentials_.reset();
+    QSettings().setValue(QStringLiteral("autoLogin"), false);
     if (p2p_account_logout(account_.get()) != P2P_OK) {
         setStatus(winText(p2p_last_error()), true);
     } else {
