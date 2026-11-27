@@ -34,6 +34,7 @@
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QScreen>
+#include <QScrollArea>
 #include <QSettings>
 #include <QShowEvent>
 #include <QSignalBlocker>
@@ -953,7 +954,11 @@ QWidget* AccountWindow::makeSidebar(QWidget* parent) {
 }
 
 QWidget* AccountWindow::makeLocalPage(QWidget* parent) {
-    auto* page = new QWidget(parent);
+    auto* scroll = new QScrollArea(parent);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+
+    auto* page = new QWidget;
     auto* layout = new QVBoxLayout(page);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(18);
@@ -1104,6 +1109,7 @@ QWidget* AccountWindow::makeLocalPage(QWidget* parent) {
     code_vbox->addWidget(local_code_value_);
     auto* code_sub = new QLabel(QStringLiteral("固定连接验证码 · 校验通过后即可远控"), code_tile);
     code_sub->setObjectName(QStringLiteral("muted"));
+    code_sub->setWordWrap(true);
     code_vbox->addWidget(code_sub);
     tiles->addWidget(code_tile, 1);
 
@@ -1269,7 +1275,8 @@ QWidget* AccountWindow::makeLocalPage(QWidget* parent) {
 
     layout->addWidget(info_card);
     layout->addStretch(1);
-    return page;
+    scroll->setWidget(page);
+    return scroll;
 }
 
 QWidget* AccountWindow::makeDetailPage(QWidget* parent) {
