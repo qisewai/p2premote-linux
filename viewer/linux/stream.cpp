@@ -30,7 +30,11 @@ struct p2p_stream {
         };
         session.statusChanged = [this](const QString& text) {
             status = text.toStdWString();
-            if (video && !session.isOpen()) attachVideoSession(video, &session);
+            const int next_state = p2p_stream_state(this);
+            if (video && next_state != last_video_state && (next_state == P2P_STOPPED || next_state == P2P_RECONNECTING)) {
+                attachVideoSession(video, &session);
+            }
+            last_video_state = next_state;
         };
     }
 
@@ -50,6 +54,7 @@ struct p2p_stream {
     bool stun_only{};
     bool diagnostics{};
     bool started{};
+    int last_video_state{P2P_IDLE};
     int quality{P2P_1080P}, bitrate{P2P_AUTOMATIC};
     std::wstring status, notice;
     PluginOverlaySnapshot overlays;

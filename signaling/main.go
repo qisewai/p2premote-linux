@@ -20,6 +20,13 @@ const (
 	roomLifetime = 2 * time.Minute
 )
 
+var (
+	signalPingInterval = 10 * time.Second
+	signalPingTimeout  = 10 * time.Second
+	signalMaxMisses    = 3
+	signalWriteTimeout = 5 * time.Second
+)
+
 type message struct {
 	Type      string `json:"type"`
 	Payload   string `json:"payload"`
@@ -174,7 +181,7 @@ func write(ctx context.Context, ws *websocket.Conn, m message) error {
 	if err != nil {
 		return err
 	}
-	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
+	bounded, cancel := context.WithTimeout(ctx, signalWriteTimeout)
 	defer cancel()
 	return ws.Write(bounded, websocket.MessageText, data)
 }
@@ -213,23 +220,18 @@ func (h *hub) serve(w http.ResponseWriter, r *http.Request) {
 	interrupted := false
 	defer func() { h.leave(session, c, interrupted) }()
 
+	pingInterval := signalPingInterval
+	pingTimeout := signalPingTimeout
+	maxMisses := signalMaxMisses
+
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
 		defer cancel()
-		ticker := time.NewTicker(4 * time.Second)
-		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				bounded, cancelPing := context.WithTimeout(ctx, 3*time.Second)
-				err := ws.Ping(bounded)
-				cancelPing()
-				if err != nil {
-					return
-				}
 			case next := <-c.out:
 				if write(ctx, ws, next) != nil || next.Type == "ended" || next.Type == "error" {
 					return
@@ -237,7 +239,47 @@ func (h *hub) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	defer func() { cancel(); <-writerDone }()
+
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		if pingInterval <= 0 || maxMisses <= 0 {
+			return
+		}
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		missed := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				bounded, cancelPing := context.WithTimeout(ctx, pingTimeout)
+				err := ws.Ping(bounded)
+				cancelPing()
+				if err == nil {
+					missed = 0
+					continue
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				if errors.Is(err, context.DeadlineExceeded) && strings.Contains(err.Error(), "wait for pong") {
+					missed++
+					if missed < maxMisses {
+						continue
+					}
+				}
+				cancel()
+				return
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		<-writerDone
+		<-pingDone
+	}()
 
 	for {
 		m, err := read(ctx, ws)

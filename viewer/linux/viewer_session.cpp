@@ -34,6 +34,8 @@ using p2premote::InputKind;
 constexpr qsizetype max_frame_bytes = 256 * 1024;
 constexpr qsizetype max_signal_bytes = 64 * 1024;
 constexpr qsizetype frame_prefix_bytes = sizeof(quint32);
+constexpr qint64 reconnect_window_ms = 30'000;
+constexpr int ws_ping_interval_ms = 15'000;
 constexpr char video_stream[] = "desktop";
 constexpr char control_stream[] = "control-v3";
 constexpr char pointer_stream[] = "pointer";
@@ -96,35 +98,48 @@ ViewerSession::ViewerSession() : api_(P2PRemoteMiniRtcApi(p2premote::native_mini
     socket_.setReadBufferSize(max_frame_bytes + frame_prefix_bytes);
     connect(&socket_, &QTcpSocket::readyRead, this, [this] { receiveFrames(); });
     connect(&socket_, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError error) {
-        if (isOpen() && error != QAbstractSocket::RemoteHostClosedError) {
-            stop(QStringLiteral("信令连接失败 · %1").arg(socket_.errorString()));
+        if (state_ != State::idle && state_ != State::reconnecting && error != QAbstractSocket::RemoteHostClosedError) {
+            recover(QStringLiteral("信令连接失败 · %1").arg(socket_.errorString()));
         }
     });
     connect(&socket_, &QTcpSocket::disconnected, this, [this] {
-        if (isOpen()) stop(QStringLiteral("已断开，可以重新连接。"));
+        if (state_ != State::idle && state_ != State::reconnecting) {
+            recover(QStringLiteral("已断开，可以重新连接。"));
+        }
     });
     web_socket_.setMaxAllowedIncomingMessageSize(max_frame_bytes);
     web_socket_.setMaxAllowedIncomingFrameSize(max_frame_bytes);
     connect(&web_socket_, &QWebSocket::connected, this, [this] {
-        if (!cloud_ || !isOpen()) return;
+        if (!cloud_ || state_ == State::idle || state_ == State::reconnecting) return;
         if (!cloudPeerMatches(cloud_->signal_url, web_socket_.sslConfiguration().peerCertificate())) {
             stop(QStringLiteral("云端信令服务身份校验失败"));
             return;
         }
         if (!sendFrame({{"type", diagnostics_ ? "join_diagnostics" : "join_internet"}, {"payload", cloud_device_},
-                {"minirtc", true}})) stop(QStringLiteral("无法请求远程会话"));
+                {"minirtc", true}})) {
+            recover(QStringLiteral("无法请求远程会话"));
+            return;
+        }
+        ws_ping_timer_.start();
     });
     connect(&web_socket_, &QWebSocket::textMessageReceived, this, [this](const QString& text) {
-        if (!isOpen() || !cloud_) return;
+        if (state_ == State::idle || state_ == State::reconnecting || !cloud_) return;
         const auto document = QJsonDocument::fromJson(text.toUtf8());
         if (document.isObject()) handleFrame(document.object());
         else stop(QStringLiteral("收到无效的云端信令"));
     });
     connect(&web_socket_, &QWebSocket::disconnected, this, [this] {
-        if (cloud_ && isOpen()) stop(QStringLiteral("云端信令已断开"));
+        if (cloud_ && state_ != State::idle && state_ != State::reconnecting) {
+            recover(QStringLiteral("云端信令已断开"));
+        }
     });
-    connect(&web_socket_, &QWebSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
-        if (cloud_ && isOpen()) stop(QStringLiteral("云端信令连接失败 · %1").arg(web_socket_.errorString()));
+    connect(&web_socket_, &QWebSocket::errorOccurred, this, [this](QAbstractSocket::SocketError error) {
+        if (cloud_ && state_ != State::idle && state_ != State::reconnecting) {
+            const auto detail = error == QAbstractSocket::RemoteHostClosedError
+                ? QStringLiteral("云端信令连接已关闭")
+                : QStringLiteral("云端信令连接失败 · %1").arg(web_socket_.errorString());
+            recover(detail);
+        }
     });
 
     timeout_.setSingleShot(true);
@@ -133,8 +148,21 @@ ViewerSession::ViewerSession() : api_(P2PRemoteMiniRtcApi(p2premote::native_mini
             if (!diagnostics_ && !metrics_.width && statusChanged) {
                 statusChanged(QStringLiteral("已连接，但暂未收到被控端画面。"));
             }
-        } else if (state_ == State::approval) stop(QStringLiteral("等待被控端授权超时。"));
-        else stop(state_ == State::negotiation ? QStringLiteral("媒体协商超时。") : QStringLiteral("连接或认证超时。"));
+            return;
+        }
+        const auto reason = state_ == State::approval
+            ? QStringLiteral("等待被控端授权超时。")
+            : (state_ == State::negotiation ? QStringLiteral("媒体协商超时。") : QStringLiteral("连接或认证超时。"));
+        if (reconnect_) recover(reason);
+        else stop(reason);
+    });
+    reconnect_timer_.setSingleShot(true);
+    connect(&reconnect_timer_, &QTimer::timeout, this, [this] { attemptReconnect(); });
+    ws_ping_timer_.setInterval(ws_ping_interval_ms);
+    connect(&ws_ping_timer_, &QTimer::timeout, this, [this] {
+        if (cloud_ && web_socket_.state() == QAbstractSocket::ConnectedState) {
+            web_socket_.ping();
+        }
     });
     plugin_timer_.setInterval(50);
     connect(&plugin_timer_, &QTimer::timeout, this, [this] { processPluginActions(); });
@@ -142,11 +170,13 @@ ViewerSession::ViewerSession() : api_(P2PRemoteMiniRtcApi(p2premote::native_mini
 
 ViewerSession::~ViewerSession() {
     statusChanged = {};
+    clearReconnect();
     stop({});
 }
 
 void ViewerSession::open(const QString& host, quint16 port, const QString& code) {
     if (isOpen()) close();
+    else clearReconnect();
     if (!api_) {
         stop(QStringLiteral("MiniRTC 库版本不匹配。"));
         return;
@@ -157,18 +187,36 @@ void ViewerSession::open(const QString& host, quint16 port, const QString& code)
         return;
     }
 
-    key_ = QCryptographicHash::hash("p2premote-lan-v1:" + code.toUtf8(), QCryptographicHash::Sha256);
+    const auto key = QCryptographicHash::hash("p2premote-lan-v1:" + code.toUtf8(), QCryptographicHash::Sha256);
+    openWithKey(address, port, key, false);
+}
+
+void ViewerSession::openWithKey(const QString& host, quint16 port, const QByteArray& key, bool reconnecting) {
+    if (!api_) {
+        stop(QStringLiteral("MiniRTC 库版本不匹配。"));
+        return;
+    }
+    lan_host_ = host;
+    lan_port_ = port;
+    lan_key_ = key;
+    key_ = key;
     metrics_ = {};
     decoded_frames_.store(0, std::memory_order_relaxed);
     draw_to_present_ms_ = 0;
     state_ = State::challenge;
-    if (statusChanged) statusChanged(QStringLiteral("正在连接 %1:%2…").arg(address).arg(port));
+    if (!reconnecting && statusChanged) statusChanged(QStringLiteral("正在连接 %1:%2…").arg(host).arg(port));
     timeout_.start(8000);
-    socket_.connectToHost(address, port);
+    socket_.connectToHost(host, port);
 }
 
 void ViewerSession::openCloud(CloudConnection connection, const QString& device, bool diagnostics) {
     if (isOpen()) close();
+    else clearReconnect();
+    openCloudInternal(std::move(connection), device, diagnostics, false);
+}
+
+void ViewerSession::openCloudInternal(CloudConnection connection, const QString& device, bool diagnostics,
+    bool reconnecting) {
     if (web_socket_.state() != QAbstractSocket::UnconnectedState) web_socket_.abort();
     if (!api_) {
         stop(QStringLiteral("MiniRTC 库版本不匹配。"));
@@ -181,7 +229,7 @@ void ViewerSession::openCloud(CloudConnection connection, const QString& device,
     decoded_frames_.store(0, std::memory_order_relaxed);
     draw_to_present_ms_ = 0;
     state_ = State::approval;
-    if (statusChanged) statusChanged(QStringLiteral("正在连接云端信令…"));
+    if (!reconnecting && statusChanged) statusChanged(QStringLiteral("正在连接云端信令…"));
     timeout_.start(15000);
     const auto request = cloudRequest(cloud_->signal_url, cloud_->token);
     if (request.url().scheme() == "wss") web_socket_.setSslConfiguration(request.sslConfiguration());
@@ -196,6 +244,7 @@ int ViewerSession::state() const {
     case State::approval: return P2P_APPROVAL;
     case State::negotiation: return P2P_NEGOTIATING;
     case State::streaming: return P2P_STREAMING;
+    case State::reconnecting: return P2P_RECONNECTING;
     }
     return P2P_STOPPED;
 }
@@ -207,15 +256,28 @@ void ViewerSession::close() {
         sendFrame({{"type", "ended"}, {"payload", "Viewer ended the session"}});
         socket_.flush();
     }
-    if (web_socket_.state() == QAbstractSocket::ConnectedState) web_socket_.flush();
+    if (cloud_ && web_socket_.state() == QAbstractSocket::ConnectedState) {
+        sendFrame({{"type", "stop"}});
+        web_socket_.flush();
+    }
+    clearReconnect();
     stop(QStringLiteral("已断开。"));
 }
 
-void ViewerSession::stop(const QString& status) {
-    state_ = State::idle;
+void ViewerSession::clearReconnect() {
+    reconnect_timer_.stop();
+    if (reconnect_) {
+        reconnect_->lan_key.fill('\0');
+        reconnect_->lan_key.clear();
+        reconnect_.reset();
+    }
+}
+
+void ViewerSession::teardownTransport() {
     ++generation_;
     timeout_.stop();
     plugin_timer_.stop();
+    ws_ping_timer_.stop();
     std::shared_ptr<ViewerAudio> old_sound;
     {
         const std::lock_guard lock(sound_mutex_);
@@ -269,7 +331,69 @@ void ViewerSession::stop(const QString& status) {
         frame_wait_sum_ms_ = 0;
         frame_wait_samples_ = 0;
     }
+}
+
+void ViewerSession::stop(const QString& status) {
+    clearReconnect();
+    lan_host_.clear();
+    lan_port_ = 0;
+    lan_key_.fill('\0');
+    lan_key_.clear();
+    state_ = State::idle;
+    teardownTransport();
     if (statusChanged) statusChanged(status);
+}
+
+void ViewerSession::recover(const QString& reason) {
+    if (!reconnect_ && state_ != State::streaming) {
+        stop(reason);
+        return;
+    }
+    if (!reconnect_) {
+        ReconnectState next;
+        next.diagnostics = diagnostics_;
+        if (cloud_) {
+            next.is_cloud = true;
+            next.cloud = *cloud_;
+            next.cloud_device = cloud_device_;
+        } else {
+            next.is_cloud = false;
+            next.lan_host = lan_host_;
+            next.lan_port = lan_port_;
+            next.lan_key = lan_key_;
+        }
+        next.window.start();
+        reconnect_ = std::move(next);
+    }
+    if (reconnect_->window.elapsed() >= reconnect_window_ms) {
+        stop(QStringLiteral("自动重连超时 · %1").arg(reason));
+        return;
+    }
+    const int delay_sec = 1 << std::min(reconnect_->attempts, 2);
+    reconnect_->reason = reason;
+    state_ = State::reconnecting;
+    teardownTransport();
+    if (statusChanged) {
+        statusChanged(QStringLiteral("将在 %1 秒后重连 · %2").arg(delay_sec).arg(reason));
+    }
+    reconnect_timer_.start(delay_sec * 1000);
+}
+
+void ViewerSession::attemptReconnect() {
+    if (!reconnect_ || state_ != State::reconnecting) return;
+    if (reconnect_->window.elapsed() >= reconnect_window_ms) {
+        stop(QStringLiteral("自动重连超时 · %1").arg(reconnect_->reason));
+        return;
+    }
+    ++reconnect_->attempts;
+    if (statusChanged) {
+        statusChanged(QStringLiteral("自动重连第 %1 次 · %2").arg(reconnect_->attempts).arg(reconnect_->reason));
+    }
+    if (reconnect_->is_cloud) {
+        openCloudInternal(reconnect_->cloud, reconnect_->cloud_device, reconnect_->diagnostics, true);
+    } else {
+        openWithKey(reconnect_->lan_host, reconnect_->lan_port, reconnect_->lan_key, true);
+    }
 }
 
 bool ViewerSession::sendFrame(const QJsonObject& message) {
@@ -311,7 +435,15 @@ void ViewerSession::handleFrame(const QJsonObject& message) {
     const auto type = message.value("type").toString();
     const auto payload = message.value("payload").toString();
     if (type == "error" || type == "ended") {
-        stop(payload.isEmpty() ? QStringLiteral("被控端已关闭连接。") : payload);
+        const bool retryable = message.value("retryable").toBool();
+        const bool transient_error = reconnect_.has_value() && type == "error"
+            && (retryable || payload == QStringLiteral("设备不可连接")
+                || payload == QStringLiteral("设备未在线或正在使用中"));
+        if ((type == "ended" && retryable) || transient_error) {
+            recover(payload.isEmpty() ? QStringLiteral("对端信令连接中断") : payload);
+        } else {
+            stop(payload.isEmpty() ? QStringLiteral("被控端已关闭连接。") : payload);
+        }
         return;
     }
 
@@ -479,14 +611,16 @@ void ViewerSession::connectionChanged(ConnectionStatus status, const char*, size
         if (status == Connected && session.state_ == State::negotiation) {
             session.transport_ready_ = true;
             session.startStreaming();
-        } else if (status == Closed || status == Failed || status == Disconnected ||
-                   status == IncorrectPassword || status == NoSuchTransmissionId || status == RemoteUnavailable) {
+        } else if (status == Closed || status == Failed || status == Disconnected) {
+            session.recover(QStringLiteral("媒体连接已断开"));
+        } else if (status == IncorrectPassword || status == NoSuchTransmissionId || status == RemoteUnavailable) {
             session.stop(QStringLiteral("媒体连接已断开，可以重新连接。"));
         }
     }, Qt::QueuedConnection);
 }
 
 void ViewerSession::startStreaming() {
+    clearReconnect();
     state_ = State::streaming;
     timeout_.stop();
     if (!diagnostics_ && !metrics_.width) timeout_.start(8000);

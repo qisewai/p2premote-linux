@@ -111,12 +111,20 @@ public:
             if (state_ == State::session) endRoom();
             else reconnect(true);
         });
+        ping_timer_.setInterval(15000);
+        connect(&ping_timer_, &QTimer::timeout, this, [this] {
+            if (socket_.state() == QAbstractSocket::ConnectedState) socket_.ping();
+        });
         socket_.setMaxAllowedIncomingMessageSize(max_packet_bytes);
         socket_.setMaxAllowedIncomingFrameSize(max_packet_bytes);
         connect(&socket_, &QWebSocket::connected, this, [this] {
             if (state_ != State::opening) return;
             if (!cloudPeerMatches(socket_.requestUrl(), socket_.sslConfiguration().peerCertificate()) ||
-                !send("listen_internet", {})) reconnect(true);
+                !send("listen_internet", {})) {
+                reconnect(true);
+                return;
+            }
+            ping_timer_.start();
         });
         connect(&socket_, &QWebSocket::textMessageReceived, this, [this](const QString& text) {
             const auto message = QJsonDocument::fromJson(text.toUtf8());
@@ -150,6 +158,7 @@ public:
             state_ = State::standby;
             retry_.stop();
             deadline_.stop();
+            ping_timer_.stop();
             if (auto* reply = std::exchange(login_reply_, nullptr)) reply->abort();
             token_.clear();
             ice_ = {};
@@ -278,6 +287,7 @@ private:
         if (state_ == State::standby || state_ == State::retry || state_ == State::locked) return;
         state_ = State::retry;
         deadline_.stop();
+        ping_timer_.stop();
         if (media_) media_->StopCloudPeer();
         socket_.abort();
         if (new_token) token_.clear();
@@ -341,7 +351,7 @@ private:
     QNetworkAccessManager network_;
     QNetworkReply* login_reply_{};
     QWebSocket socket_;
-    QTimer retry_, deadline_;
+    QTimer retry_, deadline_, ping_timer_;
     int retry_ms_{500};
     State state_{State::retry};
     std::unique_ptr<LinuxHostSession> media_;

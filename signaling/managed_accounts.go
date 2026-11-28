@@ -370,6 +370,29 @@ func validID(id string, size int) bool {
 	return err == nil && len(decoded) == size
 }
 
+func (m *managedService) hasDevice(account, deviceID string) bool {
+	if account == "" || !validID(deviceID, 18) {
+		return false
+	}
+	found := false
+	_ = m.db.View(func(tx *bolt.Tx) error {
+		devices := tx.Bucket(devicesBucket).Bucket([]byte(account))
+		if devices == nil {
+			return nil
+		}
+		cursor := devices.Cursor()
+		for key, entry := cursor.First(); key != nil; key, entry = cursor.Next() {
+			var device savedDevice
+			if json.Unmarshal(entry, &device) == nil && device.ID == deviceID {
+				found = true
+				break
+			}
+		}
+		return nil
+	})
+	return found
+}
+
 func validDeviceLabel(text string) bool {
 	return text != "" && len(text) <= 128 && strings.IndexFunc(text, unicode.IsControl) == -1
 }

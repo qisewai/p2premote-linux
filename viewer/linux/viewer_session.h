@@ -63,13 +63,32 @@ public:
     std::function<void(DecodedCursor)> cursorChanged;
 
 private:
-    enum class State { idle, challenge, authentication, approval, negotiation, streaming };
+    enum class State { idle, challenge, authentication, approval, negotiation, streaming, reconnecting };
 
     struct PeerContext {
         ViewerSession& session;
         std::uint64_t generation;
     };
 
+    struct ReconnectState {
+        bool is_cloud{};
+        CloudConnection cloud;
+        QString cloud_device;
+        bool diagnostics{};
+        QString lan_host;
+        quint16 lan_port{};
+        QByteArray lan_key;
+        QElapsedTimer window;
+        int attempts{};
+        QString reason;
+    };
+
+    void openWithKey(const QString& host, quint16 port, const QByteArray& key, bool reconnecting);
+    void openCloudInternal(CloudConnection connection, const QString& device, bool diagnostics, bool reconnecting);
+    void teardownTransport();
+    void clearReconnect();
+    void recover(const QString& reason);
+    void attemptReconnect();
     void receiveFrames();
     void handleFrame(const QJsonObject& message);
     bool sendFrame(const QJsonObject& message);
@@ -100,9 +119,15 @@ private:
     QWebSocket web_socket_;
     QTimer timeout_;
     QTimer plugin_timer_;
+    QTimer reconnect_timer_;
+    QTimer ws_ping_timer_;
     QByteArray incoming_;
     QByteArray key_;
     QByteArray expected_host_mac_;
+    QString lan_host_;
+    quint16 lan_port_{};
+    QByteArray lan_key_;
+    std::optional<ReconnectState> reconnect_;
     State state_{State::idle};
     const p2premote::native_minirtc::Api* api_{};
     PeerPtr* peer_{};

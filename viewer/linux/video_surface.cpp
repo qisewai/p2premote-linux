@@ -402,12 +402,16 @@ void main() {
     }
 
     bool event(QEvent* event) override {
-        if (event->type() == QEvent::Hide || event->type() == QEvent::WindowDeactivate) setCapture(false);
-        if (capturing_ && event->type() == QEvent::ShortcutOverride) {
+        const auto type = event->type();
+        if (type == QEvent::Hide || type == QEvent::WindowDeactivate ||
+                (type == QEvent::UngrabMouse && pressed_buttons_ != Qt::NoButton)) {
+            setCapture(false);
+        }
+        if (capturing_ && type == QEvent::ShortcutOverride) {
             event->accept();
             return true;
         }
-        if (capturing_ && event->type() == QEvent::KeyPress) {
+        if (capturing_ && type == QEvent::KeyPress) {
             keyPressEvent(static_cast<QKeyEvent*>(event));
             return true;
         }
@@ -434,19 +438,24 @@ void main() {
 
     void mousePressEvent(QMouseEvent* event) override {
         updatePointerInVideo(event->position());
-        if (!capturing_ && event->button() == Qt::LeftButton && pointer_in_video_) {
+        const auto button = event->button();
+        if (!capturing_ && button == Qt::LeftButton && pointer_in_video_) {
             setCapture(true);
         }
-        if (const auto button = pointerButton(event->button())) {
-            pressed_buttons_ |= event->button();
-            sendPointerAction(InputKind::button_down, button, event->position());
+        if (const auto code = pointerButton(button); code && !pressed_buttons_.testFlag(button) &&
+                sendPointerAction(InputKind::button_down, code, event->position())) {
+            pressed_buttons_.setFlag(button);
         }
     }
 
     void mouseReleaseEvent(QMouseEvent* event) override {
-        if (const auto button = pointerButton(event->button())) {
-            pressed_buttons_ &= ~event->button();
-            sendPointerAction(InputKind::button_up, button, event->position());
+        const auto button = event->button();
+        if (const auto code = pointerButton(button); code && pressed_buttons_.testFlag(button)) {
+            if (sendPointerAction(InputKind::button_up, code, event->position())) {
+                pressed_buttons_.setFlag(button, false);
+            } else {
+                setCapture(false);
+            }
         }
     }
 
@@ -622,7 +631,7 @@ private:
 
     void queueMove(const QPointF& pos) {
         if (!capturing_) return;
-        const auto point = normalizePoint(pos, false);
+        const auto point = normalizePoint(pos, pressed_buttons_ != Qt::NoButton);
         if (!point) return;
         if (!pending_move_ && last_move_sent_ && *last_move_sent_ == *point) return;
         pending_move_ = *point;
@@ -650,16 +659,19 @@ private:
         }
     }
 
-    void sendPointerAction(InputKind kind, std::uint16_t code, const QPointF& pos) {
-        if (!capturing_ || !session_) return;
-        const auto point = normalizePoint(pos, kind == InputKind::button_up);
-        if (!point) return;
+    bool sendPointerAction(InputKind kind, std::uint16_t code, const QPointF& pos) {
+        if (!capturing_ || !session_) return false;
+        const auto point = normalizePoint(pos, pressed_buttons_ != Qt::NoButton);
+        if (!point) return false;
         pending_move_.reset();
         move_flush_timer_.stop();
         drag_tail_timer_.stop();
-        if (session_->sendInput(kind, code, point->first, point->second)) {
-            last_move_sent_ = *point;
+        if (!session_->sendInput(kind, code, point->first, point->second)) {
+            setCapture(false);
+            return false;
         }
+        last_move_sent_ = *point;
+        return true;
     }
 
     void key(InputKind kind, QKeyEvent* event) {

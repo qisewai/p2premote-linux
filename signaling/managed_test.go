@@ -339,3 +339,192 @@ func TestManagedTURNForwardsUDPAndTCPClients(t *testing.T) {
 		})
 	}
 }
+
+func TestManagedOfflineOwnedDeviceRetryable(t *testing.T) {
+	m, err := openManagedService(filepath.Join(t.TempDir(), "retryable.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.close()
+	server := httptest.NewTLSServer(m.routes())
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type loginResult struct {
+		Token string `json:"accessToken"`
+	}
+	call := func(method, path, token string, body any, want int, response any) {
+		t.Helper()
+		var buffer bytes.Buffer
+		if body != nil {
+			if err := json.NewEncoder(&buffer).Encode(body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, method, server.URL+"/api/v2/"+path, &buffer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		reply, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reply.Body.Close()
+		if reply.StatusCode != want {
+			t.Fatalf("%s returned %d, want %d", path, reply.StatusCode, want)
+		}
+		if response != nil {
+			if err := json.NewDecoder(reply.Body).Decode(response); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	var hostAuth, viewerAuth, strangerAuth loginResult
+	call("POST", "register", "", testAccount(t, "owner", "Host"), 200, &hostAuth)
+	call("POST", "login", "", testAccount(t, "owner", "Viewer"), 200, &viewerAuth)
+	call("POST", "register", "", testAccount(t, "other", "Stranger"), 200, &strangerAuth)
+
+	var hostDevice savedDevice
+	call("POST", "devices/current", hostAuth.Token, nil, 200, &hostDevice)
+
+	wsURL := "wss" + strings.TrimPrefix(server.URL, "https") + "/signal"
+	joinAndExpectError := func(token string) message {
+		t.Helper()
+		conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+			HTTPClient: server.Client(),
+			HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.CloseNow()
+		if err := write(ctx, conn, message{Type: "join_internet", Payload: hostDevice.ID}); err != nil {
+			t.Fatal(err)
+		}
+		msg, err := read(ctx, conn)
+		if err != nil || msg.Type != "error" {
+			t.Fatalf("expected error message, got %+v (%v)", msg, err)
+		}
+		return msg
+	}
+
+	// Host is registered in DB but currently offline: same account may retry.
+	if msg := joinAndExpectError(viewerAuth.Token); !msg.Retryable {
+		t.Fatalf("offline registered device should be retryable for owner, got %+v", msg)
+	}
+	// Different account must never see Retryable=true.
+	if msg := joinAndExpectError(strangerAuth.Token); msg.Retryable {
+		t.Fatalf("offline device must not be retryable for stranger, got %+v", msg)
+	}
+	// Once deleted from account, even owner must not retry.
+	call("DELETE", "devices/"+hostDevice.ID, viewerAuth.Token, nil, 204, nil)
+	if msg := joinAndExpectError(viewerAuth.Token); msg.Retryable {
+		t.Fatalf("deleted device must not be retryable, got %+v", msg)
+	}
+}
+
+func TestSignalingPingMissTolerance(t *testing.T) {
+	origInterval := signalPingInterval
+	origTimeout := signalPingTimeout
+	origMaxMisses := signalMaxMisses
+	signalPingInterval = 50 * time.Millisecond
+	signalPingTimeout = 30 * time.Millisecond
+	signalMaxMisses = 3
+	t.Cleanup(func() {
+		signalPingInterval = origInterval
+		signalPingTimeout = origTimeout
+		signalMaxMisses = origMaxMisses
+	})
+
+	m, err := openManagedService(filepath.Join(t.TempDir(), "ping.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.close()
+	server := httptest.NewTLSServer(m.routes())
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type loginResult struct {
+		Token string `json:"accessToken"`
+	}
+	call := func(path, token string, body any, want int, response any) {
+		t.Helper()
+		var buffer bytes.Buffer
+		if body != nil {
+			if err := json.NewEncoder(&buffer).Encode(body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/v2/"+path, &buffer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		reply, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reply.Body.Close()
+		if reply.StatusCode != want {
+			t.Fatalf("%s returned %d, want %d", path, reply.StatusCode, want)
+		}
+		if response != nil {
+			if err := json.NewDecoder(reply.Body).Decode(response); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	var hostAuth, viewerAuth loginResult
+	call("register", "", testAccount(t, "owner", "Host"), 200, &hostAuth)
+	call("login", "", testAccount(t, "owner", "Viewer"), 200, &viewerAuth)
+	var hostDevice savedDevice
+	call("devices/current", hostAuth.Token, nil, 200, &hostDevice)
+
+	wsURL := "wss" + strings.TrimPrefix(server.URL, "https") + "/signal"
+	dial := func(token, kind, payload string) *websocket.Conn {
+		t.Helper()
+		conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+			HTTPClient: server.Client(),
+			HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.CloseNow() })
+		if err := write(ctx, conn, message{Type: kind, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+		return conn
+	}
+
+	host := dial(hostAuth.Token, "listen_internet", "")
+	if ready, err := read(ctx, host); err != nil || ready.Type != "ready" {
+		t.Fatalf("expected ready, got %+v (%v)", ready, err)
+	}
+
+	// Pause reading past 1 missed ping (50ms interval + 30ms timeout = 80ms) but < 3 misses.
+	time.Sleep(95 * time.Millisecond)
+
+	// Viewer joins now; reading on host drains/responds to pending pings and still receives "request".
+	viewer := dial(viewerAuth.Token, "join_internet", hostDevice.ID)
+	if waitMsg, err := read(ctx, viewer); err != nil || waitMsg.Type != "waiting" {
+		t.Fatalf("expected waiting, got %+v (%v)", waitMsg, err)
+	}
+	if reqMsg, err := read(ctx, host); err != nil || reqMsg.Type != "request" {
+		t.Fatalf("host should survive single missed ping, got %+v (%v)", reqMsg, err)
+	}
+
+	// Pause reading past 3 consecutive missed pings (> 3 * 50ms + 30ms).
+	time.Sleep(260 * time.Millisecond)
+	readCtx, cancelRead := context.WithTimeout(ctx, time.Second)
+	defer cancelRead()
+	if msg, err := read(readCtx, host); err == nil {
+		t.Fatalf("expected connection closed after 3 missed pings, got %+v", msg)
+	}
+}

@@ -292,6 +292,7 @@ struct ActiveStream {
     std::vector<std::uint8_t> bgra;
     HMONITOR monitor{};
     HWND surface{};
+    StreamFrameRate requested_frame_rate{StreamFrameRate::fps60};
     std::int64_t negotiation_start{};
     std::int64_t next_capture{};
     std::int64_t capture_interval{};
@@ -550,6 +551,7 @@ void StreamSession::Open(HMONITOR monitor, HWND surface, StreamFrameRate frame_r
     active->diagnostics = !impl_->host && connection.diagnostics;
     active->monitor = impl_->host ? ResolveValidMonitor(monitor) : monitor;
     active->surface = surface;
+    active->requested_frame_rate = frame_rate;
     active->dynamic_cadence = impl_->host && connection.DynamicCadenceEnabled();
     const auto target_fps = static_cast<unsigned>(frame_rate);
     active->capture_interval = impl_->host && NeedsCaptureRateLimit(active->monitor, target_fps) ? QpcFrequency() / target_fps : 0;
@@ -743,8 +745,7 @@ void StreamSession::Recover(std::wstring status) {
     }
     const auto now = GetTickCount64();
     if (!retry) {
-        retry.emplace(Impl::Reconnect{active.monitor, active.surface,
-            impl_->host ? static_cast<StreamFrameRate>(impl_->stats.target_fps) : StreamFrameRate::fps30,
+        retry.emplace(Impl::Reconnect{active.monitor, active.surface, active.requested_frame_rate,
             now + reconnect_window_ms, 0, 0, DesktopControl()});
     }
     const auto delay_seconds = 1u << std::min(retry->attempts, 2u);
@@ -811,7 +812,9 @@ void StreamSession::ProcessEvents() {
             Stop(winrt::to_hstring(event.payload).c_str());
             return;
         case StreamEventType::signal:
-            if (event.retryable && (event.name == "ended" || (event.name == "error" && impl_->reconnect))) {
+            if (const bool transient_retry_error = impl_->reconnect && event.name == "error"
+                    && (event.retryable || event.payload == "设备不可连接" || event.payload == "设备未在线或正在使用中");
+                (event.retryable && event.name == "ended") || transient_retry_error) {
                 Recover(winrt::to_hstring(event.payload).c_str());
                 return;
             }

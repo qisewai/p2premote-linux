@@ -35,7 +35,13 @@ func (h *hub) enterManaged(c *client, first message) (*room, error) {
 			return nil, errors.New("请在客户端连接设备")
 		}
 		r := h.deviceHosts[first.Payload]
-		if r == nil || r.host.identity.account != identity.account || r.host.identity.ctx.Err() != nil {
+		if r == nil {
+			if h.managed.hasDevice(identity.account, first.Payload) {
+				return nil, errDirectUnavailable
+			}
+			return nil, errors.New("设备不可连接")
+		}
+		if r.host.identity.account != identity.account || r.host.identity.ctx.Err() != nil {
 			return nil, errors.New("设备不可连接")
 		}
 		if r.host.identity.installation == identity.installation {
