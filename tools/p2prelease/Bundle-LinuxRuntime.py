@@ -36,16 +36,16 @@ def bundle(runtime):
 
     # Qt opens OpenSSL with dlopen. Bundle the matching libssl even if no
     # deployed ELF declares it as a link-time dependency.
-    ssl_dependencies = subprocess.check_output(["ldd", shutil.which("openssl")], text=True)
-    ssl_sources = [
-        Path(match[2])
-        for line in ssl_dependencies.splitlines()
-        if (match := RESOLVED.match(line)) and match[1] == "libssl.so.3"
-    ]
-    if not ssl_sources:
-        raise SystemExit("OpenSSL 3 is required on the build machine.")
     ssl = common_libs / "libssl.so.3"
     if not ssl.exists():
+        ssl_dependencies = subprocess.check_output(["ldd", shutil.which("openssl")], text=True)
+        ssl_sources = [
+            Path(match[2])
+            for line in ssl_dependencies.splitlines()
+            if (match := RESOLVED.match(line)) and match[1] == "libssl.so.3"
+        ]
+        if not ssl_sources:
+            raise SystemExit("OpenSSL 3 is required on the build machine.")
         shutil.copy2(ssl_sources[0], ssl)
         binaries.append(ssl)
 
@@ -73,14 +73,24 @@ def bundle(runtime):
             shutil.copy2(source, destination)
             binaries.append(destination)
 
-    # RUNPATH is evaluated independently for each object. Set it on the bundled
-    # shared libraries and Qt plugins as well as on the executables.
+    # Older portable updaters install only gui/. Keep its libraries self-contained
+    # and let the host use relative symlinks for the files it shares with the GUI.
+    for path in sorted(common_libs.iterdir()):
+        destination = gui_libs / path.name
+        if destination.exists() or destination.is_symlink():
+            continue
+        path.rename(destination)
+        path.symlink_to(os.path.relpath(destination, path.parent))
+
+    # RUNPATH is evaluated independently for each executable, library and Qt plugin.
+    binaries = list(elf_files(runtime))
     for path in binaries:
-        folders = library_paths if path.is_relative_to(gui) else (common_libs,)
-        rpath = ":".join("$ORIGIN/" + os.path.relpath(folder, path.parent) for folder in folders)
+        folder = gui_libs if path.is_relative_to(gui) else common_libs
+        rpath = "$ORIGIN/" + os.path.relpath(folder, path.parent)
         subprocess.run(["patchelf", "--set-rpath", rpath, str(path)], check=True)
+    environment.pop("LD_LIBRARY_PATH", None)
     for path in binaries:
-        output = subprocess.check_output(["ldd", str(path)], text=True)
+        output = subprocess.check_output(["ldd", str(path)], env=environment, text=True)
         if "=> not found" in output:
             raise SystemExit(f"Unresolved library in {path}:\n{output}")
 
