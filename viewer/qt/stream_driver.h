@@ -1,6 +1,6 @@
 #pragma once
 
-#include <p2premote/core_api.h>
+#include <p2premote/core_api_v2.h>
 
 #include <QString>
 #include <QTimer>
@@ -31,9 +31,9 @@ class StreamDriver final : public QObject {
     Q_OBJECT
 
 public:
-    StreamDriver(p2p_account* account, bool host, const wchar_t* device, void* video_parent,
+    StreamDriver(p2p_account* account, bool host, const QString& device, const p2p_render_target_v2& target,
         const LaunchOptions& options, QObject* parent, bool diagnostics = false);
-    StreamDriver(const LanConnectOptions& lan, void* video_parent,
+    StreamDriver(const LanConnectOptions& lan, const p2p_render_target_v2& target,
         const LaunchOptions& options, QObject* parent);
     ~StreamDriver() override;
 
@@ -42,7 +42,7 @@ public:
     void resize(bool drawable);
 
 signals:
-    void changed(const p2p_stream_snapshot_v1& snapshot);
+    void changed(const p2p_stream_snapshot_v2& snapshot);
     void uiCommandsReady();
     void failed(const QString& message);
 

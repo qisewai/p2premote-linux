@@ -6,11 +6,7 @@
 #include "frameless_chrome.h"
 #include "plugin_dialog.h"
 #include "settings_dialog.h"
-#if defined(Q_OS_WIN)
-#include "../connection_overlay.h"
-#else
-#include "../linux/video_surface.h"
-#endif
+#include "video_surface_adapter.h"
 
 #include <QAbstractButton>
 #include <QActionGroup>
@@ -40,10 +36,6 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
-#if defined(Q_OS_WIN)
-#include <windows.h>
-#endif
-
 #include <map>
 
 #include <algorithm>
@@ -53,33 +45,6 @@
 #include <utility>
 
 namespace {
-
-#if defined(Q_OS_WIN)
-class VideoContainer final : public QWidget {
-public:
-    explicit VideoContainer(std::function<void()> toggle, QWidget* parent)
-        : QWidget(parent), toggle_(std::move(toggle)) {
-        setObjectName(QStringLiteral("video"));
-        setAttribute(Qt::WA_DontCreateNativeAncestors);
-        setAttribute(Qt::WA_NativeWindow);
-        setFocusPolicy(Qt::NoFocus);
-    }
-
-protected:
-    bool nativeEvent(const QByteArray& type, void* message, qintptr* result) override {
-        const auto* msg = static_cast<MSG*>(message);
-        if (msg->message == P2P_VIDEO_FULLSCREEN_MESSAGE) {
-            toggle_();
-            *result = 0;
-            return true;
-        }
-        return QWidget::nativeEvent(type, message, result);
-    }
-
-private:
-    std::function<void()> toggle_;
-};
-#endif
 
 constexpr int kTabStripHeight = 40;
 constexpr int kBridgeHeight = 4;
@@ -450,25 +415,17 @@ public:
             layout->addWidget(share_, 0, Qt::AlignHCenter);
             layout->addStretch();
         } else {
-#if defined(Q_OS_WIN)
-            video_ = new VideoContainer(std::move(on_fullscreen), this);
-#else
-            video_ = createVideoSurface(std::move(on_fullscreen), this);
-#endif
+            surface_ = createVideoSurfaceAdapter(std::move(on_fullscreen), this);
+            video_ = surface_->widget();
             video_->installEventFilter(this);
             layout->addWidget(video_, 1);
         }
 
-#if defined(Q_OS_WIN)
-        const auto parent_handle = video_ ? reinterpret_cast<void*>(video_->winId()) : nullptr;
-#else
-        const auto parent_handle = static_cast<void*>(video_);
-#endif
+        const auto render_target = surface_ ? surface_->target() : p2p_render_target_v2{};
         if (lan) {
-            driver_ = std::make_unique<StreamDriver>(*lan, parent_handle, options, this);
+            driver_ = std::make_unique<StreamDriver>(*lan, render_target, options, this);
         } else {
-            const auto target = device.toStdWString();
-            driver_ = std::make_unique<StreamDriver>(account, false, target.c_str(), parent_handle, options, this, diagnostics_);
+            driver_ = std::make_unique<StreamDriver>(account, false, device, render_target, options, this, diagnostics_);
         }
         if (video_) {
             stage_overlay_ = new ConnectionStageOverlay(this);
@@ -477,12 +434,10 @@ public:
             connect(stage_overlay_, &ConnectionStageOverlay::reconnectRequested, this, [this] {
                 if (!active() && handle()) start();
             });
-#if !defined(Q_OS_WIN)
-            setVideoFirstFrameCallback(video_, [this] {
+            surface_->setFirstFrameCallback([this] {
                 first_frame_received_ = true;
                 updateStageOverlay();
             });
-#endif
         }
         if (!driver_->handle()) {
             status_text_ = QString::fromWCharArray(p2p_last_error());
@@ -509,7 +464,7 @@ public:
         });
 
         dialogs_ = new PluginDialogManager(dialog_parent, this);
-        connect(driver_.get(), &StreamDriver::changed, this, [this](const p2p_stream_snapshot_v1& snap) {
+        connect(driver_.get(), &StreamDriver::changed, this, [this](const p2p_stream_snapshot_v2& snap) {
             onSnapshot(snap);
         });
         connect(driver_.get(), &StreamDriver::uiCommandsReady, this, [this] {
@@ -519,9 +474,7 @@ public:
     }
 
     ~RemoteSessionTab() override {
-#if !defined(Q_OS_WIN)
-        if (video_) setVideoFirstFrameCallback(video_, {});
-#endif
+        if (surface_) surface_->setFirstFrameCallback({});
         if (dialogs_) dialogs_->closeAll();
     }
 
@@ -696,14 +649,7 @@ private:
         if (!video_ || !AppSettings::instance().data().show_diagnostics || !playing() || !video_->isVisible() ||
             window()->isMinimized()) {
             overlay_timer_.stop();
-#if defined(Q_OS_WIN)
-            overlays_.Hide();
-#else
-            if (video_ && overlays_visible_) {
-                setVideoOverlays(video_, {});
-                overlays_visible_ = false;
-            }
-#endif
+            if (surface_) surface_->hideOverlays();
             return;
         }
         if (!overlay_timer_.isActive()) overlay_timer_.start(100);
@@ -724,16 +670,11 @@ private:
             item.font_size = std::clamp(settings.value(QStringLiteral("font_size")).toInt(item.font_size), 9, 20);
             item.opacity = static_cast<std::uint8_t>(std::clamp(settings.value(QStringLiteral("opacity")).toInt(item.opacity), 0, 255));
         }
-#if defined(Q_OS_WIN)
-        overlays_.Render(reinterpret_cast<HWND>(video_->winId()), width_, height_, items);
-#else
-        setVideoOverlays(video_, std::move(items));
-        overlays_visible_ = true;
-#endif
+        surface_->renderOverlays(width_, height_, std::move(items));
         overlay_dirty_ = false;
     }
 
-    void onSnapshot(const p2p_stream_snapshot_v1& snapshot) {
+    void onSnapshot(const p2p_stream_snapshot_v2& snapshot) {
         state_ = snapshot.state;
         if (!active() || state_ == P2P_RECONNECTING) first_frame_received_ = false;
         if (share_) share_->setEnabled(playing());
@@ -748,10 +689,10 @@ private:
             if (!active()) dialogs_->closeAll();
         }
 
-        raw_status_text_ = snapshot.status ? QString::fromWCharArray(snapshot.status) : QString{};
+        raw_status_text_ = snapshot.status ? QString::fromUtf8(snapshot.status) : QString{};
         status_text_ = raw_status_text_;
         if (snapshot.input_ready && !waitingForVideo()) status_text_ += QStringLiteral("  ·  点击画面接管键鼠，F12 释放");
-        notice_text_ = *snapshot.plugin_notice ? QString::fromWCharArray(snapshot.plugin_notice) : QString{};
+        notice_text_ = *snapshot.plugin_notice ? QString::fromUtf8(snapshot.plugin_notice) : QString{};
 
         updateStageOverlay();
         updateConnectionOverlays();
@@ -763,6 +704,7 @@ private:
     bool diagnostics_{};
     std::function<void()> on_changed_;
     QPushButton* share_{};
+    std::unique_ptr<VideoSurfaceAdapter> surface_;
     QWidget* video_{};
     ConnectionStageOverlay* stage_overlay_{};
     bool first_frame_received_{};
@@ -784,11 +726,6 @@ private:
     QString status_text_{QStringLiteral("正在连接设备…")};
     QString notice_text_;
     QTimer overlay_timer_;
-#if defined(Q_OS_WIN)
-    p2premote::viewer::OverlayManager overlays_;
-#else
-    bool overlays_visible_{};
-#endif
     std::uint64_t overlay_revision_{};
     bool overlay_dirty_{};
     std::vector<p2premote::PluginOverlayItem> overlay_items_;

@@ -20,6 +20,33 @@ if(NOT P2PREMOTE_LINUX_MINIRTC_INCLUDE OR NOT P2PREMOTE_LINUX_MINIRTC_LIBRARY)
     message(FATAL_ERROR "Build the Linux MiniRTC library with bash tools/minirtc_probe/Build-Linux.sh first.")
 endif()
 
+add_library(p2premote_linux_core STATIC
+    viewer/linux/account.cpp
+    viewer/linux/cloud_connection.cpp
+    viewer/linux/audio.cpp
+    viewer/linux/cursor_shape.cpp
+    viewer/linux/file_clipboard.cpp
+    viewer/linux/lan_discovery.cpp
+    viewer/linux/plugin_platform.cpp
+    viewer/linux/stream.cpp
+    viewer/linux/video_surface.cpp
+    viewer/linux/viewer_session.cpp
+    core/src/plugin_host.cpp
+    core/src/pty_session_posix.cpp
+    proto/input_protocol.cpp
+    proto/plugin_protocol.cpp)
+target_compile_features(p2premote_linux_core PRIVATE cxx_std_20)
+target_compile_options(p2premote_linux_core PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(p2premote_linux_core PRIVATE
+    P2PREMOTE_LINUX_PLUGIN_DIR="${CMAKE_INSTALL_FULL_DATADIR}/p2premote/plugins")
+target_include_directories(p2premote_linux_core PUBLIC core/include
+    PRIVATE proto/include core/src tools/minirtc_probe viewer/linux)
+target_include_directories(p2premote_linux_core SYSTEM PRIVATE
+    "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
+target_link_libraries(p2premote_linux_core PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets
+    OpenSSL::Crypto PkgConfig::LINUX_LUA PkgConfig::LINUX_PULSE PkgConfig::LINUX_FUSE3
+    "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}" util dl)
+
 qt6_add_executable(p2premote_linux_viewer
     viewer/qt/main.cpp
     viewer/qt/account_window.cpp
@@ -37,24 +64,11 @@ qt6_add_executable(p2premote_linux_viewer
     viewer/qt/terminal_widget.cpp
     viewer/qt/update_client.cpp
     viewer/qt/update_client.h
-    viewer/linux/account.cpp
-    viewer/linux/cloud_connection.cpp
-    viewer/linux/audio.cpp
     viewer/linux/credentials.cpp
-    viewer/linux/cursor_shape.cpp
-    viewer/linux/file_clipboard.cpp
-    viewer/linux/lan_discovery.cpp
-    viewer/linux/plugin_platform.cpp
     viewer/linux/service_control.cpp
     viewer/linux/single_instance.cpp
-    viewer/linux/stream.cpp
     viewer/linux/update_apply_linux.cpp
-    viewer/linux/video_surface.cpp
-    viewer/linux/viewer_session.cpp
-    core/src/plugin_host.cpp
-    core/src/pty_session_posix.cpp
-    proto/input_protocol.cpp
-    proto/plugin_protocol.cpp)
+    viewer/linux/video_surface_adapter.cpp)
 set_target_properties(p2premote_linux_viewer PROPERTIES AUTOMOC ON)
 if(P2PREMOTE_BUILD_LINUX_HOST)
     set_target_properties(p2premote_linux_viewer PROPERTIES OUTPUT_NAME p2premote)
@@ -62,17 +76,13 @@ endif()
 set(p2premote_gui_dir "${P2PREMOTE_LINUX_APP_DIR}/gui")
 set_target_properties(p2premote_linux_viewer PROPERTIES INSTALL_RPATH "\$ORIGIN/lib;\$ORIGIN/../lib")
 target_compile_definitions(p2premote_linux_viewer PRIVATE
-    P2PREMOTE_LINUX_HOST_EXECUTABLE="${CMAKE_INSTALL_FULL_LIBEXECDIR}/p2premote/p2premote_linux_host"
-    P2PREMOTE_LINUX_PLUGIN_DIR="${CMAKE_INSTALL_FULL_DATADIR}/p2premote/plugins")
+    P2PREMOTE_LINUX_HOST_EXECUTABLE="${CMAKE_INSTALL_FULL_LIBEXECDIR}/p2premote/p2premote_linux_host")
 target_compile_features(p2premote_linux_viewer PRIVATE cxx_std_20)
 target_compile_options(p2premote_linux_viewer PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(p2premote_linux_viewer PRIVATE
     proto/include core/include core/src tools/minirtc_probe viewer/linux)
-target_include_directories(p2premote_linux_viewer SYSTEM PRIVATE
-    "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
-target_link_libraries(p2premote_linux_viewer PRIVATE p2premote_update_core Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::OpenGLWidgets OpenSSL::Crypto
-    PkgConfig::LINUX_LUA PkgConfig::LINUX_SECRET PkgConfig::LINUX_PULSE PkgConfig::LINUX_FUSE3 ghostty-vt::ghostty-vt
-    "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}" util dl)
+target_link_libraries(p2premote_linux_viewer PRIVATE p2premote_linux_core p2premote_update_core
+    Qt6::Widgets Qt6::Network OpenSSL::Crypto PkgConfig::LINUX_SECRET ghostty-vt::ghostty-vt)
 if(TARGET Qt6::QOffscreenIntegrationPlugin)
     qt6_import_plugins(p2premote_linux_viewer INCLUDE Qt6::QOffscreenIntegrationPlugin)
 endif()
@@ -120,6 +130,12 @@ else()
 endif()
 
 enable_testing()
+add_executable(linux_core_api_v2_test viewer/linux/core_api_v2_test.cpp)
+target_compile_features(linux_core_api_v2_test PRIVATE cxx_std_20)
+target_link_libraries(linux_core_api_v2_test PRIVATE p2premote_linux_core Qt6::Network)
+add_test(NAME linux_core_api_v2_test COMMAND linux_core_api_v2_test)
+set_tests_properties(linux_core_api_v2_test PROPERTIES TIMEOUT 10)
+
 foreach(protocol IN ITEMS input plugin)
     add_executable(${protocol}_protocol_test
         "proto/${protocol}_protocol.cpp" "proto/${protocol}_protocol_test.cpp")

@@ -1,26 +1,23 @@
 #pragma once
+#include "desktop_target.h"
+
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 
 namespace p2premote::linux_host {
 
-class ClipboardRelay {
+class ClipboardBridge {
 public:
-    using FrameVt = std::function<unsigned()>;
-    using Send = std::function<bool(unsigned, std::string_view)>;
-    ClipboardRelay(FrameVt vt, Send send);
-    void Receive(std::string_view bytes);
-
-private:
-    void Run(std::stop_token stop, const FrameVt& vt, const Send& send);
-    std::mutex mutex_;
-    std::deque<std::string> pending_;
-    size_t queued_bytes_{};
-    bool attached_{}, failed_{};
-    std::jthread worker_; // join before destroying the queue
+    using ActiveTarget = std::function<std::optional<DesktopTarget>()>;
+    using Send = std::function<bool(const DesktopTarget&, std::string_view)>;
+    virtual ~ClipboardBridge() = default;
+    virtual void Receive(std::string_view bytes) = 0;
 };
+
+std::unique_ptr<ClipboardBridge> CreateClipboardBridge(ClipboardBridge::ActiveTarget target, ClipboardBridge::Send send);
 
 } // namespace p2premote::linux_host

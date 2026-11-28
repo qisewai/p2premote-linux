@@ -163,7 +163,7 @@ void DesktopInput::Run(std::stop_token stop) {
     while (!stop.stop_requested()) {
         std::unique_lock lock(mutex_);
         const auto queued = [this] { return !pending_.empty(); };
-        if (keys_.any() || buttons_.any()) {
+        if (pressed_.Any()) {
             changed_.wait_until(lock, stop, deadline, queued);
         } else {
             changed_.wait(lock, stop, queued);
@@ -178,7 +178,7 @@ void DesktopInput::Run(std::stop_token stop) {
 
         EnsureDesktop(false);
         const auto now = Clock::now();
-        if ((keys_.any() || buttons_.any()) && now >= deadline) {
+        if (pressed_.Any() && now >= deadline) {
             Release();
             deadline = now + std::chrono::milliseconds(input_heartbeat_ms);
         }
@@ -226,7 +226,7 @@ void DesktopInput::Apply(const InputCommand& command) {
             if (!scan || (scan > 0xff && (scan & 0xff00) != 0xe000)) return;
             const bool extended = scan > 0xff || IsExtendedVirtualKey(key);
             scans[i] = static_cast<std::uint16_t>((scan & 0xff) | (extended ? 0x100 : 0));
-            if (keys_.test(scans[i]) || (GetAsyncKeyState(key) & 0x8000)) return;
+            if (pressed_.keys.test(scans[i]) || (GetAsyncKeyState(key) & 0x8000)) return;
             events[count++] = Key(scans[i], false);
         }
         for (auto i = command.units.size(); i > 0; --i) events[count++] = Key(scans[i - 1], true);
@@ -239,7 +239,7 @@ void DesktopInput::Apply(const InputCommand& command) {
             // Enter and Tab need physical key events to behave as typed input.
             if (unit == '\n' || unit == '\r' || unit == '\t') {
                 const auto scan = static_cast<std::uint16_t>(MapVirtualKeyExW(unit == '\t' ? VK_TAB : VK_RETURN, MAPVK_VK_TO_VSC, layout));
-                if (!scan || keys_.test(scan)) return;
+                if (!scan || pressed_.keys.test(scan)) return;
                 events[count++] = Key(scan, false);
                 events[count++] = Key(scan, true);
             } else {
@@ -256,7 +256,7 @@ void DesktopInput::Apply(const InputCommand& command) {
         auto pressed = std::min<std::size_t>(sent, command.units.size());
         while (pressed > 0) {
             const auto scan = scans[--pressed];
-            if (!Inject(Key(scan, true))) keys_.set(scan);
+            if (!Inject(Key(scan, true))) pressed_.keys.set(scan);
         }
     } else if (sent % 2) {
         auto up = events[sent];
@@ -274,17 +274,17 @@ void DesktopInput::Apply(const InputPacket& input) {
         Release();
         return;
     case InputKind::key_down:
-        if (inject_one(Key(input.code, false))) keys_.set(input.code);
+        if (inject_one(Key(input.code, false))) pressed_.keys.set(input.code);
         return;
     case InputKind::key_up:
-        if (keys_.test(input.code) && inject_one(Key(input.code, true))) keys_.reset(input.code);
+        if (pressed_.keys.test(input.code) && inject_one(Key(input.code, true))) pressed_.keys.reset(input.code);
         return;
     case InputKind::move: {
         const auto position = BuildMove(input);
         const bool injected = position && inject_one(*position);
         if (injected) {
             latest_move_ = input;
-            if (buttons_.any()) last_drag_tick_.store(GetTickCount64(), std::memory_order_relaxed);
+            if (pressed_.Dragging()) last_drag_tick_.store(GetTickCount64(), std::memory_order_relaxed);
         }
         if (trace_) trace_->Pointer(injected ? "input_injected" : "input_injection_failed", input);
         return;
@@ -294,7 +294,7 @@ void DesktopInput::Apply(const InputPacket& input) {
     case InputKind::wheel: {
         const bool wheel = input.kind == InputKind::wheel;
         const bool down = input.kind == InputKind::button_down;
-        if (!wheel && buttons_.test(input.code) == down) return;
+        if (!wheel && pressed_.buttons.test(input.code) == down) return;
         const auto flags = wheel ? MOUSEEVENTF_WHEEL : (down ? button_down[input.code] : button_up[input.code]);
         const auto delta = wheel ? static_cast<DWORD>(std::bit_cast<std::int16_t>(input.code)) : 0;
         const auto action = Mouse(flags, 0, 0, delta);
@@ -306,7 +306,7 @@ void DesktopInput::Apply(const InputPacket& input) {
             }
             if (trace_) trace_->Pointer(injected ? "input_injected" : "input_injection_failed", input);
             if (injected && !wheel) {
-                buttons_.set(input.code, down);
+                pressed_.buttons.set(input.code, down);
                 if (down) last_drag_tick_.store(GetTickCount64(), std::memory_order_relaxed);
             }
             // Motion can overtake an ordered control on the other channel. Apply
@@ -317,7 +317,7 @@ void DesktopInput::Apply(const InputPacket& input) {
                 latest_move_.reset();
             }
         } else if (input.kind == InputKind::button_up && inject_one(action)) {
-            buttons_.reset(input.code);
+            pressed_.buttons.reset(input.code);
         }
         return;
     }
@@ -332,12 +332,8 @@ void DesktopInput::Apply(const InputPacket& input) {
 void DesktopInput::Release() {
     latest_move_.reset();
     last_drag_tick_.store(0, std::memory_order_relaxed);
-    for (std::uint16_t scan = 1; scan < keys_.size(); ++scan) {
-        if (keys_.test(scan) && Inject(Key(scan, true))) keys_.reset(scan);
-    }
-    for (std::size_t button = 1; button < buttons_.size(); ++button) {
-        if (buttons_.test(button) && Inject(Mouse(button_up[button]))) buttons_.reset(button);
-    }
+    pressed_.ReleaseKeys([this](std::uint16_t scan) { return Inject(Key(scan, true)); });
+    pressed_.ReleaseButtons([this](std::uint16_t button) { return Inject(Mouse(button_up[button])); });
 }
 
 } // namespace p2premote

@@ -128,11 +128,7 @@ private:
     QPointer<SettingsDialog> settings_dialog_;
     TitleBar* title_bar_{};
     QPushButton* account_btn_{};
-#if defined(Q_OS_WIN)
-    QWinEventNotifier account_event_;
-#else
     QTimer account_event_;
-#endif
     QTimer refresh_;
     QTimer status_clear_timer_;
     Request request_{Request::none};
@@ -145,9 +141,7 @@ private:
     std::jthread service_status_thread_;
     std::uint64_t service_status_generation_{};
     bool service_status_pending_{};
-#if defined(Q_OS_LINUX)
     bool service_operation_pending_{};
-#endif
     QString loaded_server_;
     bool quitting_{};
     bool viewing_local_{true};

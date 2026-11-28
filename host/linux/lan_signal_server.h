@@ -32,7 +32,7 @@ public:
     };
 
     LanSignalServer(std::string display_name, std::uint16_t port, std::string access_code,
-        Callbacks callbacks, std::uint16_t discovery_port = kDefaultDiscoveryPort);
+        Callbacks callbacks, std::uint16_t discovery_port = kDefaultDiscoveryPort, bool allow_control = true);
     ~LanSignalServer();
 
     LanSignalServer(const LanSignalServer&) = delete;
@@ -55,6 +55,7 @@ private:
     std::uint16_t port_{};
     std::string access_code_;
     std::uint16_t discovery_port_{};
+    bool allow_control_{};
     std::mutex mutex_;
     std::deque<std::pair<std::string, std::string>> outbound_;
     std::atomic_bool end_client_{false};

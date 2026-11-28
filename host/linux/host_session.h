@@ -1,10 +1,11 @@
 #pragma once
 
-#include "capture_backend.h"
+#include "backend_factory.h"
+#include "desktop_access.h"
 #include "desktop_audio.h"
 #include "clipboard_relay.h"
 #include "lan_signal_server.h"
-#include "uinput_injector.h"
+#include "video_frame_conversion.h"
 
 #include "managed_api.h"
 #include <p2premote/input_protocol.h>
@@ -29,6 +30,7 @@ struct HostConfig {
     unsigned fps{30};
     int max_height{1080};
     std::string log_dir;
+    BackendPreference backend{BackendPreference::automatic};
 };
 
 class LinuxHostSession final {
@@ -39,7 +41,7 @@ public:
         std::function<void(std::string_view)> status;
     };
 
-    LinuxHostSession(HostConfig config, std::unique_ptr<LinuxCaptureBackend> capturer,
+    LinuxHostSession(HostConfig config, std::unique_ptr<DesktopSession> desktop,
         std::optional<CloudCallbacks> cloud = std::nullopt);
     ~LinuxHostSession();
 
@@ -47,6 +49,7 @@ public:
     LinuxHostSession& operator=(const LinuxHostSession&) = delete;
 
     bool Valid() const noexcept { return capture_thread_.joinable(); }
+    bool SupportsControl() const noexcept { return desktop_access_.CanInject(); }
     bool PeerActive() const noexcept { return peer_active_.load(std::memory_order_acquire); }
     bool StartCloudPeer(TurnMode turn);
     bool ReceiveCloudSignal(const std::string& payload);
@@ -75,12 +78,13 @@ private:
     HostConfig config_;
     std::optional<CloudCallbacks> cloud_;
     const p2premote::native_minirtc::Api* api_{};
-    std::unique_ptr<LinuxCaptureBackend> capturer_;
-    UinputInjector injector_;
+    std::unique_ptr<DesktopSession> desktop_;
+    DesktopAccess desktop_access_;
 
     std::mutex clipboard_mutex_;
-    std::unique_ptr<ClipboardRelay> clipboard_;
-    unsigned ClipboardVt();
+    std::unique_ptr<ClipboardBridge> clipboard_;
+    std::optional<DesktopTarget> ClipboardTarget();
+    bool DesktopCurrentLocked() const;
     std::mutex peer_mutex_;
     PeerPtr* peer_{};
     int console_lock_{-1};
@@ -92,15 +96,11 @@ private:
     std::atomic<std::uint64_t> peer_generation_{};
 
     std::mutex input_mutex_;
-    InputReceiveState input_state_;
-    std::uint64_t last_input_ms_{};
-    bool frame_sent_{};
     bool speaker_enabled_{};
     std::uint64_t audio_revision_{};
 
     std::unique_ptr<LanSignalServer> server_;
-    std::vector<std::uint8_t> scaled_bgra_;
-    std::vector<std::uint8_t> nv12_;
+    Nv12FrameBuffer nv12_;
     std::jthread capture_thread_;
     std::jthread audio_thread_;
 };

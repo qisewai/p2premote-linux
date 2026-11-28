@@ -40,7 +40,7 @@ bool clear(const QByteArray& key) {
 
 Credentials::~Credentials() { OPENSSL_cleanse(password.data(), password.size() * sizeof(wchar_t)); }
 
-std::optional<Credentials> readCredentials(const QString& server) {
+std::optional<Credentials> SecretStore::readAccount(const QString& server) {
     const auto secret = lookup("account:" + server.toUtf8());
     if (!secret) return {};
     const auto value = QString::fromUtf8(secret.get());
@@ -49,19 +49,21 @@ std::optional<Credentials> readCredentials(const QString& server) {
     return Credentials{server, value.left(separator), value.mid(separator + 1).toStdWString(), true};
 }
 
-bool saveCredentials(const Credentials& credentials) {
+bool SecretStore::saveAccount(const Credentials& credentials) {
     auto secret = credentials.user.toUtf8() + '\n' + QString::fromStdWString(credentials.password).toUtf8();
     const auto saved = store("account:" + credentials.server.toUtf8(), secret);
     OPENSSL_cleanse(secret.data(), secret.size());
     return saved;
 }
 
-bool deleteCredentials(const QString& server) { return clear("account:" + server.toUtf8()); }
+bool SecretStore::deleteAccount(const QString& server) { return clear("account:" + server.toUtf8()); }
 
-QString readLanSecret(const QString& key) {
+QString SecretStore::readLan(const QString& key) {
     const auto secret = lookup("lan:" + key.toUtf8());
     return secret ? QString::fromUtf8(secret.get()) : QString{};
 }
 
-bool saveLanSecret(const QString& key, const QString& value) { return store("lan:" + key.toUtf8(), value.toUtf8()); }
-bool deleteLanSecret(const QString& key) { return clear("lan:" + key.toUtf8()); }
+bool SecretStore::saveLan(const QString& key, const QString& value) { return store("lan:" + key.toUtf8(), value.toUtf8()); }
+bool SecretStore::deleteLan(const QString& key) { return clear("lan:" + key.toUtf8()); }
+
+void SecretStore::eraseTemporary(QByteArray& secret) { OPENSSL_cleanse(secret.data(), secret.size()); }

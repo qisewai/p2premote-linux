@@ -1,3 +1,4 @@
+#include <p2premote/session_policy.h>
 #include <p2premote/stream_session.h>
 
 #include "audio_engine.h"
@@ -30,9 +31,7 @@
 namespace p2premote {
 namespace {
 
-constexpr ULONGLONG reconnect_window_ms = 30'000;
 constexpr ULONGLONG close_grace_ms = 1'000;
-constexpr ULONGLONG video_settings_timeout_ms = 3'000;
 constexpr std::int64_t first_frame_timeout_seconds = 8;
 
 bool DiagnosticsEnabled() {
@@ -241,11 +240,6 @@ private:
 };
 
 struct ActiveStream {
-    struct VideoRequest {
-        InputPacket packet;
-        ULONGLONG deadline;
-        bool retried{};
-    };
     explicit ActiveStream(std::shared_ptr<LatencyTrace> trace)
         : events(std::make_shared<StreamEvents>(std::move(trace))) {}
 
@@ -304,11 +298,10 @@ struct ActiveStream {
     bool host_registered{};
     ULONGLONG transport_close_deadline{};
     StreamQuality quality{StreamQuality::p1080};
-    std::optional<VideoRequest> video_request;
+    VideoSettingsNegotiation video_settings{{1'500, 3'000, 2}};
     VideoBitratePreset plugin_bitrate{VideoBitratePreset::automatic};
     std::wstring plugin_notice;
     ULONGLONG plugin_notice_until{};
-    std::optional<std::pair<StreamQuality, std::uint32_t>> settled_video_settings;
     StreamInputMode input_mode{};
     bool input_ready{};
     bool cursor_requested{};
@@ -450,9 +443,7 @@ struct StreamSession::Impl {
         HMONITOR monitor{};
         HWND surface{};
         StreamFrameRate frame_rate{};
-        ULONGLONG deadline{};
-        ULONGLONG next_attempt{};
-        unsigned attempts{};
+        ReconnectWindow window;
         bool desktop{};
     };
 
@@ -613,13 +604,13 @@ void StreamSession::Approve(StreamInputMode input) {
 
 void StreamSession::SetQuality(StreamQuality quality) {
     impl_->requested_quality = quality;
-    if (impl_->active) impl_->active->settled_video_settings.reset();
+    if (impl_->active) impl_->active->video_settings.RequestAgain();
     UpdateVideoSettings();
 }
 
 void StreamSession::SetVideoBitratePreset(VideoBitratePreset preset) {
     impl_->requested_bitrate = preset;
-    if (impl_->active) impl_->active->settled_video_settings.reset();
+    if (impl_->active) impl_->active->video_settings.RequestAgain();
     UpdateVideoSettings();
 }
 
@@ -679,25 +670,9 @@ void StreamSession::UpdateVideoSettings() {
     const auto preset = impl_->requested_bitrate == VideoBitratePreset::automatic ? active.plugin_bitrate : impl_->requested_bitrate;
     const auto bitrate = VideoBitrateLimit(preset);
 
-    if (active.video_request) {
-        auto& request = *active.video_request;
-        if (now < request.deadline) {
-            if (!request.retried && now + video_settings_timeout_ms / 2 >= request.deadline) {
-                request.retried = active.rtc->SendVideoSettings(request.packet);
-            }
-            return;
-        }
-        active.settled_video_settings = std::pair{static_cast<StreamQuality>(request.packet.code),
-            VideoSettingsBitrate(request.packet)};
-        active.video_request.reset();
+    if (active.video_settings.Update({resolution, bitrate}, now, active.outgoing_input_sequence,
+            [&](const InputPacket& request) { return active.rtc->SendVideoSettings(request); })) {
         impl_->detail = L"画质设置未获确认";
-    }
-    if (active.settled_video_settings == std::pair{resolution, bitrate}) return;
-
-    const auto request = VideoSettingsPacket(InputKind::set_video_settings, resolution, bitrate,
-        ++active.outgoing_input_sequence, now);
-    if (active.rtc->SendVideoSettings(request)) {
-        active.video_request = ActiveStream::VideoRequest{request, now + video_settings_timeout_ms};
     }
 }
 
@@ -746,10 +721,9 @@ void StreamSession::Recover(std::wstring status) {
     const auto now = GetTickCount64();
     if (!retry) {
         retry.emplace(Impl::Reconnect{active.monitor, active.surface, active.requested_frame_rate,
-            now + reconnect_window_ms, 0, 0, DesktopControl()});
+            ReconnectWindow(now), DesktopControl()});
     }
-    const auto delay_seconds = 1u << std::min(retry->attempts, 2u);
-    retry->next_attempt = now + delay_seconds * 1'000;
+    retry->window.Schedule(now);
     Close(std::move(status), false);
     impl_->state = StreamState::reconnecting;
 }
@@ -811,13 +785,18 @@ void StreamSession::ProcessEvents() {
         case StreamEventType::error:
             Stop(winrt::to_hstring(event.payload).c_str());
             return;
-        case StreamEventType::signal:
-            if (const bool transient_retry_error = impl_->reconnect && event.name == "error"
-                    && (event.retryable || event.payload == "设备不可连接" || event.payload == "设备未在线或正在使用中");
-                (event.retryable && event.name == "ended") || transient_retry_error) {
+        case StreamEventType::signal: {
+            if (ClassifySignalTermination(event.name, event.payload, event.retryable, impl_->reconnect.has_value())
+                == SignalTermination::reconnect) {
                 Recover(winrt::to_hstring(event.payload).c_str());
                 return;
             }
+            auto signal_stage = ViewerSignalStage::inactive;
+            if (!impl_->host && impl_->state == StreamState::waiting) signal_stage = ViewerSignalStage::approval;
+            else if (active.rtc && (impl_->state == StreamState::negotiating || impl_->state == StreamState::streaming)) {
+                signal_stage = ViewerSignalStage::media;
+            }
+            const auto signal = ClassifyViewerSignal(signal_stage, event.name);
             if (event.name == "ended" && impl_->host && impl_->connection.auto_control) {
                 const auto monitor = active.monitor;
                 const auto frame_rate = static_cast<StreamFrameRate>(impl_->stats.target_fps);
@@ -850,10 +829,11 @@ void StreamSession::ProcessEvents() {
                 if (active.diagnostics) Approve(StreamInputMode::view_only);
                 else if (impl_->connection.auto_control) Approve(StreamInputMode::desktop);
                 else impl_->detail = L"收到同账号设备连接请求，请确认授权";
-            } else if (!impl_->host && event.name == "waiting" && impl_->state == StreamState::waiting) {
+            } else if (signal == ViewerSignal::waiting) {
                 impl_->detail = L"等待 Host 确认";
-            } else if (!impl_->host && event.name == "accepted" && impl_->state == StreamState::waiting) {
-                if (active.diagnostics != (event.payload == "diagnostics")) {
+            } else if (signal == ViewerSignal::accepted) {
+                const auto mode = ParseSessionMode(event.payload);
+                if (mode == SessionMode::invalid || active.diagnostics != (mode == SessionMode::diagnostics)) {
                     Stop(L"对端未接受所选连接模式");
                     return;
                 }
@@ -869,15 +849,15 @@ void StreamSession::ProcessEvents() {
                 active.device = CreateD3d11Device(true);
                 active.overlays = std::make_shared<PluginOverlays>();
                 active.rtc = std::make_unique<MiniRtcCall>(false, active.events, impl_->connection,
-                    event.payload == "control", 60, active.device.get(), active.overlays);
-            } else if (active.rtc && event.name == "minirtc" &&
-                (impl_->state == StreamState::negotiating || impl_->state == StreamState::streaming)) {
+                    mode == SessionMode::control, 60, active.device.get(), active.overlays);
+            } else if (signal == ViewerSignal::minirtc) {
                 active.rtc->ReceiveSignal(event.payload);
             } else {
                 Stop(L"收到与当前会话状态不符的信令");
                 return;
             }
             break;
+        }
         case StreamEventType::minirtc_signal:
             if (MiniRtcCall::IsSessionSignal(event.payload)) {
                 active.signal->Send("minirtc", std::move(event.payload));
@@ -1003,14 +983,11 @@ void StreamSession::ProcessEvents() {
                 active.rtc->SendVideoSettings(VideoSettingsPacket(InputKind::video_settings_reply, resolution,
                     static_cast<std::uint32_t>(applied), settings.sequence, settings.sent_ms));
             } else {
-                if (settings.kind != InputKind::video_settings_reply || !active.video_request) break;
-                const auto& request = active.video_request->packet;
-                if (settings.sequence != request.sequence || settings.code != request.code) break;
-                active.settled_video_settings = std::pair{resolution, VideoSettingsBitrate(request)};
-                active.video_request.reset();
-                if (bitrate) {
-                    active.quality = resolution;
-                    impl_->stats.video_bitrate_limit_bps = static_cast<int>(bitrate);
+                const auto reply = active.video_settings.Acknowledge(settings);
+                if (!reply) break;
+                if (reply->applied_bitrate) {
+                    active.quality = reply->settings.quality;
+                    impl_->stats.video_bitrate_limit_bps = static_cast<int>(reply->applied_bitrate);
                     impl_->detail = L"正在接收视频";
                 } else {
                     impl_->detail = L"画质设置未生效";
@@ -1203,7 +1180,7 @@ void StreamSession::ProcessPluginActions() {
         case PluginAction::Kind::bitrate:
             if (active.plugin_bitrate != action.bitrate) {
                 active.plugin_bitrate = action.bitrate;
-                if (impl_->requested_bitrate == VideoBitratePreset::automatic) active.settled_video_settings.reset();
+                if (impl_->requested_bitrate == VideoBitratePreset::automatic) active.video_settings.RequestAgain();
             }
             break;
         }
@@ -1424,13 +1401,13 @@ void StreamSession::Present() {
 void StreamSession::Tick() {
     const auto now_ms = GetTickCount64();
     if (auto& retry = impl_->reconnect) {
-        if (now_ms >= retry->deadline) {
+        if (retry->window.Expired(now_ms)) {
             Stop(L"自动重连超时 · " + impl_->detail);
             return;
         }
         if (impl_->state == StreamState::reconnecting) {
-            if (now_ms >= retry->next_attempt) {
-                ++retry->attempts;
+            if (retry->window.Due(now_ms)) {
+                retry->window.BeginAttempt();
                 Open(retry->monitor, retry->surface, retry->frame_rate);
             }
             return;
@@ -1489,10 +1466,10 @@ std::wstring StreamSession::Status() const {
     if (const auto& retry = impl_->reconnect) {
         if (impl_->state == StreamState::reconnecting) {
             const auto now = GetTickCount64();
-            const auto seconds = retry->next_attempt > now ? (retry->next_attempt - now + 999) / 1'000 : 0;
+            const auto seconds = retry->window.SecondsRemaining(now);
             return L"将在 " + std::to_wstring(seconds) + L" 秒后重连 · " + impl_->detail;
         }
-        return L"自动重连第 " + std::to_wstring(retry->attempts) + L" 次 · " + impl_->detail;
+        return L"自动重连第 " + std::to_wstring(retry->window.Attempts()) + L" 次 · " + impl_->detail;
     }
     const auto* active = impl_->active.get();
     if (impl_->state == StreamState::streaming && active && !active->diagnostics && !active->transport_close_deadline) {

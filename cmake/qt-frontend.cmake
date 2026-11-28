@@ -32,6 +32,7 @@ add_executable(p2premote_qt WIN32
     viewer/qt/plugin_menu.cpp
     viewer/qt/plugin_menu.h
     viewer/qt/remote_window.cpp
+    viewer/qt/video_surface_adapter_win.cpp
     viewer/qt/remote_window.h
     viewer/connection_overlay.cpp
     viewer/qt/service_control.cpp

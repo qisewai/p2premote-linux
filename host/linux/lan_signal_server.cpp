@@ -1,3 +1,5 @@
+#include <p2premote/session_policy.h>
+
 #include "lan_signal_server.h"
 
 #include <arpa/inet.h>
@@ -345,22 +347,22 @@ std::string ExtractJsonString(std::string_view json, std::string_view key) {
 std::string RelayMiniRtcJson(std::string_view payload, bool from_host) {
     if (payload.size() > 64 * 1024) throw std::runtime_error("MiniRTC signaling payload too large");
     const auto kind = ExtractJsonString(payload, "type");
+    const auto relay = ClassifyLanMedia(kind, from_host);
     std::string out = "{\"transmission_id\":\"host\"";
-    if (!from_host && (kind == "join_transmission" || kind == "user_join_transmission")) {
+    if (relay == LanMediaSignal::join) {
         out += ",\"type\":\"user_join_transmission\",\"status\":\"success\",\"user_id\":\"viewer\"}";
         return out;
     }
-    if ((from_host && kind == "offer") || (!from_host && kind == "answer") ||
-        kind == "new_candidate" || kind == "new_candidate_mid") {
+    if (relay != LanMediaSignal::invalid) {
         out += ",\"type\":\"" + JsonEscape(kind) + "\"";
         out += std::string(",\"remote_user_id\":\"") + (from_host ? "host" : "viewer") + "\"";
-        if (kind == "new_candidate_mid") {
+        if (relay == LanMediaSignal::candidate_mid) {
             out += ",\"mid\":\"" + JsonEscape(ExtractJsonString(payload, "mid")) + "\"";
             out += ",\"candidate\":\"" + JsonEscape(ExtractJsonString(payload, "candidate")) + "\"";
         } else {
             out += ",\"sdp\":\"" + JsonEscape(ExtractJsonString(payload, "sdp")) + "\"";
         }
-        if (kind == "new_candidate" || kind == "new_candidate_mid") {
+        if (relay == LanMediaSignal::candidate || relay == LanMediaSignal::candidate_mid) {
             const auto ufrag = ExtractJsonString(payload, "ufrag");
             if (!ufrag.empty()) {
                 out += ",\"ufrag\":\"" + JsonEscape(ufrag) + "\"";
@@ -373,9 +375,10 @@ std::string RelayMiniRtcJson(std::string_view payload, bool from_host) {
 }
 
 LanSignalServer::LanSignalServer(std::string display_name, std::uint16_t port, std::string access_code,
-    Callbacks callbacks, std::uint16_t discovery_port)
+    Callbacks callbacks, std::uint16_t discovery_port, bool allow_control)
     : callbacks_(std::move(callbacks)), display_name_(std::move(display_name)),
-      port_(port ? port : kDefaultLanPort), access_code_(std::move(access_code)), discovery_port_(discovery_port) {}
+      port_(port ? port : kDefaultLanPort), access_code_(std::move(access_code)), discovery_port_(discovery_port),
+      allow_control_(allow_control) {}
 
 LanSignalServer::~LanSignalServer() {
     Stop();
@@ -428,7 +431,7 @@ void LanSignalServer::Run(std::stop_token stop, int listen_fd) {
     const auto& display_name = display_name_;
     const auto port = port_;
     const auto discovery_port = discovery_port_;
-    const auto key = Sha256("p2premote-lan-v1:" + access_code_);
+    const auto key = Sha256(lan_access_key_prefix + access_code_);
     const auto instance_id = RandomHex(8);
 
     int yes = 1;
@@ -614,8 +617,9 @@ void LanSignalServer::Run(std::stop_token stop, int listen_fd) {
             const auto& auth = frames.front();
             const auto viewer_nonce = ExtractJsonString(auth, "nonce");
             const auto viewer_hmac = ExtractJsonString(auth, "hmac");
-            if (ExtractJsonString(auth, "type") != "auth" || viewer_nonce.empty() || viewer_nonce.size() > 128 ||
-                !ConstantTimeEqual(viewer_hmac, HmacSha256Hex(key, candidate.nonce + ":" + viewer_nonce + ":viewer"))) {
+            if (ExtractJsonString(auth, "type") != "auth" || viewer_nonce.size() > 128 ||
+                !VerifyLanProof(candidate.nonce, viewer_nonce, LanProofRole::viewer, viewer_hmac,
+                    [&](std::string_view bytes) { return HmacSha256Hex(key, bytes); }, ConstantTimeEqual)) {
                 if (failures.size() < 4096 || failures.contains(candidate.ip)) {
                     auto& fail = failures[candidate.ip];
                     const auto failed_at = NowMs();
@@ -627,8 +631,9 @@ void LanSignalServer::Run(std::stop_token stop, int listen_fd) {
                 return true;
             }
 
-            const auto host_mac = HmacSha256Hex(key, candidate.nonce + ":" + viewer_nonce + ":host");
-            const std::string accept = "{\"type\":\"accepted\",\"payload\":\"control\",\"hmac\":\"" + host_mac + "\"}";
+            const auto host_mac = HmacSha256Hex(key, LanProofMessage(candidate.nonce, viewer_nonce, LanProofRole::host));
+            const auto mode = allow_control_ ? "control" : "view";
+            const std::string accept = std::string{"{\"type\":\"accepted\",\"payload\":\""} + mode + "\",\"hmac\":\"" + host_mac + "\"}";
             if (SendFramedJson(candidate.socket.Get(), accept, 0)) {
                 failures.erase(candidate.ip);
                 client_fd = std::move(candidate.socket);

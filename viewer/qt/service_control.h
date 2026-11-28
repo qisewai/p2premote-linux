@@ -26,19 +26,15 @@ struct HostServiceInfo {
     int monitor_index{};
     QString user;
     QString device_id;
-#if defined(Q_OS_WIN)
     bool needs_upgrade{};
     QString foreground_lease;
-#endif
     QString status;
     QString lan_status;
-#if defined(Q_OS_LINUX)
     bool enabled{};
     bool cloud_installed{};
     bool needs_cleanup{};
     bool cloud_online{};
     bool operator==(const HostServiceInfo&) const = default;
-#endif
 };
 
 struct HostServiceConfig {
@@ -56,26 +52,23 @@ struct HostServiceConfig {
     int monitor_index{};
 };
 
+enum class HostConfigUpdate { install, lan, cloud, monitor, unattended, upgrade };
+
+class HostServiceAdapter {
+public:
+    static bool available();
+    static std::optional<HostServiceInfo> query();
+    static void configure(QObject* owner, HostConfigUpdate update, bool enabled, const HostServiceConfig& config,
+        std::function<void(QString)> completed);
+
+#if defined(Q_OS_WIN)
+    // The Windows SCM and foreground worker have separate status and command paths.
+    static HostServiceInfo queryWorker(HostServiceInfo info);
+    static bool configureSync(HostConfigUpdate update, bool enabled, const HostServiceConfig& config, QString* error);
+#endif
+};
+
+#if defined(Q_OS_WIN)
 bool isProcessElevated();
-bool serviceExecutableExists();
-HostServiceInfo queryHostServiceInfo();
-HostServiceInfo queryHostWorkerStatus(HostServiceInfo info);
-
-enum class HostConfigUpdate { install, lan, cloud, monitor };
-bool installHostService(const HostServiceConfig& config, HostConfigUpdate update, QString* error);
-bool upgradeHostService(QString* error);
-bool updateHostUnattended(bool enabled, QString* error);
-bool disableHostCloud(QString* error);
-bool uninstallHostService(QString* error = nullptr);
 bool relaunchClientElevated(QString* error = nullptr);
-
-#if defined(Q_OS_LINUX)
-std::optional<HostServiceInfo> queryLinuxHostServiceInfo();
-void changeLinuxUnattended(QObject* owner, bool enabled, std::function<void(QString)> completed);
-void manageLinuxHostService(QObject* owner, bool enable, std::uint16_t port, const QString& code,
-    std::function<void(QString)> completed);
-void manageLinuxCloudService(QObject* owner, const std::optional<HostServiceConfig>& config,
-    std::function<void(QString)> completed);
-void manageLinuxMasterService(QObject* owner, bool install, const HostServiceConfig& config,
-    std::function<void(QString)> completed);
 #endif

@@ -707,7 +707,7 @@ AccountWindow::AccountWindow(LaunchOptions options)
     resize(960, 640);
     setMinimumSize(820, 540);
 
-    lan_host_code_ = readLanSecret(QStringLiteral("HostAccessCode"));
+    lan_host_code_ = SecretStore::readLan(QStringLiteral("HostAccessCode"));
 
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
@@ -780,14 +780,8 @@ AccountWindow::AccountWindow(LaunchOptions options)
         return;
     }
 
-#if defined(Q_OS_WIN)
-    account_event_.setHandle(p2p_account_event(account_.get()));
-    account_event_.setEnabled(true);
-    connect(&account_event_, &QWinEventNotifier::activated, this, &AccountWindow::completeRequest);
-#else
     account_event_.setInterval(50);
     connect(&account_event_, &QTimer::timeout, this, &AccountWindow::completeRequest);
-#endif
     refresh_.setInterval(3000);
     connect(&refresh_, &QTimer::timeout, this, &AccountWindow::refresh);
 
@@ -829,11 +823,7 @@ AccountWindow::AccountWindow(LaunchOptions options)
 AccountWindow::~AccountWindow() {
     service_refresh_.stop();
     if (service_status_thread_.joinable()) service_status_thread_.join();
-#if defined(Q_OS_WIN)
-    account_event_.setEnabled(false);
-#else
     account_event_.stop();
-#endif
     closeSessions();
 }
 
@@ -1026,7 +1016,7 @@ QWidget* AccountWindow::makeLocalPage(QWidget* parent) {
     host_hdr->addWidget(upgrade_service_);
     connect(upgrade_service_, &QPushButton::clicked, this, [this] {
         QString error;
-        if (upgradeHostService(&error)) {
+        if (HostServiceAdapter::configureSync(HostConfigUpdate::upgrade, true, {}, &error)) {
             ++service_status_generation_;
             setStatus(QStringLiteral("被控服务已更新。"));
         } else {
@@ -1444,7 +1434,7 @@ void AccountWindow::makeLoginPopup() {
     fields->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
 
     QSettings settings;
-    server_ = new QLineEdit(settings.value(QStringLiteral("lastServer"), winText(p2p_default_server())).toString(), login_popup_);
+    server_ = new QLineEdit(settings.value(QStringLiteral("lastServer"), QString::fromUtf8(p2p_default_server_utf8())).toString(), login_popup_);
     server_->setObjectName(QStringLiteral("server"));
     server_->setMaxLength(256);
     server_->setPlaceholderText(QStringLiteral("https://"));
@@ -1497,7 +1487,7 @@ void AccountWindow::makeLoginPopup() {
     connect(remember_, &QCheckBox::clicked, this, [this](bool checked) {
         if (checked) return;
         QSettings().setValue(QStringLiteral("autoLogin"), false);
-        if (!deleteCredentials(server_->text().trimmed())) {
+        if (!SecretStore::deleteAccount(server_->text().trimmed())) {
             if (login_popup_status_) {
                 login_popup_status_->setText(QStringLiteral("无法删除已保存的凭据。"));
                 login_popup_status_->show();
@@ -1831,13 +1821,13 @@ void AccountWindow::updateLocalPage() {
 #if defined(Q_OS_LINUX)
     const bool lan_checked = host_enabled && (service_info_.lan_enabled || service_info_.enabled);
     const bool lan_active = ready && lan_checked;
-    const bool service_available = serviceExecutableExists() || service_info_.installed;
+    const bool service_available = HostServiceAdapter::available() || service_info_.installed;
     const bool master_enabled = service_available && !service_operation_pending_;
     const bool service_controls_enabled = master_enabled && !service_info_.needs_cleanup;
 #else
     const bool lan_checked = service_lan_active;
     const bool lan_active = service_lan_active;
-    const bool service_available = serviceExecutableExists() || service_info_.installed;
+    const bool service_available = HostServiceAdapter::available() || service_info_.installed;
     const bool master_enabled = service_available;
     const bool service_controls_enabled = master_enabled;
     if (upgrade_service_) upgrade_service_->setVisible(host_enabled && service_info_.needs_upgrade);
@@ -1926,7 +1916,7 @@ void AccountWindow::updateLocalPage() {
         } else if (!service_available) {
             local_host_desc_->setText(QStringLiteral("未找到 Linux 被控服务程序或系统授权工具（pkexec）"));
         } else if (any_controlled) {
-            local_host_desc_->setText(QStringLiteral("[系统服务] 远程主控已接入，支持 Xorg 登录界面与桌面控制"));
+            local_host_desc_->setText(QStringLiteral("[系统服务] 远程主控已接入，正在控制本机"));
         } else if (host_enabled) {
             local_host_desc_->setText(service_info_.unattended
                 ? QStringLiteral("[系统服务] 无人值守模式已开启（退出软件或开机登录界面仍可被控）；关闭开关将移除服务")
@@ -2083,6 +2073,8 @@ void AccountWindow::updateControls() {
         cloud_refresh_btn_->setEnabled(!changing_account && !add_device_after_refresh_);
     }
     if (login_popup_) login_popup_->setEnabled(!busy);
+    if (busy && !account_event_.isActive()) account_event_.start();
+    if (!busy) account_event_.stop();
 
 #if defined(Q_OS_WIN)
     const bool host_enabled = service_info_.installed;
@@ -2114,8 +2106,6 @@ void AccountWindow::updateControls() {
             : QStringLiteral("未安装被控服务"));
     }
 #else
-    if (busy && !account_event_.isActive()) account_event_.start();
-    if (!busy) account_event_.stop();
     const bool host_enabled = service_info_.installed;
     const bool receiving = host_enabled && !service_info_.needs_cleanup && service_info_.cloud_enabled;
     cloud_host_section_->setVisible(signed_in || receiving);
@@ -2163,7 +2153,7 @@ void AccountWindow::setHostServiceEnabled(bool enabled) {
     QString error;
     if (!enabled) {
         setStatus(QStringLiteral("正在停止并移除被控系统服务（请在弹出的 UAC 窗口确认）…"));
-        if (!uninstallHostService(&error)) {
+        if (!HostServiceAdapter::configureSync(HostConfigUpdate::install, false, {}, &error)) {
             setStatus(error, true);
             updateControls();
             return;
@@ -2210,7 +2200,7 @@ void AccountWindow::setHostServiceEnabled(bool enabled) {
     ++service_status_generation_;
     updateControls();
     setStatus(enabled ? QStringLiteral("正在安装并启动被控系统服务…") : QStringLiteral("正在停止并移除被控系统服务…"));
-    manageLinuxMasterService(this, enabled, config, [this, enabled, has_cloud](const QString& error) {
+    HostServiceAdapter::configure(this, HostConfigUpdate::install, enabled, config, [this, enabled, has_cloud](const QString& error) {
         service_operation_pending_ = false;
         if (error.isEmpty()) {
             if (!enabled) {
@@ -2241,20 +2231,6 @@ void AccountWindow::setUnattendedEnabled(bool enabled) {
         updateLocalPage();
         return;
     }
-#if defined(Q_OS_WIN)
-    QString error;
-    if (!updateHostUnattended(enabled, &error)) {
-        setStatus(error, true);
-        updateControls();
-        return;
-    }
-    ++service_status_generation_;
-    service_info_.unattended = enabled;
-    refreshServiceStatus();
-    setStatus(enabled
-        ? QStringLiteral("已开启无人值守模式（退出软件或开机登录界面仍允许被控）。")
-        : QStringLiteral("已关闭无人值守模式（退出软件后被控服务将自动休眠断网）。"));
-#else
     if (service_operation_pending_) {
         updateLocalPage();
         return;
@@ -2262,7 +2238,7 @@ void AccountWindow::setUnattendedEnabled(bool enabled) {
     service_operation_pending_ = true;
     ++service_status_generation_;
     updateControls();
-    changeLinuxUnattended(this, enabled, [this, enabled](const QString& error) {
+    HostServiceAdapter::configure(this, HostConfigUpdate::unattended, enabled, {}, [this, enabled](const QString& error) {
         service_operation_pending_ = false;
         if (error.isEmpty()) {
             service_info_.unattended = enabled;
@@ -2275,7 +2251,6 @@ void AccountWindow::setUnattendedEnabled(bool enabled) {
         updateControls();
         refreshServiceStatus();
     });
-#endif
 }
 
 void AccountWindow::startClientAliveBeacon() {
@@ -2348,7 +2323,7 @@ void AccountWindow::startLanHostFromCli(const QString& code, std::uint16_t port)
     lan_host_port_ = port ? port : P2P_LAN_DEFAULT_PORT;
     if (!code.isEmpty()) {
         lan_host_code_ = code;
-        saveLanSecret(QStringLiteral("HostAccessCode"), code);
+        SecretStore::saveLan(QStringLiteral("HostAccessCode"), code);
     }
     const bool has_cloud = active_credentials_ && p2p_account_device_id(account_.get()) != nullptr;
     QString error;
@@ -2392,13 +2367,16 @@ void AccountWindow::changeLinuxHostService(bool enabled, QString code) {
     service_operation_pending_ = true;
     ++service_status_generation_;
     updateLocalPage();
-    manageLinuxHostService(this, enabled, lan_host_port_, code, [this, enabled, code](const QString& error) {
+    HostServiceConfig config;
+    config.lan_port = lan_host_port_;
+    config.lan_access_code = code.toStdWString();
+    HostServiceAdapter::configure(this, HostConfigUpdate::lan, enabled, config, [this, enabled, code](const QString& error) {
         service_operation_pending_ = false;
         if (error.isEmpty()) {
             service_info_.enabled = enabled;
             if (enabled) {
                 lan_host_code_ = code;
-                saveLanSecret(QStringLiteral("HostAccessCode"), lan_host_code_);
+                SecretStore::saveLan(QStringLiteral("HostAccessCode"), lan_host_code_);
             } else {
                 service_info_.running = service_info_.cloud_enabled;
                 service_info_.lan_enabled = false;
@@ -2468,7 +2446,7 @@ void AccountWindow::editLanAccessCode() {
     if (dialog.exec() == QDialog::Accepted) {
 #if defined(Q_OS_WIN)
         lan_host_code_ = next_code;
-        saveLanSecret(QStringLiteral("HostAccessCode"), lan_host_code_);
+        SecretStore::saveLan(QStringLiteral("HostAccessCode"), lan_host_code_);
         if (service_info_.installed && service_info_.lan_enabled) {
             QString error;
             if (!installOrUpdateHostService(HostConfigUpdate::lan, true, false, &error)) {
@@ -2539,7 +2517,7 @@ void AccountWindow::openLanConnectDialog() {
     // Section 2: Direct connection parameters
     const QString initial_host = QSettings().value(QStringLiteral("lan/lastTarget")).toString();
     const QString initial_code = !initial_host.isEmpty()
-        ? readLanSecret(QStringLiteral("Peer/") + initial_host) : QString{};
+        ? SecretStore::readLan(QStringLiteral("Peer/") + initial_host) : QString{};
 
     auto* form = new QFormLayout;
     form->setHorizontalSpacing(14);
@@ -2658,7 +2636,7 @@ void AccountWindow::openLanConnectDialog() {
         chosen_name = item->data(device_name_role).toString();
         chosen_port = static_cast<std::uint16_t>(item->data(lan_port_role).toInt());
         host_edit->setText(addr);
-        const auto saved = readLanSecret(QStringLiteral("Peer/") + addr);
+        const auto saved = SecretStore::readLan(QStringLiteral("Peer/") + addr);
         if (!saved.isEmpty()) code_edit->setText(saved);
         else code_edit->clear();
         code_edit->setFocus();
@@ -2670,7 +2648,7 @@ void AccountWindow::openLanConnectDialog() {
         chosen_name = item->data(device_name_role).toString();
         chosen_port = static_cast<std::uint16_t>(item->data(lan_port_role).toInt());
         host_edit->setText(addr);
-        const auto saved = readLanSecret(QStringLiteral("Peer/") + addr);
+        const auto saved = SecretStore::readLan(QStringLiteral("Peer/") + addr);
         if (!saved.isEmpty()) {
             code_edit->setText(saved);
             go->click();
@@ -2713,8 +2691,8 @@ void AccountWindow::openLanConnectDialog() {
             port = static_cast<std::uint16_t>(parsed);
         }
         QSettings().setValue(QStringLiteral("lan/lastTarget"), host);
-        if (remember_cb->isChecked()) saveLanSecret(QStringLiteral("Peer/") + host, code);
-        else deleteLanSecret(QStringLiteral("Peer/") + host);
+        if (remember_cb->isChecked()) SecretStore::saveLan(QStringLiteral("Peer/") + host, code);
+        else SecretStore::deleteLan(QStringLiteral("Peer/") + host);
 
         result = {host.toStdWString(), port, code.toStdWString()};
         display_name = (!chosen_name.isEmpty() && host == chosen_addr) ? chosen_name : host;
@@ -2741,7 +2719,7 @@ void AccountWindow::loadCredentials() {
     const auto server = server_->text().trimmed();
     if (server.isEmpty() || server == loaded_server_) return;
     loaded_server_ = server;
-    if (auto saved = readCredentials(server)) {
+    if (auto saved = SecretStore::readAccount(server)) {
         user_->setText(saved->user);
         password_->setText(QString::fromStdWString(saved->password));
         remember_->setChecked(true);
@@ -2751,11 +2729,14 @@ void AccountWindow::loadCredentials() {
 void AccountWindow::signIn(bool create) {
     if (request_ != Request::none || p2p_account_signed_in(account_.get())) return;
     pending_.emplace(server_->text().trimmed(), user_->text(), password_->text().toStdWString(), remember_->isChecked());
-    const auto endpoint = pending_->server.toStdWString();
-    const auto user = pending_->user.toStdWString();
-    if (p2p_account_login(account_.get(), endpoint.c_str(), user.c_str(), pending_->password.c_str(),
-        create, options_.compatible_http, options_.relay_only) != P2P_OK) {
-        const auto err = winText(p2p_last_error());
+    const auto endpoint = pending_->server.toUtf8();
+    const auto user = pending_->user.toUtf8();
+    auto secret = password_->text().toUtf8();
+    const auto result = p2p_account_login_v2(account_.get(), endpoint.constData(), user.constData(), secret.constData(),
+        create, options_.compatible_http, options_.relay_only);
+    SecretStore::eraseTemporary(secret);
+    if (result != P2P_OK) {
+        const auto err = QString::fromUtf8(p2p_last_error_utf8());
         if (login_popup_status_ && login_popup_ && login_popup_->isVisible()) {
             login_popup_status_->setText(err);
             login_popup_status_->show();
@@ -2836,12 +2817,12 @@ void AccountWindow::removeSelectedDevice() {
 
 void AccountWindow::completeRequest() {
     const auto registered_device = winText(p2p_account_device_id(account_.get()));
-    const auto result = p2p_account_complete(account_.get());
+    const auto result = p2p_account_poll_events(account_.get());
     if (result == P2P_PENDING) return;
     const auto request = std::exchange(request_, Request::none);
     if (result == P2P_OK) {
         if (request == Request::login) {
-            const bool saved = pending_->remember && saveCredentials(*pending_);
+            const bool saved = pending_->remember && SecretStore::saveAccount(*pending_);
             QSettings settings;
             settings.setValue(QStringLiteral("lastServer"), pending_->server);
             settings.setValue(QStringLiteral("autoLogin"), saved);
@@ -3213,7 +3194,7 @@ void AccountWindow::openAgentAudit() {
 }
 
 void AccountWindow::refreshServiceStatus() {
-    auto status = queryHostServiceInfo();
+    auto status = HostServiceAdapter::query().value_or(HostServiceInfo{});
     if (status.running != service_info_.running || status.installed != service_info_.installed) {
         ++service_status_generation_;
         service_status_age_.invalidate();
@@ -3227,7 +3208,7 @@ void AccountWindow::refreshServiceStatus() {
     service_status_pending_ = true;
     const auto generation = service_status_generation_;
     service_status_thread_ = std::jthread([this, generation, status = std::move(status)]() mutable {
-        auto info = queryHostWorkerStatus(std::move(status));
+        auto info = HostServiceAdapter::queryWorker(std::move(status));
         QMetaObject::invokeMethod(this, [this, generation, info = std::move(info)]() mutable {
             service_status_pending_ = false;
             if (generation != service_status_generation_) return;
@@ -3277,7 +3258,7 @@ bool AccountWindow::installOrUpdateHostService(HostConfigUpdate update, bool ena
     if (enable_lan) {
         if (lan_host_code_.size() < 6 || lan_host_code_.size() > 32) {
             lan_host_code_ = generateDefaultAccessCode();
-            saveLanSecret(QStringLiteral("HostAccessCode"), lan_host_code_);
+            SecretStore::saveLan(QStringLiteral("HostAccessCode"), lan_host_code_);
         }
         config.lan_enabled = true;
         config.lan_port = lan_host_port_ ? lan_host_port_ : static_cast<std::uint16_t>(P2P_LAN_DEFAULT_PORT);
@@ -3286,7 +3267,7 @@ bool AccountWindow::installOrUpdateHostService(HostConfigUpdate update, bool ena
 
     setStatus(QStringLiteral("正在更新被控系统服务（请在弹出的 UAC 窗口确认）…"));
 
-    if (!installHostService(config, update, error)) {
+    if (!HostServiceAdapter::configureSync(update, true, config, error)) {
         refreshServiceStatus();
         updateControls();
         return false;
@@ -3304,7 +3285,7 @@ void AccountWindow::syncCloudHostIfEnabled(bool enable_cloud, std::function<void
     }
     QString error;
     const bool ok = enable_cloud ? installOrUpdateHostService(HostConfigUpdate::cloud, false, true, &error)
-                                 : disableHostCloud(&error);
+                                 : HostServiceAdapter::configureSync(HostConfigUpdate::cloud, false, {}, &error);
     if (ok && !enable_cloud) {
         ++service_status_generation_;
         service_info_.cloud_enabled = false;
@@ -3349,7 +3330,7 @@ void AccountWindow::changeLinuxCloudReceiving(bool enabled, std::function<void(b
     service_operation_pending_ = true;
     ++service_status_generation_;
     updateControls();
-    manageLinuxCloudService(this, config, [this, enabled, device, completed = std::move(completed)](const QString& error) {
+    HostServiceAdapter::configure(this, HostConfigUpdate::cloud, enabled, config.value_or(HostServiceConfig{}), [this, enabled, device, completed = std::move(completed)](const QString& error) {
         service_operation_pending_ = false;
         if (error.isEmpty()) {
             service_info_.cloud_enabled = enabled;
@@ -3371,7 +3352,7 @@ void AccountWindow::refreshServiceStatus() {
     const auto generation = service_status_generation_;
     service_status_pending_ = true;
     service_status_thread_ = std::jthread([this, generation] {
-        const auto info = queryLinuxHostServiceInfo();
+        const auto info = HostServiceAdapter::query();
         QMetaObject::invokeMethod(this, [this, generation, info = std::move(info)] {
             service_status_pending_ = false;
             if (generation != service_status_generation_) {

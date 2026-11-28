@@ -11,6 +11,7 @@
 #include <winrt/Windows.Foundation.Collections.h>
 
 #include <p2premote/plugin_protocol.h>
+#include <p2premote/core_api_v2.h>
 
 using namespace p2premote;
 using namespace p2premote::abi;
@@ -127,7 +128,8 @@ struct p2p_stream {
             return 0;
         } else if ((message == WM_KEYDOWN || message == WM_KEYUP) && wparam == VK_F11) {
             if (message == WM_KEYDOWN && !(lparam & (1L << 30))) {
-                PostMessageW(GetParent(window), P2P_VIDEO_FULLSCREEN_MESSAGE, 0, 0);
+                if (self.fullscreen) self.fullscreen(self.fullscreen_context);
+                else if (self.legacy_fullscreen) PostMessageW(GetParent(window), P2P_VIDEO_FULLSCREEN_MESSAGE, 0, 0);
             }
             return 0;
         } else {
@@ -150,10 +152,14 @@ struct p2p_stream {
         return DefSubclassProc(window, message, wparam, lparam);
     }
 
-    Apartment apartment{winrt::apartment_type::single_threaded};
+    WinrtApartment apartment{winrt::apartment_type::single_threaded};
     bool host;
     bool diagnostics;
     bool poll_cursor;
+    bool legacy_fullscreen{true};
+    void (*fullscreen)(void*){};
+    void* fullscreen_context{};
+    std::string status_utf8, codec_utf8, notice_utf8, ice_protocol_utf8;
     StreamSession session;
     ViewerInput input;
     HWND surface{};
@@ -228,6 +234,71 @@ p2p_stream* p2p_stream_create_lan(int32_t host, void* video_parent, const p2p_la
         stream = new p2p_stream(host != 0, std::move(connection), static_cast<HWND>(video_parent));
     });
     return stream;
+}
+
+namespace {
+
+void* VideoParent(const p2p_render_target_v2* target) {
+    if (!target || (target->kind == P2P_RENDER_TARGET_NONE && !target->native_target)) return nullptr;
+    if (target->kind != P2P_RENDER_TARGET_WIN32_WINDOW || !target->native_target) {
+        throw std::invalid_argument("此平台不支持指定的视频渲染目标");
+    }
+    return reinterpret_cast<void*>(target->native_target);
+}
+
+p2p_stream* WithRenderer(p2p_stream* stream, const p2p_render_target_v2* target) {
+    if (stream) {
+        stream->legacy_fullscreen = false;
+        if (target) {
+            stream->fullscreen = target->request_fullscreen;
+            stream->fullscreen_context = target->context;
+        }
+    }
+    return stream;
+}
+
+} // namespace
+
+p2p_stream* p2p_stream_create_v2(const p2p_account* account, int32_t host, const char* device,
+    const p2p_render_target_v2* target, const p2p_connection_options_v2* options) {
+    try {
+        const auto parent = VideoParent(target);
+        const auto remote = FromUtf8(device);
+        if (!options) return WithRenderer(p2p_stream_create(account, host, remote.c_str(), parent, nullptr), target);
+        const auto ice_trace = FromUtf8(options->ice_trace_directory);
+        const auto latency_trace = FromUtf8(options->latency_trace_directory);
+        const p2p_connection_options_v1 legacy{ice_trace.c_str(), latency_trace.c_str(), options->stun_url,
+            options->stun_only, options->auto_control, options->diagnostics};
+        return WithRenderer(p2p_stream_create(account, host, remote.c_str(), parent, &legacy), target);
+    } catch (...) {
+        ReportException();
+        return nullptr;
+    }
+}
+
+p2p_stream* p2p_stream_create_lan_v2(int32_t host, const p2p_render_target_v2* target,
+    const p2p_lan_options_v2* options) {
+    try {
+        const auto parent = VideoParent(target);
+        const auto& opt = Required(options);
+        const auto address = FromUtf8(opt.host_address), code = FromUtf8(opt.access_code);
+        const auto ice_trace = FromUtf8(opt.ice_trace_directory), latency_trace = FromUtf8(opt.latency_trace_directory);
+        const p2p_lan_options_v1 legacy{address.c_str(), opt.port, code.c_str(), opt.auto_control,
+            ice_trace.c_str(), latency_trace.c_str()};
+        return WithRenderer(p2p_stream_create_lan(host, parent, &legacy), target);
+    } catch (...) {
+        ReportException();
+        return nullptr;
+    }
+}
+
+int32_t p2p_stream_stop_v2(p2p_stream* stream, const char* reason) {
+    try {
+        const auto converted = FromUtf8(reason);
+        return p2p_stream_stop(stream, reason ? converted.c_str() : nullptr);
+    } catch (...) {
+        return ReportException();
+    }
 }
 
 struct p2p_lan_scanner {
@@ -427,6 +498,28 @@ int32_t p2p_stream_dispatch(p2p_stream* stream, uint32_t kind) {
     });
 }
 
+int32_t p2p_stream_poll_events(p2p_stream* stream, p2p_stream_events_v2* events) {
+    static_assert(P2P_STREAM_EVENT_SESSION == (1u << P2P_WAIT_SESSION) &&
+        P2P_STREAM_EVENT_CAPTURE == (1u << P2P_WAIT_CAPTURE) &&
+        P2P_STREAM_EVENT_PRESENT == (1u << P2P_WAIT_PRESENT) &&
+        P2P_STREAM_EVENT_INPUT == (1u << P2P_WAIT_INPUT));
+    if (!stream || !events) return Guard([&] { Required(stream); Required(events); });
+    *events = {};
+    for (uint32_t kind = P2P_WAIT_SESSION; kind <= P2P_WAIT_INPUT; ++kind) {
+        if (const auto handle = p2p_stream_wait_handle(stream, kind)) {
+            const auto waited = WaitForSingleObject(handle, 0);
+            if (waited == WAIT_FAILED) return Guard([] { winrt::throw_last_error(); });
+            if (waited != WAIT_OBJECT_0) continue;
+            const auto result = p2p_stream_dispatch(stream, kind);
+            if (result != P2P_OK) return result;
+            events->ready |= 1u << kind;
+        }
+    }
+    events->state = p2p_stream_state(stream);
+    events->input_ready = p2p_stream_input_ready(stream);
+    return P2P_OK;
+}
+
 int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* snapshot) {
     return Guard([&] {
         auto& state = Required(stream);
@@ -445,6 +538,24 @@ int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* snapshot
             stats.video_loss_fraction.value_or(-1), stats.capture_to_submit_ms, stats.draw_to_present_ms,
             stats.packet_send_queue_ms.value_or(-1), stats.decoded_frame_wait_ms.value_or(-1)
         };
+    });
+}
+
+int32_t p2p_stream_snapshot_v2_read(p2p_stream* stream, p2p_stream_snapshot_v2* snapshot) {
+    if (!snapshot) return Guard([&] { Required(snapshot); });
+    p2p_stream_snapshot_v1 v{};
+    if (const auto result = p2p_stream_snapshot(stream, &v); result != P2P_OK) return result;
+    return Guard([&] {
+        stream->status_utf8 = winrt::to_string(std::wstring_view(v.status));
+        stream->codec_utf8 = winrt::to_string(std::wstring_view(v.codec));
+        stream->notice_utf8 = winrt::to_string(std::wstring_view(v.plugin_notice));
+        stream->ice_protocol_utf8 = v.ice_protocol;
+        *snapshot = {stream->status_utf8.c_str(), stream->codec_utf8.c_str(), stream->notice_utf8.c_str(),
+            stream->ice_protocol_utf8.c_str(), v.captured, v.submitted, v.received, v.decoded, v.presented,
+            v.width, v.height, v.upload_bps, v.download_bps, v.bitrate_limit_bps, v.state, v.ice_path,
+            v.desktop_control, v.input_ready, v.has_plugin_menu, v.srtp, v.gpu_native, v.gpu_conversion, v.seconds,
+            v.rtt_ms, v.loss_fraction, v.capture_to_submit_ms, v.draw_to_present_ms, v.send_queue_ms,
+            v.decoded_frame_wait_ms};
     });
 }
 
@@ -516,7 +627,7 @@ int32_t p2p_plugin_update_config(const char* plugin_id, int32_t role, const char
             strnlen_s(updates_json, 16 * 1024 + 1) > 16 * 1024) {
             throw std::invalid_argument("无效的插件配置");
         }
-        std::optional<Apartment> apartment;
+        std::optional<WinrtApartment> apartment;
         APTTYPE type{};
         APTTYPEQUALIFIER qualifier{};
         if (CoGetApartmentType(&type, &qualifier) == CO_E_NOTINITIALIZED) {

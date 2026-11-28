@@ -2,7 +2,7 @@
 #include "cloud_host.h"
 #include "desktop_audio.h"
 #include "service_support.h"
-#include "x11_shm_capturer.h"
+#include "backend_factory.h"
 
 #include <charconv>
 #include <csignal>
@@ -31,7 +31,7 @@ std::string DefaultHostname() {
 
 void PrintUsage(const char* argv0) {
     std::cerr << "Usage: " << argv0
-              << " --code <6-32 chars> [--port 27887] [--fps 30] [--max-height 1080] [--name <hostname>]\n"
+              << " --code <6-32 chars> [--port 27887] [--fps 30] [--max-height 1080] [--name <hostname>] [--backend=auto|x11] [--probe]\n"
               << "  Environment fallback: P2PREMOTE_ACCESS_CODE\n";
 }
 
@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
 
     HostConfig cfg;
     bool system_service = false;
+    bool probe = false;
     cfg.display_name = DefaultHostname();
     if (const char* env_code = std::getenv("P2PREMOTE_ACCESS_CODE"); env_code && *env_code) {
         cfg.access_code = env_code;
@@ -84,7 +85,13 @@ int main(int argc, char** argv) {
             out = argv[++i];
             return true;
         };
-        if (arg == "--system-service") {
+        if (arg == "--probe") {
+            probe = true;
+        } else if (arg.starts_with("--backend=")) {
+            const auto backend = ParseBackend(std::string_view(arg).substr(10));
+            if (!backend) { PrintUsage(argv[0]); return 2; }
+            cfg.backend = *backend;
+        } else if (arg == "--system-service") {
             system_service = true;
         } else if (arg == "--code") {
             if (!next_val(cfg.access_code)) { PrintUsage(argv[0]); return 2; }
@@ -118,6 +125,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (probe) {
+        const auto capabilities = ProbeDesktop(cfg.backend);
+        std::cout << std::boolalpha << "{\"backend\":\"x11\",\"built\":" << capabilities.x11_built
+                  << ",\"xorg_active\":" << capabilities.xorg_active
+                  << ",\"uinput_writable\":" << capabilities.uinput_writable
+                  << ",\"reason\":\"" << capabilities.reason << "\"}\n";
+        return 0;
+    }
     if (system_service) {
         return RunSystemService(argc, argv, std::move(cfg));
     }
@@ -138,7 +153,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto session = std::make_unique<LinuxHostSession>(cfg, std::make_unique<X11ShmCapturer>());
+    auto session = std::make_unique<LinuxHostSession>(cfg, CreateDesktopSession(cfg.backend));
     if (!session->Valid()) {
         std::cerr << "Error: failed to initialize Linux host session.\n";
         return 1;

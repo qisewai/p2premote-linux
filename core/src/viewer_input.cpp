@@ -68,7 +68,7 @@ bool ViewerInput::RefreshReady() {
 
 void ViewerInput::Heartbeat() {
     drag_tail_pending_ = false;
-    if ((buttons_.any() || keys_.any()) && !session_.SubmitInput({InputKind::heartbeat})) ReleaseViewerInput();
+    if (pressed_.Any() && !session_.SubmitInput({InputKind::heartbeat})) ReleaseViewerInput();
 }
 
 void ViewerInput::UpdatePluginLocks(StreamSession& session) {
@@ -97,7 +97,7 @@ void ViewerInput::FlushPendingMove(bool force) {
     if (session_.SubmitInput(move)) {
         last_move_sent_ = {move.x, move.y};
         last_move_qpc_ = now;
-        drag_tail_pending_ = buttons_.any();
+        drag_tail_pending_ = pressed_.Dragging();
     }
 }
 
@@ -120,7 +120,7 @@ void ViewerInput::RefreshLocalCursor() {
     POINT point{};
     if (active && GetFocus() == surface_ && GetCursorPos(&point)
             && (WindowFromPoint(point) == surface_ || GetCapture() == surface_) && ScreenToClient(surface_, &point)
-            && PointInput(InputKind::move, 0, point, buttons_.any())) {
+            && PointInput(InputKind::move, 0, point, pressed_.Dragging())) {
         SetCursor(cursor);
     }
 }
@@ -141,7 +141,7 @@ std::optional<LRESULT> ViewerInput::OnSurfaceMessage(HWND hwnd, UINT message, WP
         ReleaseViewerInput();
         break;
     case WM_CAPTURECHANGED:
-        if (buttons_.any()) ReleaseViewerInput();
+        if (pressed_.Dragging()) ReleaseViewerInput();
         break;
     }
     if (!input_ready_) return std::nullopt;
@@ -154,7 +154,7 @@ std::optional<LRESULT> ViewerInput::OnSurfaceMessage(HWND hwnd, UINT message, WP
         if (GetFocus() == hwnd && LOWORD(lparam) == HTCLIENT) {
             POINT cursor{};
             if (GetCursorPos(&cursor) && ScreenToClient(hwnd, &cursor)
-                && PointInput(InputKind::move, 0, cursor, buttons_.any())) {
+                && PointInput(InputKind::move, 0, cursor, pressed_.Dragging())) {
                 HCURSOR shape{};
                 session_.LocalCursor(shape);
                 SetCursor(shape);
@@ -173,7 +173,7 @@ std::optional<LRESULT> ViewerInput::OnSurfaceMessage(HWND hwnd, UINT message, WP
     case WM_MBUTTONUP: SetButton(InputButton::middle, false, point); return 0;
     case WM_MOUSEMOVE:
         if (GetFocus() == hwnd) {
-            if (const auto input = PointInput(InputKind::move, 0, point, buttons_.any())) {
+            if (const auto input = PointInput(InputKind::move, 0, point, pressed_.Dragging())) {
                 QueueMouseMove(*input);
             }
         }
@@ -182,7 +182,7 @@ std::optional<LRESULT> ViewerInput::OnSurfaceMessage(HWND hwnd, UINT message, WP
         if (GetFocus() == hwnd && ScreenToClient(hwnd, &point)) {
             FlushPendingMove(true);
             const auto code = static_cast<std::uint16_t>(GET_WHEEL_DELTA_WPARAM(wparam));
-            if (const auto input = PointInput(InputKind::wheel, code, point, buttons_.any())) SendControl(*input);
+            if (const auto input = PointInput(InputKind::wheel, code, point, pressed_.Dragging())) SendControl(*input);
         }
         return 0;
     case WM_KEYDOWN:
@@ -229,9 +229,9 @@ std::optional<InputPacket> ViewerInput::PointInput(InputKind kind, std::uint16_t
 
 void ViewerInput::SetButton(InputButton button, bool down, POINT point) {
     const auto code = static_cast<std::uint16_t>(button);
-    if (buttons_.test(code) == down) return;
+    if (pressed_.buttons.test(code) == down) return;
     FlushPendingMove(true);
-    const auto input = PointInput(down ? InputKind::button_down : InputKind::button_up, code, point, buttons_.any());
+    const auto input = PointInput(down ? InputKind::button_down : InputKind::button_up, code, point, pressed_.Dragging());
     if (!input) {
         if (!down) ReleaseViewerInput();
         return;
@@ -246,9 +246,9 @@ void ViewerInput::SetButton(InputButton button, bool down, POINT point) {
     if (!SendControl(*input)) return;
     drag_tail_pending_ = false;
     last_move_sent_ = {input->x, input->y};
-    buttons_.set(code, down);
+    pressed_.buttons.set(code, down);
     if (down) SetCapture(surface_);
-    else if (buttons_.none() && GetCapture() == surface_) ReleaseCapture();
+    else if (pressed_.buttons.none() && GetCapture() == surface_) ReleaseCapture();
 }
 
 void ViewerInput::SetKey(WPARAM key, LPARAM flags, bool down) {
@@ -258,8 +258,8 @@ void ViewerInput::SetKey(WPARAM key, LPARAM flags, bool down) {
     }
     FlushPendingMove(true);
     const auto code = static_cast<std::uint16_t>((flags >> 16) & 0x1ff);
-    if (!code || (keys_.test(code) == down && !down)) return;
-    if (SendControl({down ? InputKind::key_down : InputKind::key_up, code})) keys_.set(code, down);
+    if (!code || (pressed_.keys.test(code) == down && !down)) return;
+    if (SendControl({down ? InputKind::key_down : InputKind::key_up, code})) pressed_.keys.set(code, down);
 }
 
 bool ViewerInput::SendControl(const InputPacket& input) {
@@ -273,8 +273,7 @@ void ViewerInput::ReleaseViewerInput() {
     if (!surface_) return;
     pending_move_.reset();
     last_move_sent_.reset();
-    buttons_.reset();
-    keys_.reset();
+    pressed_.Clear();
     if (GetCapture() == surface_) ReleaseCapture();
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
     if (input_ready_) session_.SubmitInput({InputKind::reset});

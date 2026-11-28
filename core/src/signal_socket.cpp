@@ -1,4 +1,5 @@
 #include "signal_socket.h"
+#include "winrt_apartment.h"
 
 #include "stream_events.h"
 
@@ -52,14 +53,8 @@ SignalSocket::SignalSocket(std::shared_ptr<StreamEvents> events, std::wstring en
     : events_(std::move(events)), worker_([this, endpoint = std::move(endpoint), kind = std::move(kind),
                                           payload = std::move(payload), token = std::move(token)](std::stop_token stop) {
         try {
-            winrt::init_apartment();
-            try {
-                Run(stop, endpoint, kind, payload, token);
-            } catch (...) {
-                winrt::uninit_apartment();
-                throw;
-            }
-            winrt::uninit_apartment();
+            const WinrtApartment apartment;
+            Run(stop, endpoint, kind, payload, token);
         } catch (const winrt::hresult_error& error) {
             if (!stop.stop_requested()) {
                 events_->Push({StreamEventType::signal_lost, {}, "信令连接失败 · " + winrt::to_string(error.message())});

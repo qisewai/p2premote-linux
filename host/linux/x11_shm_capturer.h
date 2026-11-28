@@ -1,8 +1,8 @@
 #pragma once
 
-#include "capture_backend.h"
+#include "desktop_session.h"
 
-#include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -31,31 +31,39 @@ std::optional<ActiveXorgTarget> DiscoverActiveXorg();
 std::string EncodeXFixesCursor(unsigned width, unsigned height, unsigned hot_x, unsigned hot_y,
     const std::uint32_t* pixels);
 
-class X11ShmCapturer final : public LinuxCaptureBackend {
+class X11ShmCapturer final {
 public:
     X11ShmCapturer() = default;
-    ~X11ShmCapturer() override;
+    ~X11ShmCapturer();
 
     X11ShmCapturer(const X11ShmCapturer&) = delete;
     X11ShmCapturer& operator=(const X11ShmCapturer&) = delete;
 
-    std::optional<CapturedFrame> GrabFrame() override;
-    std::optional<CursorUpdate> PollCursor(bool force) override;
-    void MarkFrameSent() noexcept override;
-    unsigned ActiveFrameVt() const override;
-    std::string Describe() const override;
+    std::optional<VideoFrameView> GrabFrame();
+    bool IsFrameCurrent(const VideoFrameView& frame) const;
+    bool HasPublishedTarget() const;
+    std::optional<CursorUpdate> PollCursor(bool force);
+    void MarkFrameSent();
+    DesktopTarget ActiveTarget() const;
+    void Disconnect() noexcept;
+    std::string Describe() const;
 
 private:
     bool EnsureConnected();
     bool AttachShm(int width, int height);
     void DetachShm() noexcept;
-    void Disconnect() noexcept;
+    void UpdateDesktop();
+    void ClearActiveTarget() noexcept;
 
     ActiveXorgTarget current_target_;
     xcb_connection_t* display_{};
     std::uint32_t root_{};
     bool has_xfixes_{};
-    std::atomic<int> frame_vt_{};
+    mutable std::mutex desktop_mutex_;
+    DesktopTarget current_desktop_;
+    DesktopTarget active_desktop_;
+    std::uint64_t epoch_{};
+    std::uint64_t sequence_{};
 
     int shmid_{-1};
     void* shmaddr_{};

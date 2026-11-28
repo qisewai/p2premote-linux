@@ -158,8 +158,8 @@ std::uint16_t pointerButton(Qt::MouseButton button) {
 
 class VideoSurface final : public QOpenGLWidget, protected QOpenGLFunctions {
 public:
-    VideoSurface(std::function<void()> fullscreen, QWidget* parent)
-        : QOpenGLWidget(parent), fullscreen_(std::move(fullscreen)),
+    explicit VideoSurface(QWidget* parent)
+        : QOpenGLWidget(parent),
           xkb_(QGuiApplication::platformName().startsWith("wayland") || QGuiApplication::platformName() == "xcb") {
         auto fmt = format();
         fmt.setSwapInterval(0);
@@ -182,11 +182,13 @@ public:
         connect(&move_flush_timer_, &QTimer::timeout, this, [this] { flushPendingMove(true); });
         drag_tail_timer_.setSingleShot(true);
         connect(&drag_tail_timer_, &QTimer::timeout, this, [this] {
-            if (capturing_ && pressed_buttons_ != Qt::NoButton && session_) {
+            if (capturing_ && pressed_.Dragging() && session_) {
                 session_->sendInput(InputKind::heartbeat);
             }
         });
     }
+
+    void setFullscreenCallback(std::function<void()> callback) { fullscreen_ = std::move(callback); }
 
     ~VideoSurface() override {
         if (context()) {
@@ -232,7 +234,7 @@ public:
             drag_tail_timer_.stop();
             pending_move_.reset();
             last_move_sent_.reset();
-            pressed_buttons_ = Qt::NoButton;
+            pressed_.Clear();
             if (session_) session_->sendInput(InputKind::reset);
             updateSurfaceCursor();
         }
@@ -404,7 +406,7 @@ void main() {
     bool event(QEvent* event) override {
         const auto type = event->type();
         if (type == QEvent::Hide || type == QEvent::WindowDeactivate ||
-                (type == QEvent::UngrabMouse && pressed_buttons_ != Qt::NoButton)) {
+                (type == QEvent::UngrabMouse && pressed_.Dragging())) {
             setCapture(false);
         }
         if (capturing_ && type == QEvent::ShortcutOverride) {
@@ -442,17 +444,17 @@ void main() {
         if (!capturing_ && button == Qt::LeftButton && pointer_in_video_) {
             setCapture(true);
         }
-        if (const auto code = pointerButton(button); code && !pressed_buttons_.testFlag(button) &&
+        if (const auto code = pointerButton(button); code && !pressed_.buttons.test(code) &&
                 sendPointerAction(InputKind::button_down, code, event->position())) {
-            pressed_buttons_.setFlag(button);
+            pressed_.buttons.set(code);
         }
     }
 
     void mouseReleaseEvent(QMouseEvent* event) override {
         const auto button = event->button();
-        if (const auto code = pointerButton(button); code && pressed_buttons_.testFlag(button)) {
+        if (const auto code = pointerButton(button); code && pressed_.buttons.test(code)) {
             if (sendPointerAction(InputKind::button_up, code, event->position())) {
-                pressed_buttons_.setFlag(button, false);
+                pressed_.buttons.reset(code);
             } else {
                 setCapture(false);
             }
@@ -631,7 +633,7 @@ private:
 
     void queueMove(const QPointF& pos) {
         if (!capturing_) return;
-        const auto point = normalizePoint(pos, pressed_buttons_ != Qt::NoButton);
+        const auto point = normalizePoint(pos, pressed_.Dragging());
         if (!point) return;
         if (!pending_move_ && last_move_sent_ && *last_move_sent_ == *point) return;
         pending_move_ = *point;
@@ -655,13 +657,13 @@ private:
         if (session_->sendInput(InputKind::move, 0, move.first, move.second)) {
             last_move_sent_ = move;
             move_clock_.restart();
-            if (pressed_buttons_ != Qt::NoButton) drag_tail_timer_.start(drag_tail_delay_ms);
+            if (pressed_.Dragging()) drag_tail_timer_.start(drag_tail_delay_ms);
         }
     }
 
     bool sendPointerAction(InputKind kind, std::uint16_t code, const QPointF& pos) {
         if (!capturing_ || !session_) return false;
-        const auto point = normalizePoint(pos, pressed_buttons_ != Qt::NoButton);
+        const auto point = normalizePoint(pos, pressed_.Dragging());
         if (!point) return false;
         pending_move_.reset();
         move_flush_timer_.stop();
@@ -683,7 +685,7 @@ private:
         const auto lock = code == 0x3a ? 0x02u : (code == 0x45 ? 0x10u : 0u);
         if (event->isAutoRepeat()) {
             // Qt can emit release/press pairs for a held key. Keep the remote key down until the real release.
-            if (kind == InputKind::key_down && !lock && code != 0x46) session_->sendInput(kind, code);
+            if (kind == InputKind::key_down && pressed_.keys.test(code) && !lock && code != 0x46) session_->sendInput(kind, code);
             return;
         }
         bool sync_lock{};
@@ -693,7 +695,11 @@ private:
             if (kind == InputKind::key_down) modifiers ^= lock;
             sync_lock = session_->updateKeyboardLocks(modifiers & 0x02u, modifiers & 0x10u) && lock;
         }
-        if (!sync_lock) session_->sendInput(kind, code);
+        const bool down = kind == InputKind::key_down;
+        if (!sync_lock && (down || pressed_.keys.test(code))) {
+            if (session_->sendInput(kind, code)) pressed_.keys.set(code, down);
+            else setCapture(false);
+        }
     }
 
     void updatePointerInVideo(const QPointF& pos) {
@@ -730,7 +736,7 @@ private:
     QElapsedTimer move_clock_;
     std::optional<std::pair<std::uint16_t, std::uint16_t>> pending_move_;
     std::optional<std::pair<std::uint16_t, std::uint16_t>> last_move_sent_;
-    Qt::MouseButtons pressed_buttons_{Qt::NoButton};
+    p2premote::PressedInput<> pressed_;
     VideoFrame frame_;
     struct FrameTiming { FrameClock::time_point decoded_at, draw_at; };
     std::optional<FrameTiming> pending_swap_;
@@ -753,8 +759,12 @@ private:
 
 } // namespace
 
-QWidget* createVideoSurface(std::function<void()> fullscreen, QWidget* parent) {
-    return new VideoSurface(std::move(fullscreen), parent);
+QWidget* createVideoSurface(QWidget* parent) {
+    return new VideoSurface(parent);
+}
+
+void setVideoFullscreenCallback(QWidget* widget, std::function<void()> callback) {
+    static_cast<VideoSurface*>(widget)->setFullscreenCallback(std::move(callback));
 }
 
 void attachVideoSession(QWidget* widget, ViewerSession* session) {

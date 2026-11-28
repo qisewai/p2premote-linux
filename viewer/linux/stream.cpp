@@ -2,6 +2,7 @@
 #include "video_surface.h"
 #include "plugin_host.h"
 #include "plugin_platform.h"
+#include <p2premote/core_api_v2.h>
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -11,6 +12,7 @@
 #include <QWidget>
 
 #include <deque>
+#include <utility>
 
 using namespace p2premote;
 
@@ -23,13 +25,15 @@ struct p2p_stream {
     explicit p2p_stream(QWidget* widget) : video(widget) {
         if (video) attachVideoSession(video, &session);
         session.frameReady = [this] {
+            events |= P2P_STREAM_EVENT_PRESENT;
             if (video) notifyVideoFrameReady(video);
         };
         session.cursorChanged = [this](DecodedCursor cursor) {
             if (video) setVideoCursor(video, std::move(cursor));
         };
         session.statusChanged = [this](const QString& text) {
-            status = text.toStdWString();
+            status = text;
+            events |= P2P_STREAM_EVENT_SESSION;
             const int next_state = p2p_stream_state(this);
             if (video && next_state != last_video_state && (next_state == P2P_STOPPED || next_state == P2P_RECONNECTING)) {
                 attachVideoSession(video, &session);
@@ -39,7 +43,10 @@ struct p2p_stream {
     }
 
     ~p2p_stream() {
-        if (video) attachVideoSession(video, nullptr);
+        if (video) {
+            setVideoFullscreenCallback(video, {});
+            attachVideoSession(video, nullptr);
+        }
         session.cursorChanged = {};
         session.statusChanged = {};
         session.close();
@@ -56,7 +63,12 @@ struct p2p_stream {
     bool started{};
     int last_video_state{P2P_IDLE};
     int quality{P2P_1080P}, bitrate{P2P_AUTOMATIC};
-    std::wstring status, notice;
+    QString status;
+    std::wstring legacy_status, notice;
+    QByteArray status_utf8, notice_utf8, ice_protocol_utf8;
+    int reported_state{P2P_IDLE};
+    bool reported_input{};
+    uint32_t events{};
     PluginOverlaySnapshot overlays;
     std::vector<PluginMenuItem> menu;
     std::deque<PluginUiCommand> commands;
@@ -105,33 +117,99 @@ std::optional<CloudConnection> tuneIce(const CloudConnection& original, const st
 
 } // namespace
 
-p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host, const wchar_t* device,
-    void* video, const p2p_connection_options_v1* options) {
-    const auto target = fromWide(device);
-    if (host || target.isEmpty() || !cloudConnection(account)) {
+namespace {
+
+p2p_stream* createCloud(const p2p_account* account, int32_t host, const QString& device, QWidget* video,
+    const char* stun, bool stun_only, bool diagnostics) {
+    if (host || device.isEmpty() || !cloudConnection(account)) {
         fail(QStringLiteral("请登录后选择远程设备"));
         return nullptr;
     }
-    auto stream = std::make_unique<p2p_stream>(static_cast<QWidget*>(video));
+    auto stream = std::make_unique<p2p_stream>(video);
     stream->account = account;
-    stream->device = target;
-    if (options) {
-        if (options->stun_url) stream->stun = options->stun_url;
-        stream->stun_only = options->stun_only;
-        stream->diagnostics = options->diagnostics;
-    }
+    stream->device = device;
+    if (stun) stream->stun = stun;
+    stream->stun_only = stun_only;
+    stream->diagnostics = diagnostics;
     return stream.release();
 }
 
-p2p_stream* p2p_stream_create_lan(int32_t host, void* video, const p2p_lan_options_v1* options) {
-    if (host || !options || !options->host_address || !options->access_code) {
+p2p_stream* createLan(int32_t host, QWidget* video, const QString& address, const QString& code, quint16 port) {
+    if (host || address.isNull() || code.isNull()) {
         fail(QStringLiteral("请输入远程设备地址及连接验证码"));
         return nullptr;
     }
-    auto stream = std::make_unique<p2p_stream>(static_cast<QWidget*>(video));
-    stream->lan = p2p_stream::Lan{fromWide(options->host_address), fromWide(options->access_code),
-        options->port ? options->port : static_cast<quint16>(P2P_LAN_DEFAULT_PORT)};
+    auto stream = std::make_unique<p2p_stream>(video);
+    stream->lan = p2p_stream::Lan{address, code, port ? port : static_cast<quint16>(P2P_LAN_DEFAULT_PORT)};
     return stream.release();
+}
+
+bool resolveVideoParent(const p2p_render_target_v2* target, QWidget*& video) {
+    if (!target || (target->kind == P2P_RENDER_TARGET_NONE && !target->native_target)) return true;
+    if (target->kind != P2P_RENDER_TARGET_QT_VIDEO_SURFACE || !target->native_target) {
+        fail(QStringLiteral("此平台不支持指定的视频渲染目标"));
+        return false;
+    }
+    video = reinterpret_cast<QWidget*>(target->native_target);
+    return true;
+}
+
+p2p_stream* bindFullscreen(p2p_stream* stream, const p2p_render_target_v2* target) {
+    if (stream && stream->video && target && target->request_fullscreen) {
+        setVideoFullscreenCallback(stream->video, [invoke = target->request_fullscreen, context = target->context] {
+            invoke(context);
+        });
+    }
+    return stream;
+}
+
+int32_t closeStream(p2p_stream* stream, const QString& reason) {
+    if (!stream) return P2P_ERROR;
+    stream->session.close();
+    if (!reason.isEmpty()) stream->status = reason;
+    stream->events |= P2P_STREAM_EVENT_SESSION;
+    stream->commands.clear();
+    return P2P_OK;
+}
+
+} // namespace
+
+p2p_stream* p2p_stream_create(const p2p_account* account, int32_t host, const wchar_t* device,
+    void* video, const p2p_connection_options_v1* options) {
+    return createCloud(account, host, fromWide(device), static_cast<QWidget*>(video),
+        options ? options->stun_url : nullptr, options && options->stun_only, options && options->diagnostics);
+}
+
+p2p_stream* p2p_stream_create_lan(int32_t host, void* video, const p2p_lan_options_v1* options) {
+    return createLan(host, static_cast<QWidget*>(video), fromWide(options ? options->host_address : nullptr),
+        fromWide(options ? options->access_code : nullptr), options ? options->port : 0);
+}
+
+p2p_stream* p2p_stream_create_v2(const p2p_account* account, int32_t host, const char* device,
+    const p2p_render_target_v2* target, const p2p_connection_options_v2* options) {
+    QWidget* video{};
+    if (!resolveVideoParent(target, video)) return nullptr;
+    if (device && !QByteArrayView(device).isValidUtf8()) {
+        fail(QStringLiteral("输入必须使用有效的 UTF-8"));
+        return nullptr;
+    }
+    return bindFullscreen(createCloud(account, host, QString::fromUtf8(device), video, options ? options->stun_url : nullptr,
+        options && options->stun_only, options && options->diagnostics), target);
+}
+
+p2p_stream* p2p_stream_create_lan_v2(int32_t host, const p2p_render_target_v2* target, const p2p_lan_options_v2* options) {
+    QWidget* video{};
+    if (!resolveVideoParent(target, video)) return nullptr;
+    if (!options || !options->host_address || !options->access_code) {
+        fail(QStringLiteral("请输入远程设备地址及连接验证码"));
+        return nullptr;
+    }
+    if (!QByteArrayView(options->host_address).isValidUtf8() || !QByteArrayView(options->access_code).isValidUtf8()) {
+        fail(QStringLiteral("输入必须使用有效的 UTF-8"));
+        return nullptr;
+    }
+    return bindFullscreen(createLan(host, video, QString::fromUtf8(options->host_address),
+        QString::fromUtf8(options->access_code), options->port), target);
 }
 
 void p2p_stream_destroy(p2p_stream* stream) { delete stream; }
@@ -155,11 +233,12 @@ int32_t p2p_stream_start(p2p_stream* stream, void*, uint32_t) {
 }
 
 int32_t p2p_stream_stop(p2p_stream* stream, const wchar_t* reason) {
-    if (!stream) return P2P_ERROR;
-    stream->session.close();
-    if (reason && *reason) stream->status = reason;
-    stream->commands.clear();
-    return P2P_OK;
+    return closeStream(stream, fromWide(reason));
+}
+
+int32_t p2p_stream_stop_v2(p2p_stream* stream, const char* reason) {
+    if (reason && !QByteArrayView(reason).isValidUtf8()) return fail(QStringLiteral("输入必须使用有效的 UTF-8"));
+    return closeStream(stream, QString::fromUtf8(reason));
 }
 
 int32_t p2p_stream_quality(p2p_stream* stream, uint32_t quality) {
@@ -196,19 +275,54 @@ int32_t p2p_stream_state(const p2p_stream* stream) {
 
 int32_t p2p_stream_input_ready(const p2p_stream* stream) { return stream && stream->session.canControl(); }
 
-int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* out) {
-    if (!stream || !out) return P2P_ERROR;
+namespace {
+
+template<class Snapshot, class Char>
+int32_t readSnapshot(p2p_stream* stream, Snapshot* out, const Char* status, const Char* codec, const Char* notice,
+    const char* ice_protocol) {
     const auto& session = stream->session;
     const auto& m = session.metrics();
     const auto decoded = session.decodedFrames();
-    stream->notice = session.notice().toStdWString();
     const auto* plugins = session.plugins();
-    *out = {stream->status.c_str(), L"H264 (MiniRTC)", stream->notice.c_str(), session.iceProtocol().constData(),
+    *out = {status, codec, notice, ice_protocol,
         0, 0, decoded, decoded, m.presented, m.width, m.height, m.upload_bps.value_or(0),
         m.download_bps.value_or(0), session.confirmedBitrate(), p2p_stream_state(stream), session.icePath(),
         session.canControl(), session.canControl(), plugins && plugins->HasMenu(), session.srtpActive(), 0, 0,
         m.seconds, m.rtt_ms.value_or(-1), m.loss.value_or(-1), -1, session.drawToPresentMs(), -1,
         m.frame_wait_ms.value_or(-1)};
+    return P2P_OK;
+}
+
+} // namespace
+
+int32_t p2p_stream_snapshot(p2p_stream* stream, p2p_stream_snapshot_v1* out) {
+    if (!stream || !out) return P2P_ERROR;
+    stream->legacy_status = stream->status.toStdWString();
+    stream->notice = stream->session.notice().toStdWString();
+    return readSnapshot(stream, out, stream->legacy_status.c_str(), L"H264 (MiniRTC)", stream->notice.c_str(),
+        stream->session.iceProtocol().constData());
+}
+
+int32_t p2p_stream_snapshot_v2_read(p2p_stream* stream, p2p_stream_snapshot_v2* out) {
+    if (!stream || !out) return fail(QStringLiteral("缺少核心接口参数"));
+    stream->status_utf8 = stream->status.toUtf8();
+    stream->notice_utf8 = stream->session.notice().toUtf8();
+    stream->ice_protocol_utf8 = stream->session.iceProtocol();
+    return readSnapshot(stream, out, stream->status_utf8.constData(), "H264 (MiniRTC)", stream->notice_utf8.constData(),
+        stream->ice_protocol_utf8.constData());
+}
+
+int32_t p2p_stream_poll_events(p2p_stream* stream, p2p_stream_events_v2* events) {
+    if (!stream || !events) return fail(QStringLiteral("缺少核心接口参数"));
+    const auto state = p2p_stream_state(stream);
+    const auto input = p2p_stream_input_ready(stream) != 0;
+    auto ready = std::exchange(stream->events, 0);
+    if (state != stream->reported_state || input != stream->reported_input || !stream->commands.empty()) {
+        ready |= P2P_STREAM_EVENT_SESSION;
+    }
+    stream->reported_state = state;
+    stream->reported_input = input;
+    *events = {ready, state, input};
     return P2P_OK;
 }
 

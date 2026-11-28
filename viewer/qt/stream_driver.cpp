@@ -27,20 +27,26 @@ void runWhile(QTimer& timer, bool running) {
 
 } // namespace
 
-StreamDriver::StreamDriver(p2p_account* account, bool host, const wchar_t* device, void* video_parent,
+StreamDriver::StreamDriver(p2p_account* account, bool host, const QString& device, const p2p_render_target_v2& target,
     const LaunchOptions& options, QObject* parent, bool diagnostics) : QObject(parent) {
-    const p2p_connection_options_v1 settings{
-        options.ice_trace.c_str(), options.latency_trace.c_str(), options.stun.c_str(), options.stun_only, host, diagnostics};
-    stream_.reset(p2p_stream_create(account, host, device, video_parent, &settings));
+    const auto ice_trace = QString::fromStdWString(options.ice_trace).toUtf8();
+    const auto latency_trace = QString::fromStdWString(options.latency_trace).toUtf8();
+    const auto remote = device.toUtf8();
+    const p2p_connection_options_v2 settings{ice_trace.constData(), latency_trace.constData(), options.stun.c_str(),
+        options.stun_only, host, diagnostics};
+    stream_.reset(p2p_stream_create_v2(account, host, remote.constData(), &target, &settings));
     initTimersAndWaits();
 }
 
-StreamDriver::StreamDriver(const LanConnectOptions& lan, void* video_parent,
+StreamDriver::StreamDriver(const LanConnectOptions& lan, const p2p_render_target_v2& target,
     const LaunchOptions& options, QObject* parent) : QObject(parent) {
-    const p2p_lan_options_v1 settings{
-        lan.host.c_str(), lan.port, lan.access_code.c_str(), 0,
-        options.ice_trace.c_str(), options.latency_trace.c_str()};
-    stream_.reset(p2p_stream_create_lan(0, video_parent, &settings));
+    const auto ice_trace = QString::fromStdWString(options.ice_trace).toUtf8();
+    const auto latency_trace = QString::fromStdWString(options.latency_trace).toUtf8();
+    const auto address = QString::fromStdWString(lan.host).toUtf8();
+    const auto code = QString::fromStdWString(lan.access_code).toUtf8();
+    const p2p_lan_options_v2 settings{address.constData(), lan.port, code.constData(), 0,
+        ice_trace.constData(), latency_trace.constData()};
+    stream_.reset(p2p_stream_create_lan_v2(0, &target, &settings));
     initTimersAndWaits();
 }
 
@@ -54,9 +60,14 @@ void StreamDriver::initTimersAndWaits() {
 #else
     cursor_.setInterval(50);
     connect(&cursor_, &QTimer::timeout, this, [this] {
+        p2p_stream_events_v2 events{};
+        if (const auto result = p2p_stream_poll_events(handle(), &events); result != P2P_OK) {
+            update(result);
+            return;
+        }
         if (!hasVideo()) {
             publishIfChanged();
-        } else if (p2p_stream_state(handle()) != state_ || (p2p_stream_input_ready(handle()) != 0) != input_ready_) {
+        } else if (events.state != state_ || (events.input_ready != 0) != input_ready_) {
             publish();
         }
         emit uiCommandsReady();
@@ -85,9 +96,9 @@ StreamDriver::~StreamDriver() {
 
 void StreamDriver::update(int result) {
     if (result != P2P_OK) {
-        const auto error = QString::fromWCharArray(p2p_last_error());
-        const auto reason = error.toStdWString();
-        p2p_stream_stop(handle(), reason.c_str());
+        const auto error = QString::fromUtf8(p2p_last_error_utf8());
+        const auto reason = error.toUtf8();
+        p2p_stream_stop_v2(handle(), reason.constData());
         emit failed(error);
     }
     syncWaits();
@@ -145,14 +156,14 @@ void StreamDriver::publishIfChanged() {
 
 void StreamDriver::publishSnapshot(bool force) {
     if (!handle()) return;
-    p2p_stream_snapshot_v1 snapshot{};
-    if (p2p_stream_snapshot(handle(), &snapshot) != P2P_OK) {
-        emit failed(QString::fromWCharArray(p2p_last_error()));
+    p2p_stream_snapshot_v2 snapshot{};
+    if (p2p_stream_snapshot_v2_read(handle(), &snapshot) != P2P_OK) {
+        emit failed(QString::fromUtf8(p2p_last_error_utf8()));
         return;
     }
     const bool input_ready = snapshot.input_ready != 0;
-    const auto status = snapshot.status ? QString::fromWCharArray(snapshot.status) : QString{};
-    const auto notice = snapshot.plugin_notice ? QString::fromWCharArray(snapshot.plugin_notice) : QString{};
+    const auto status = snapshot.status ? QString::fromUtf8(snapshot.status) : QString{};
+    const auto notice = snapshot.plugin_notice ? QString::fromUtf8(snapshot.plugin_notice) : QString{};
     if (!force && snapshot.state == state_ && input_ready == input_ready_
         && snapshot.width == width_ && snapshot.height == height_
         && status == status_ && notice == notice_) {

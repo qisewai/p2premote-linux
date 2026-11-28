@@ -400,6 +400,10 @@ Linux 主控端开始绘制时取最新的解码帧。连接状态的 FPS 统计
 
 Linux 被控端默认以最高 30 fps 检查桌面变化。局域网和云端会话在画面变化后立即提交新帧，并在变化停止后短暂补帧以恢复画质。桌面持续静止时约每秒提交一次缓存画面，期间跳过重复画面的缩放和转色。
 
+运行 `p2premote_linux_host --backend=auto --probe` 可用 JSON 查看 X11 后端是否编译、是否发现活动的 Xorg 桌面以及当前进程是否能打开 `/dev/uinput`。显式选择 X11 时可传入 `--backend=x11`。只构建主控时可设置 `-DP2PREMOTE_BUILD_LINUX_HOST=OFF`，也可用 `-DP2PREMOTE_LINUX_HOST_X11=OFF` 验证 Linux 服务和通用会话代码的无 X11 构建。
+
+Qt 客户端使用 [C ABI v2](core/include/p2premote/core_api_v2.h) 的 UTF-8 登录和会话入口、类型化渲染目标以及通用事件轮询。Windows 的原生高频呈现仍由事件通知驱动，原有 [C ABI](core/include/p2premote/core_api.h) 继续可用。
+
 构建需要 GCC、CMake、Ninja、Xmake、Qt 6.8 或更新版本（Widgets、Network、WebSockets）、OpenSSL、libyuv、Lua 5.4、libsecret、PulseAudio 和 FUSE3（`fuse3`）的开发包，以及 [libghostty-vt 1.0.1](https://lib.ghostty.org/vt/installing.html#build-from-source)。Linux 上从源码构建 libghostty-vt，可安装到 `~/.local/share/p2premote/ghostty-vt`，也可在配置时用 `CMAKE_PREFIX_PATH` 指定其前缀。MiniRTC 还需要归档解压工具、Meson 1.4 或更新版本、Autotools 和 NASM。
 
 Ubuntu 上还需安装 `libavcodec-dev libavutil-dev` 来构建 MiniRTC，安装 `zlib1g-dev libbz2-dev` 来构建更新模块，以及安装 `libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxau-dev libsystemd-dev libpulse-dev` 来构建被控服务。

@@ -1,4 +1,5 @@
 #include "x11_shm_capturer.h"
+#include "cursor_packet.h"
 
 #include <X11/Xauth.h>
 #include <xcb/xcb.h>
@@ -25,10 +26,6 @@
 
 namespace p2premote::linux_host {
 namespace {
-
-constexpr char kCursorMarker = 'C';
-constexpr unsigned kCursorMaxDim = 128;
-constexpr std::size_t kCursorHeaderBytes = 9;
 
 template<class T>
 using XcbReply = std::unique_ptr<T, decltype(&std::free)>;
@@ -184,11 +181,6 @@ bool IsDigits(const std::string& s) {
     return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
 }
 
-void WriteLe16(std::string& out, std::size_t offset, unsigned value) noexcept {
-    out[offset] = static_cast<char>(value & 0xffu);
-    out[offset + 1] = static_cast<char>((value >> 8) & 0xffu);
-}
-
 } // namespace
 
 std::optional<ActiveXorgTarget> DiscoverActiveXorg() {
@@ -226,48 +218,20 @@ std::optional<ActiveXorgTarget> DiscoverActiveXorg() {
 
 std::string EncodeXFixesCursor(unsigned width, unsigned height, unsigned hot_x, unsigned hot_y,
     const std::uint32_t* pixels) {
-    if (!pixels || !width || !height || width > kCursorMaxDim || height > kCursorMaxDim) return {};
-    if (hot_x >= width) hot_x = width - 1;
-    if (hot_y >= height) hot_y = height - 1;
-
-    const std::size_t mask_stride = ((width + 31u) / 32u) * 4u;
-    const std::size_t mask_bytes = mask_stride * height;
-    const std::size_t color_bytes = static_cast<std::size_t>(width) * height * 4u;
-
-    std::string out(kCursorHeaderBytes + mask_bytes + color_bytes, '\0');
-    out[0] = kCursorMarker;
-    WriteLe16(out, 1, width);
-    WriteLe16(out, 3, height);
-    WriteLe16(out, 5, hot_x);
-    WriteLe16(out, 7, hot_y);
-
-    auto* mask = reinterpret_cast<std::uint8_t*>(out.data() + kCursorHeaderBytes);
-    auto* color = reinterpret_cast<std::uint8_t*>(out.data() + kCursorHeaderBytes + mask_bytes);
-    for (unsigned y = 0; y < height; ++y) {
-        auto* mask_row = mask + y * mask_stride;
-        auto* color_row = color + static_cast<std::size_t>(y) * width * 4u;
-        for (unsigned x = 0; x < width; ++x) {
-            const auto argb = pixels[static_cast<std::size_t>(y) * width + x];
-            const std::uint8_t a = static_cast<std::uint8_t>((argb >> 24) & 0xffu);
-            std::uint8_t r = static_cast<std::uint8_t>((argb >> 16) & 0xffu);
-            std::uint8_t g = static_cast<std::uint8_t>((argb >> 8) & 0xffu);
-            std::uint8_t b = static_cast<std::uint8_t>(argb & 0xffu);
-            // XFixes returns premultiplied ARGB; un-premultiply for standard BGRA cursor pixels.
-            if (a > 0 && a < 255) {
-                r = static_cast<std::uint8_t>(std::min<unsigned>(255u, (static_cast<unsigned>(r) * 255u) / a));
-                g = static_cast<std::uint8_t>(std::min<unsigned>(255u, (static_cast<unsigned>(g) * 255u) / a));
-                b = static_cast<std::uint8_t>(std::min<unsigned>(255u, (static_cast<unsigned>(b) * 255u) / a));
-            }
-            color_row[x * 4 + 0] = b;
-            color_row[x * 4 + 1] = g;
-            color_row[x * 4 + 2] = r;
-            color_row[x * 4 + 3] = a;
-            if (a == 0) {
-                mask_row[x >> 3] |= static_cast<std::uint8_t>(0x80u >> (x & 7u));
-            }
+    if (!pixels || !width || !height || width > cursor_max_dimension || height > cursor_max_dimension) return {};
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4);
+    for (std::size_t i = 0; i < rgba.size() / 4; ++i) {
+        const auto argb = pixels[i];
+        const auto alpha = argb >> 24;
+        for (unsigned channel = 0; channel < 3; ++channel) {
+            auto color = (argb >> (16 - 8 * channel)) & 0xff;
+            // XFixes uses premultiplied ARGB.
+            if (alpha > 0 && alpha < 255) color = std::min(255u, color * 255 / alpha);
+            rgba[i * 4 + channel] = static_cast<std::uint8_t>(color);
         }
+        rgba[i * 4 + 3] = static_cast<std::uint8_t>(alpha);
     }
-    return out;
+    return EncodeRgbaCursorPacket(width, height, hot_x, hot_y, rgba);
 }
 
 X11ShmCapturer::~X11ShmCapturer() {
@@ -285,13 +249,14 @@ void X11ShmCapturer::DetachShm() noexcept {
 }
 
 void X11ShmCapturer::Disconnect() noexcept {
-    frame_vt_.store(0, std::memory_order_release);
+    ClearActiveTarget();
     DetachShm();
     if (display_) xcb_disconnect(display_);
     display_ = nullptr;
     root_ = 0;
     has_xfixes_ = false;
     current_target_ = {};
+    current_desktop_ = {};
     last_cursor_serial_ = 0;
     cursor_sent_ = false;
 }
@@ -354,7 +319,10 @@ bool X11ShmCapturer::EnsureConnected() {
         Disconnect();
         return false;
     }
-    if (display_ && *next == current_target_) return true;
+    if (display_ && *next == current_target_) {
+        UpdateDesktop();
+        return true;
+    }
     Disconnect();
 
     int screen_index = 0;
@@ -392,10 +360,11 @@ bool X11ShmCapturer::EnsureConnected() {
         return false;
     }
     last_geom_check_ = now;
+    UpdateDesktop();
     return true;
 }
 
-std::optional<CapturedFrame> X11ShmCapturer::GrabFrame() {
+std::optional<VideoFrameView> X11ShmCapturer::GrabFrame() {
     if (!EnsureConnected()) return std::nullopt;
 
     const auto now = std::chrono::steady_clock::now();
@@ -420,23 +389,58 @@ std::optional<CapturedFrame> X11ShmCapturer::GrabFrame() {
         return std::nullopt;
     }
     if (ReadActiveVt() != current_target_.vt) {
-        frame_vt_.store(0, std::memory_order_release);
+        ClearActiveTarget();
         return std::nullopt;
     }
-    return CapturedFrame{width_, height_, stride_, static_cast<const std::uint8_t*>(shmaddr_)};
+    const auto timestamp = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+    return VideoFrameView{width_, height_, VideoPixelFormat::bgra32,
+        static_cast<const std::uint8_t*>(shmaddr_), stride_, nullptr, 0, ++sequence_, timestamp, {}, current_desktop_.epoch};
 }
 
-void X11ShmCapturer::MarkFrameSent() noexcept {
-    frame_vt_.store(current_target_.vt, std::memory_order_release);
+bool X11ShmCapturer::IsFrameCurrent(const VideoFrameView& frame) const {
+    return frame.desktop_epoch == current_desktop_.epoch && current_desktop_.valid() &&
+        ReadActiveVt() == current_target_.vt;
 }
 
-unsigned X11ShmCapturer::ActiveFrameVt() const {
-    const auto vt = frame_vt_.load(std::memory_order_acquire);
-    return vt != 0 && vt == ReadActiveVt() ? static_cast<unsigned>(vt) : 0;
+bool X11ShmCapturer::HasPublishedTarget() const {
+    const std::lock_guard lock(desktop_mutex_);
+    return active_desktop_.valid();
+}
+
+void X11ShmCapturer::UpdateDesktop() {
+    const auto vt = static_cast<unsigned>(current_target_.vt);
+    // Login and lock screens remain valid Xorg capture targets, with no
+    // user clipboard or audio attached to their desktop identity.
+    DesktopTarget desktop{DisplayServer::x11, current_target_.uid, {}, vt, {}, current_desktop_.epoch, true};
+    if (const auto login = ActiveUserDesktop(); login && login->vt == vt && login->valid()) {
+        desktop.uid = login->uid;
+        desktop.session_id = login->session_id;
+        desktop.runtime_dir = login->runtime_dir;
+    }
+    if (desktop == current_desktop_) return;
+    ClearActiveTarget();
+    desktop.epoch = ++epoch_;
+    current_desktop_ = std::move(desktop);
+}
+
+void X11ShmCapturer::ClearActiveTarget() noexcept {
+    const std::lock_guard lock(desktop_mutex_);
+    active_desktop_ = {};
+}
+
+void X11ShmCapturer::MarkFrameSent() {
+    const std::lock_guard lock(desktop_mutex_);
+    active_desktop_ = current_desktop_;
+}
+
+DesktopTarget X11ShmCapturer::ActiveTarget() const {
+    const std::lock_guard lock(desktop_mutex_);
+    return active_desktop_.valid() && static_cast<int>(active_desktop_.vt) == ReadActiveVt()
+        ? active_desktop_ : DesktopTarget{};
 }
 
 std::optional<CursorUpdate> X11ShmCapturer::PollCursor(bool force) {
-    if (!display_ || !has_xfixes_ || !InputAvailable()) return std::nullopt;
+    if (!display_ || !has_xfixes_ || !ActiveTarget().valid()) return std::nullopt;
     const auto request = xcb_xfixes_get_cursor_image(display_);
     XcbReply<xcb_xfixes_get_cursor_image_reply_t> cursor(
         xcb_xfixes_get_cursor_image_reply(display_, request, nullptr), std::free);

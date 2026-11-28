@@ -1,5 +1,9 @@
 #pragma once
 
+#include <p2premote/input_state.h>
+
+#include <p2premote/session_policy.h>
+
 #include "cloud_connection.h"
 #include "cursor_shape.h"
 #include "managed_api.h"
@@ -18,7 +22,6 @@
 #include <QWebSocket>
 
 #include <atomic>
-#include <bitset>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -78,8 +81,7 @@ private:
         QString lan_host;
         quint16 lan_port{};
         QByteArray lan_key;
-        QElapsedTimer window;
-        int attempts{};
+        p2premote::ReconnectWindow window;
         QString reason;
     };
 
@@ -150,7 +152,6 @@ private:
     QElapsedTimer connected_since_;
     QElapsedTimer notice_age_;
     QElapsedTimer workspace_retry_;
-    QElapsedTimer video_retry_;
     QElapsedTimer cursor_retry_;
     int ice_path_{};
     QByteArray ice_protocol_;
@@ -159,16 +160,13 @@ private:
     int requested_quality_{P2P_1080P};
     int requested_bitrate_{P2P_AUTOMATIC};
     int active_bitrate_{P2P_AUTOMATIC};
-    int video_attempts_{};
-    bool video_acknowledged_{};
-    std::uint32_t video_request_{};
+    p2premote::VideoSettingsNegotiation video_settings_{{1'000, 13'000, 12}};
     std::uint32_t confirmed_bitrate_{};
     p2p_audio_options_v1 audio_{};
     std::mutex sound_mutex_;
     std::shared_ptr<ViewerAudio> sound_;
     std::uint64_t sound_generation_{};
-    std::bitset<4> sent_buttons_;
-    std::optional<p2premote::InputPacket> drag_checkpoint_;
+    p2premote::InputSendState input_send_;
 
     std::mutex frame_mutex_;
     VideoFrame pending_frame_;

@@ -2,6 +2,7 @@
 
 #include <p2premote/core_api.h>
 #include "account_api.h"
+#include "winrt_apartment.h"
 
 #include <windows.h>
 #include <winrt/base.h>
@@ -30,13 +31,7 @@ T& Required(T* value) {
     return *value;
 }
 
-struct Apartment {
-    explicit Apartment(winrt::apartment_type type);
-    ~Apartment();
-    Apartment(const Apartment&) = delete;
-    Apartment& operator=(const Apartment&) = delete;
-};
-
 p2premote::ConnectionOptions GetConnection(const p2p_account* account);
+std::wstring FromUtf8(const char* text);
 
 } // namespace p2premote::abi

@@ -122,5 +122,6 @@ else
     echo "Archive: $output_dir/$archive_name (unsigned local build)"
 fi
 
-tar -tzf "$output_dir/$archive_name" install.sh >/dev/null
-tar -tzf "$output_dir/$archive_name" VERSION >/dev/null
+tar -tzf "$output_dir/$archive_name" > "$work/archive-contents"
+grep -Eq '^(\./)?install\.sh$' "$work/archive-contents"
+grep -Eq '^(\./)?VERSION$' "$work/archive-contents"

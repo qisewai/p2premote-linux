@@ -5,7 +5,7 @@
 #include <windows.h>
 
 #include <atomic>
-#include <bitset>
+#include <p2premote/input_state.h>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -52,8 +52,7 @@ private:
     HDESK attached_desktop_{};
     std::wstring desktop_name_;
     std::chrono::steady_clock::time_point last_desktop_check_{};
-    std::bitset<512> keys_;
-    std::bitset<4> buttons_;
+    PressedInput<> pressed_;
     std::optional<InputPacket> latest_move_;
     std::atomic<ULONGLONG> last_drag_tick_{};
     std::mutex mutex_;

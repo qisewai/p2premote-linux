@@ -1,5 +1,7 @@
 #include "credentials.h"
 
+#include <QByteArray>
+
 #include <windows.h>
 #include <wincred.h>
 
@@ -17,7 +19,7 @@ Credentials::~Credentials() {
     SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
 }
 
-std::optional<Credentials> readCredentials(const QString& server) {
+std::optional<Credentials> SecretStore::readAccount(const QString& server) {
     const auto target = targetFor(server);
     PCREDENTIALW raw{};
     if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &raw)) return std::nullopt;
@@ -32,7 +34,7 @@ std::optional<Credentials> readCredentials(const QString& server) {
     return credentials;
 }
 
-bool saveCredentials(const Credentials& credentials) {
+bool SecretStore::saveAccount(const Credentials& credentials) {
     auto target = targetFor(credentials.server);
     auto user = credentials.user.toStdWString();
     const auto bytes = credentials.password.size() * sizeof(wchar_t);
@@ -47,12 +49,12 @@ bool saveCredentials(const Credentials& credentials) {
     return CredWriteW(&entry, 0) != FALSE;
 }
 
-bool deleteCredentials(const QString& server) {
+bool SecretStore::deleteAccount(const QString& server) {
     const auto target = targetFor(server);
     return CredDeleteW(target.c_str(), CRED_TYPE_GENERIC, 0) || GetLastError() == ERROR_NOT_FOUND;
 }
 
-QString readLanSecret(const QString& key) {
+QString SecretStore::readLan(const QString& key) {
     const auto target = (QStringLiteral("P2PRemote/Qt/LAN/") + key.trimmed()).toStdWString();
     PCREDENTIALW raw{};
     if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &raw)) return {};
@@ -65,7 +67,7 @@ QString readLanSecret(const QString& key) {
     return secret;
 }
 
-bool saveLanSecret(const QString& key, const QString& secret) {
+bool SecretStore::saveLan(const QString& key, const QString& secret) {
     auto target = (QStringLiteral("P2PRemote/Qt/LAN/") + key.trimmed()).toStdWString();
     auto user = std::wstring(L"lan");
     auto value = secret.toStdWString();
@@ -83,7 +85,9 @@ bool saveLanSecret(const QString& key, const QString& secret) {
     return ok;
 }
 
-bool deleteLanSecret(const QString& key) {
+bool SecretStore::deleteLan(const QString& key) {
     const auto target = (QStringLiteral("P2PRemote/Qt/LAN/") + key.trimmed()).toStdWString();
     return CredDeleteW(target.c_str(), CRED_TYPE_GENERIC, 0) || GetLastError() == ERROR_NOT_FOUND;
 }
+
+void SecretStore::eraseTemporary(QByteArray& secret) { SecureZeroMemory(secret.data(), secret.size()); }

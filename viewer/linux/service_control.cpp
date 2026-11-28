@@ -23,6 +23,13 @@ trap 'rm -rf -- "$work"' EXIT
 TMPDIR="$work" "$1" --appimage-extract-and-run --install-and-enable-host
 )");
 
+QString describeDesktopStatus(const QString& state) {
+    if (state == QStringLiteral("display")) return QStringLiteral("已连接，正在等待活动的桌面");
+    if (state == QStringLiteral("permission")) return QStringLiteral("正在等待系统授予屏幕共享权限");
+    if (state == QStringLiteral("revoked")) return QStringLiteral("屏幕共享已停止，请重新开启或授权");
+    return {};
+}
+
 struct UnitInfo {
     bool installed{}, enabled{};
     QString state, status;
@@ -61,13 +68,13 @@ std::optional<UnitInfo> queryUnit(const QString& unit) {
 
 } // namespace
 
-bool serviceExecutableExists() {
+bool HostServiceAdapter::available() {
     return QFileInfo(systemctl).isExecutable() &&
         (QFileInfo(service_executable).isExecutable() || !appImageExecutable().isEmpty()) &&
         (geteuid() == 0 || QFileInfo(pkexec).isExecutable());
 }
 
-std::optional<HostServiceInfo> queryLinuxHostServiceInfo() {
+std::optional<HostServiceInfo> HostServiceAdapter::query() {
     const auto unit = queryUnit(service_unit);
     if (!unit) return std::nullopt;
 
@@ -110,13 +117,16 @@ std::optional<HostServiceInfo> queryLinuxHostServiceInfo() {
         info.lan_status = QStringLiteral("被控服务启动失败，请查看 systemd 日志");
     } else if (info.lan_enabled) {
         info.lan_state = P2P_WAITING;
-        if (lan_state == QStringLiteral("streaming")) {
+        if (lan_state == QStringLiteral("viewing")) {
+            info.lan_state = P2P_STREAMING;
+            info.lan_status = QStringLiteral("远程主控正在查看本机画面");
+        } else if (lan_state == QStringLiteral("streaming")) {
             info.lan_state = P2P_STREAMING;
             info.lan_desktop_control = true;
             info.lan_status = QStringLiteral("远程主控已接入");
-        } else if (lan_state == QStringLiteral("display")) {
+        } else if (const auto desktop_status = describeDesktopStatus(lan_state); !desktop_status.isEmpty()) {
             info.lan_state = P2P_NEGOTIATING;
-            info.lan_status = QStringLiteral("已连接，正在等待活动的 Xorg 桌面");
+            info.lan_status = desktop_status;
         } else if (lan_state == QStringLiteral("negotiating")) {
             info.lan_state = P2P_NEGOTIATING;
             info.lan_status = QStringLiteral("正在建立远程会话");
@@ -134,14 +144,20 @@ std::optional<HostServiceInfo> queryLinuxHostServiceInfo() {
             info.status = QStringLiteral("已上线，等待同账号设备连接");
             info.state = P2P_WAITING;
             info.cloud_online = true;
+        } else if (cloud_state == QStringLiteral("viewing")) {
+            info.status = QStringLiteral("同账号设备正在查看本机画面");
+            info.state = P2P_STREAMING;
+            info.cloud_online = true;
         } else if (cloud_state == QStringLiteral("streaming")) {
             info.status = QStringLiteral("同账号设备正在远程控制本机");
             info.state = P2P_STREAMING;
             info.desktop_control = info.cloud_online = true;
-        } else if (cloud_state == QStringLiteral("negotiating") || cloud_state == QStringLiteral("display")) {
-            info.status = cloud_state == QStringLiteral("display")
-                ? QStringLiteral("已连接，正在等待活动的 Xorg 桌面")
-                : QStringLiteral("正在建立云端远程会话");
+        } else if (const auto desktop_status = describeDesktopStatus(cloud_state); !desktop_status.isEmpty()) {
+            info.status = desktop_status;
+            info.state = P2P_NEGOTIATING;
+            info.cloud_online = true;
+        } else if (cloud_state == QStringLiteral("negotiating")) {
+            info.status = QStringLiteral("正在建立云端远程会话");
             info.state = P2P_NEGOTIATING;
             info.cloud_online = true;
         } else if (cloud_state == QStringLiteral("removed")) {
@@ -163,7 +179,7 @@ namespace {
 
 void manageService(QObject* owner, const QString& command, const QByteArray& payload,
     std::function<void(QString)> completed) {
-    if (!serviceExecutableExists()) {
+    if (!HostServiceAdapter::available()) {
         completed(QStringLiteral("未找到安装好的被控服务或系统授权工具。"));
         return;
     }
@@ -217,44 +233,47 @@ void manageService(QObject* owner, const QString& command, const QByteArray& pay
 
 } // namespace
 
-void manageLinuxHostService(QObject* owner, bool enable, std::uint16_t port, const QString& code,
-    std::function<void(QString)> completed) {
-    const auto command = enable ? QStringLiteral("--enable-service") : QStringLiteral("--disable-service");
-    manageService(owner, command, enable ? QByteArray::number(port) + '\n' + code.toUtf8() + '\n' : QByteArray{},
-        std::move(completed));
+namespace {
+
+QByteArray cloudCredentials(const HostServiceConfig& config) {
+    const QJsonObject data{{"server", config.server}, {"user", config.user},
+        {"password", QString::fromStdWString(config.password)}, {"installationId", config.installation_id},
+        {"deviceId", config.device_id}, {"relayOnly", config.relay_only}};
+    return QJsonDocument(data).toJson(QJsonDocument::Compact);
 }
 
-void manageLinuxCloudService(QObject* owner, const std::optional<HostServiceConfig>& config,
-    std::function<void(QString)> completed) {
-    const auto command = config ? QStringLiteral("--enable-cloud-service") : QStringLiteral("--disable-cloud-service");
+} // namespace
+
+void HostServiceAdapter::configure(QObject* owner, HostConfigUpdate update, bool enabled,
+    const HostServiceConfig& config, std::function<void(QString)> completed) {
+    QString command;
     QByteArray payload;
-    if (config) {
-        const QJsonObject data{{"server", config->server}, {"user", config->user},
-            {"password", QString::fromStdWString(config->password)}, {"installationId", config->installation_id},
-            {"deviceId", config->device_id}, {"relayOnly", config->relay_only}};
-        payload = QJsonDocument(data).toJson(QJsonDocument::Compact);
-    }
-    manageService(owner, command, payload, std::move(completed));
-}
-
-void manageLinuxMasterService(QObject* owner, bool install, const HostServiceConfig& config,
-    std::function<void(QString)> completed) {
-    if (!install) {
-        manageService(owner, QStringLiteral("--uninstall-host-service"), {}, std::move(completed));
+    switch (update) {
+    case HostConfigUpdate::install:
+        command = enabled ? QStringLiteral("--install-host-service") : QStringLiteral("--uninstall-host-service");
+        if (enabled && !config.server.isEmpty() && !config.user.isEmpty() && !config.password.empty() &&
+            !config.installation_id.isEmpty() && !config.device_id.isEmpty()) {
+            payload = cloudCredentials(config);
+        }
+        break;
+    case HostConfigUpdate::lan:
+        command = enabled ? QStringLiteral("--enable-service") : QStringLiteral("--disable-service");
+        if (enabled) {
+            payload = QByteArray::number(config.lan_port) + '\n' +
+                QString::fromStdWString(config.lan_access_code).toUtf8() + '\n';
+        }
+        break;
+    case HostConfigUpdate::cloud:
+        command = enabled ? QStringLiteral("--enable-cloud-service") : QStringLiteral("--disable-cloud-service");
+        if (enabled) payload = cloudCredentials(config);
+        break;
+    case HostConfigUpdate::unattended:
+        command = enabled ? QStringLiteral("--enable-unattended") : QStringLiteral("--disable-unattended");
+        break;
+    case HostConfigUpdate::monitor:
+    case HostConfigUpdate::upgrade:
+        if (completed) completed(QStringLiteral("当前系统服务不支持此操作"));
         return;
     }
-    QByteArray payload;
-    if (!config.server.isEmpty() && !config.user.isEmpty() && !config.password.empty() &&
-        !config.installation_id.isEmpty() && !config.device_id.isEmpty()) {
-        const QJsonObject data{{"server", config.server}, {"user", config.user},
-            {"password", QString::fromStdWString(config.password)}, {"installationId", config.installation_id},
-            {"deviceId", config.device_id}, {"relayOnly", config.relay_only}};
-        payload.append(QJsonDocument(data).toJson(QJsonDocument::Compact));
-    }
-    manageService(owner, QStringLiteral("--install-host-service"), payload, std::move(completed));
-}
-
-void changeLinuxUnattended(QObject* owner, bool enabled, std::function<void(QString)> completed) {
-    manageService(owner, enabled ? QStringLiteral("--enable-unattended") : QStringLiteral("--disable-unattended"),
-        {}, std::move(completed));
+    manageService(owner, command, payload, std::move(completed));
 }

@@ -3,7 +3,7 @@
 #include <p2premote/stream_session.h>
 
 #include <imm.h>
-#include <bitset>
+#include <p2premote/input_state.h>
 
 namespace p2premote {
 
@@ -43,8 +43,7 @@ private:
     bool drag_tail_pending_{};
     bool last_local_cursor_active_{};
     HCURSOR last_local_cursor_{};
-    std::bitset<4> buttons_;
-    std::bitset<512> keys_;
+    PressedInput<> pressed_;
 };
 
 } // namespace p2premote

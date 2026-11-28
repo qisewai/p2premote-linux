@@ -20,7 +20,8 @@ struct VideoFrame {
     std::chrono::steady_clock::time_point decoded_at;
 };
 
-QWidget* createVideoSurface(std::function<void()> fullscreen, QWidget* parent);
+QWidget* createVideoSurface(QWidget* parent);
+void setVideoFullscreenCallback(QWidget* widget, std::function<void()> callback);
 void attachVideoSession(QWidget* widget, ViewerSession* session);
 void setVideoCursor(QWidget* widget, DecodedCursor cursor);
 void setVideoOverlays(QWidget* widget, std::vector<p2premote::PluginOverlayItem> overlays);

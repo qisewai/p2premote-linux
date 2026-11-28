@@ -1,5 +1,7 @@
 #pragma once
 
+#include <p2premote/input_state.h>
+
 #include "managed_api.h"
 #include "stream_events.h"
 #include "video_frame.h"
@@ -8,7 +10,6 @@
 #include <p2premote/input_protocol.h>
 
 #include <atomic>
-#include <bitset>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -72,8 +73,7 @@ private:
     std::vector<IceServerOptions> ice_;
     std::vector<std::uint8_t> nv12_;
     std::atomic_bool connected_{};
-    std::bitset<4> sent_buttons_;
-    std::optional<InputPacket> drag_checkpoint_;
+    InputSendState input_send_;
     mutable std::mutex mutex_;
     std::optional<DecodedFrame> latest_;
     std::uint64_t replaced_{};

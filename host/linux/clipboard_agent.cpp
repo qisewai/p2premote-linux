@@ -17,7 +17,7 @@ using namespace p2premote;
 using namespace p2premote::linux_host;
 
 namespace {
-std::optional<ClipboardDesktop> OwnDesktop() {
+std::optional<DesktopTarget> OwnDesktop() {
     const auto uid = geteuid();
     const char* display = getenv("DISPLAY");
     if (!uid || !display || !*display) return {};
@@ -40,7 +40,7 @@ std::optional<ClipboardDesktop> OwnDesktop() {
         const std::string name(display);
         if (name != value && name != std::string(value) + ".0") return {};
     }
-    return ClipboardDesktop{id, vt, uid};
+    return DesktopTarget{DisplayServer::x11, uid, id, vt, "/run/user/" + std::to_string(uid), 1, true};
 }
 }
 
@@ -56,13 +56,14 @@ int main(int argc, char** argv) {
     // The idle listener owns no clipboard contents or mounts. Each accepted
     // connection gets its own Qt selection owner and FUSE lifetime.
     unsigned vt{};
-    while (sd_session_get_vt(desktop->session.c_str(), &vt) >= 0 && vt == desktop->vt) {
+    while (sd_session_get_vt(desktop->session_id.c_str(), &vt) >= 0 && vt == desktop->vt) {
         pollfd waiting{listener, POLLIN, 0};
         if (poll(&waiting, 1, 2000) <= 0) continue;
         const int fd = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (fd < 0) continue;
+        const auto active = ActiveUserDesktop();
         if ((!ClipboardPeer(fd, 0, {}) && !ClipboardPeer(fd, desktop->uid, host)) ||
-            ActiveClipboardDesktop() != desktop) {
+            !active || !active->valid() || !active->SameLogin(*desktop)) {
             close(fd);
             continue;
         }

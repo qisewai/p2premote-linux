@@ -2,6 +2,7 @@
 #include "pty_session.h"
 #if defined(_WIN32)
 #include "agent_audit.h"
+#include "winrt_apartment.h"
 #include "clipboard_bridge.h"
 #include "file_clipboard.h"
 #include "plugin_settings.h"
@@ -3293,8 +3294,7 @@ struct PluginHost::Impl {
             while (!stop.stop_requested() && !connected.load()) wake.WaitUntilConnected();
             if (stop.stop_requested()) return;
 #if defined(_WIN32)
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-            struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
+            const WinrtApartment apartment;
 #endif
             PluginRuntime runtime(host, send, connected, workspace, config_root.empty() ? DefaultPluginSettingsDirectory()
                 : config_root, wake, local_overlay, *overlays, diagnostics_only);

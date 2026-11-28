@@ -1,7 +1,10 @@
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(PkgConfig REQUIRED)
 find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets Network WebSockets)
-pkg_check_modules(LINUX_HOST_X11 REQUIRED IMPORTED_TARGET xcb xcb-shm xcb-xfixes xau)
+option(P2PREMOTE_LINUX_HOST_X11 "Build the X11 desktop backend" ON)
+if(P2PREMOTE_LINUX_HOST_X11)
+    pkg_check_modules(LINUX_HOST_X11 REQUIRED IMPORTED_TARGET xcb xcb-shm xcb-xfixes xau)
+endif()
 pkg_check_modules(LINUX_HOST_AUDIO REQUIRED IMPORTED_TARGET libpulse libsystemd)
 find_path(LIBYUV_INCLUDE_DIR libyuv.h REQUIRED)
 find_library(LIBYUV_LIBRARY NAMES yuv REQUIRED)
@@ -16,31 +19,47 @@ if(NOT P2PREMOTE_LINUX_MINIRTC_INCLUDE OR NOT P2PREMOTE_LINUX_MINIRTC_LIBRARY)
     message(FATAL_ERROR "Build the Linux MiniRTC library with bash tools/minirtc_probe/Build-Linux.sh first.")
 endif()
 
-qt6_add_executable(p2premote_linux_host
-    host/linux/main.cpp
+add_library(p2premote_linux_host_session STATIC
+    host/linux/desktop_target.cpp
     host/linux/clipboard_endpoint.cpp
     host/linux/clipboard_relay.cpp
     proto/plugin_protocol.cpp
-    host/linux/cloud_host.cpp
     host/linux/desktop_audio.cpp
-    host/linux/x11_shm_capturer.cpp
-    host/linux/uinput_injector.cpp
     host/linux/lan_signal_server.cpp
     host/linux/host_session.cpp
+    host/linux/video_frame_conversion.cpp
     host/linux/service_support.cpp
-    viewer/linux/cloud_connection.cpp
     proto/input_protocol.cpp)
-target_compile_definitions(p2premote_linux_host PRIVATE
+target_compile_definitions(p2premote_linux_host_session PRIVATE
     P2PREMOTE_INSTALLED_GUI="${CMAKE_INSTALL_FULL_LIBEXECDIR}/p2premote/gui/p2premote")
-target_compile_features(p2premote_linux_host PRIVATE cxx_std_20)
+target_compile_features(p2premote_linux_host_session PUBLIC cxx_std_20)
+target_compile_options(p2premote_linux_host_session PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(p2premote_linux_host_session
+    PUBLIC proto/include core/include tools/minirtc_probe host/linux PRIVATE core core/src viewer/linux)
+target_include_directories(p2premote_linux_host_session SYSTEM PUBLIC "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}")
+target_include_directories(p2premote_linux_host_session SYSTEM PRIVATE "${LIBYUV_INCLUDE_DIR}")
+target_link_libraries(p2premote_linux_host_session PRIVATE p2premote_update_core Qt6::Core Qt6::Network
+    OpenSSL::Crypto PkgConfig::LINUX_HOST_AUDIO pthread "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}")
+
+qt6_add_executable(p2premote_linux_host
+    host/linux/main.cpp
+    host/linux/backend_factory.cpp
+    host/linux/cloud_host.cpp
+    viewer/linux/cloud_connection.cpp)
+target_compile_definitions(p2premote_linux_host PRIVATE P2PREMOTE_LINUX_HOST_X11=$<BOOL:${P2PREMOTE_LINUX_HOST_X11}>)
 target_compile_options(p2premote_linux_host PRIVATE -Wall -Wextra -Wpedantic)
-target_include_directories(p2premote_linux_host PRIVATE
-    proto/include core core/include core/src tools/minirtc_probe host/linux viewer/linux)
-target_include_directories(p2premote_linux_host SYSTEM PRIVATE
-    "${P2PREMOTE_LINUX_MINIRTC_INCLUDE}" "${LIBYUV_INCLUDE_DIR}")
-target_link_libraries(p2premote_linux_host PRIVATE
-    p2premote_update_core Qt6::Core Qt6::Network Qt6::WebSockets OpenSSL::Crypto PkgConfig::LINUX_HOST_X11 PkgConfig::LINUX_HOST_AUDIO pthread
-    "${P2PREMOTE_LINUX_MINIRTC_LIBRARY}" "${LIBYUV_LIBRARY}")
+target_include_directories(p2premote_linux_host PRIVATE core core/src viewer/linux)
+target_link_libraries(p2premote_linux_host PRIVATE p2premote_linux_host_session p2premote_update_core
+    Qt6::Core Qt6::Network Qt6::WebSockets OpenSSL::Crypto PkgConfig::LINUX_HOST_AUDIO)
+if(P2PREMOTE_LINUX_HOST_X11)
+    target_sources(p2premote_linux_host PRIVATE
+        host/linux/x11_desktop_session.cpp
+        host/linux/x11_shm_capturer.cpp
+        host/linux/uinput_injector.cpp
+        host/linux/cursor_packet.cpp
+        host/linux/linux_key_map.cpp)
+    target_link_libraries(p2premote_linux_host PRIVATE PkgConfig::LINUX_HOST_X11)
+endif()
 set_target_properties(p2premote_linux_host PROPERTIES
     BUILD_RPATH "\$ORIGIN/lib"
     INSTALL_RPATH "\$ORIGIN/lib")
@@ -72,7 +91,7 @@ endif()
 pkg_check_modules(LINUX_LUA REQUIRED IMPORTED_TARGET lua5.4)
 pkg_check_modules(LINUX_FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 add_library(linux_host_clipboard STATIC
-    host/linux/clipboard_session.cpp host/linux/clipboard_endpoint.cpp
+    host/linux/clipboard_session.cpp host/linux/clipboard_endpoint.cpp host/linux/desktop_target.cpp
     viewer/linux/file_clipboard.cpp viewer/linux/plugin_platform.cpp
     core/src/plugin_host.cpp core/src/pty_session_posix.cpp proto/plugin_protocol.cpp)
 target_compile_features(linux_host_clipboard PUBLIC cxx_std_20)
@@ -119,14 +138,11 @@ set_tests_properties(linux_clipboard_session_test PROPERTIES ENVIRONMENT "QT_QPA
 
 add_executable(linux_host_test
     host/linux/linux_host_test.cpp
-    host/linux/x11_shm_capturer.cpp
-    host/linux/uinput_injector.cpp
-    host/linux/lan_signal_server.cpp
-    proto/input_protocol.cpp)
+    host/linux/linux_key_map.cpp
+    host/linux/cursor_packet.cpp)
 target_compile_features(linux_host_test PRIVATE cxx_std_20)
 target_compile_options(linux_host_test PRIVATE -Wall -Wextra -Wpedantic)
-target_include_directories(linux_host_test PRIVATE proto/include host/linux)
-target_link_libraries(linux_host_test PRIVATE OpenSSL::Crypto PkgConfig::LINUX_HOST_X11 pthread)
+target_link_libraries(linux_host_test PRIVATE p2premote_linux_host_session)
 add_test(NAME linux_host_test COMMAND linux_host_test)
 set_tests_properties(linux_host_test PROPERTIES TIMEOUT 10)
 

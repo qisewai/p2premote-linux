@@ -5,7 +5,6 @@
 #include "minirtc_desktop_video.h"
 #include <p2premote/plugin_protocol.h>
 
-#include <libyuv.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -15,6 +14,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <utility>
 
 namespace p2premote::linux_host {
 namespace {
@@ -56,20 +56,24 @@ std::string InjectEmptyLanIce(const std::string& json) {
 
 } // namespace
 
-LinuxHostSession::LinuxHostSession(HostConfig config, std::unique_ptr<LinuxCaptureBackend> capturer,
+LinuxHostSession::LinuxHostSession(HostConfig config, std::unique_ptr<DesktopSession> desktop,
     std::optional<CloudCallbacks> cloud)
     : config_(std::move(config)),
       cloud_(std::move(cloud)),
       api_(P2PRemoteMiniRtcApi(p2premote::native_minirtc::abi_version)),
-      capturer_(std::move(capturer)),
+      desktop_(std::move(desktop)),
       max_height_(config_.max_height) {
     if (!api_) {
         std::cerr << "[host] MiniRTC ABI version mismatch\n";
         return;
     }
-    if (!injector_.Valid()) {
-        std::cerr << "[host] Could not create the virtual keyboard and mouse via /dev/uinput\n";
+    if (!desktop_ || !desktop_->Start()) {
+        std::cerr << "[host] No usable desktop backend\n";
         return;
+    }
+    desktop_access_.Attach(desktop_->Input());
+    if (!desktop_access_.CanInject()) {
+        std::cerr << "[host] Input unavailable, desktop viewing remains available\n";
     }
 
     if (!cloud_) {
@@ -78,12 +82,14 @@ LinuxHostSession::LinuxHostSession(HostConfig config, std::unique_ptr<LinuxCaptu
         cb.on_minirtc = [this](const std::string& payload) { OnMiniRtcSignal(payload); };
         cb.on_ended = [this](const std::string& reason) { OnClientEnded(reason); };
         server_ = std::make_unique<LanSignalServer>(
-            config_.display_name, config_.port, config_.access_code, std::move(cb), config_.discovery_port);
+            config_.display_name, config_.port, config_.access_code, std::move(cb), config_.discovery_port,
+            SupportsControl());
         if (!server_->Start()) return;
     }
     capture_thread_ = std::jthread([this](std::stop_token stop) { CaptureLoop(stop); });
     audio_thread_ = std::jthread([this](std::stop_token stop) {
-        StreamDesktopAudio(stop, [this] { return AudioState(); },
+        auto audio = CreateDesktopAudio();
+        audio->Capture(stop, [this] { return AudioState(); },
             [this](DesktopAudioState state, const char* data, std::size_t size) { SendDesktopAudio(state, data, size); });
     });
 }
@@ -99,6 +105,7 @@ LinuxHostSession::~LinuxHostSession() {
     }
     if (server_) server_->Stop();
     StopPeer();
+    if (desktop_) desktop_->Stop();
 }
 
 void LinuxHostSession::OnClientAuthed(const std::string& peer_ip) {
@@ -192,9 +199,9 @@ bool LinuxHostSession::StartPeer(TurnMode turn) {
     peer_ = peer;
     {
         const std::lock_guard guard(clipboard_mutex_);
-        clipboard_ = std::make_unique<ClipboardRelay>([this] { return ClipboardVt(); }, [this](unsigned vt, std::string_view frame) {
+        clipboard_ = CreateClipboardBridge([this] { return ClipboardTarget(); }, [this](const DesktopTarget& target, std::string_view frame) {
             const std::lock_guard lock(peer_mutex_);
-            return peer_ && vt && ClipboardVt() == vt && api_->send_reliable(peer_, frame.data(), frame.size(), "plugin") == 0;
+            return peer_ && ClipboardTarget() == target && api_->send_reliable(peer_, frame.data(), frame.size(), "plugin") == 0;
         });
     }
     connected_.store(false, std::memory_order_release);
@@ -202,8 +209,7 @@ bool LinuxHostSession::StartPeer(TurnMode turn) {
     force_cursor_.store(true, std::memory_order_release);
     {
         const std::lock_guard ilock(input_mutex_);
-        input_state_ = InputReceiveState{};
-        last_input_ms_ = 0;
+        desktop_access_.Clear();
         peer_active_.store(true, std::memory_order_release);
     }
     return true;
@@ -216,12 +222,11 @@ void LinuxHostSession::StopPeer() {
         connected_.store(false, std::memory_order_release);
         cursor_ready_.store(false, std::memory_order_release);
         ++peer_generation_;
-        frame_sent_ = false;
         speaker_enabled_ = false;
         ++audio_revision_;
-        injector_.ReleaseAll();
+        desktop_access_.Clear();
     }
-    std::unique_ptr<ClipboardRelay> clipboard;
+    std::unique_ptr<ClipboardBridge> clipboard;
     {
         const std::lock_guard lock(clipboard_mutex_);
         clipboard = std::move(clipboard_);
@@ -256,16 +261,14 @@ void LinuxHostSession::ConnectionStatusCb(ConnectionStatus status, const char*, 
         if (!self->connected_.exchange(true, std::memory_order_acq_rel)) {
             if (self->server_) self->server_->SetMediaConnected(true);
             self->PublishState("display");
-            self->last_input_ms_ = MonotonicMs();
             self->force_cursor_.store(true, std::memory_order_release);
         }
     } else if (status == Closed || status == Failed || status == Disconnected ||
                status == IncorrectPassword || status == NoSuchTransmissionId || status == RemoteUnavailable) {
         self->connected_.store(false, std::memory_order_release);
-        self->frame_sent_ = false;
         self->speaker_enabled_ = false;
         ++self->audio_revision_;
-        self->injector_.ReleaseAll();
+        self->desktop_access_.Clear();
         if (self->cloud_) self->cloud_->disconnected(self->PeerGeneration());
         else self->server_->EndActiveClient("MiniRTC disconnected");
     }
@@ -305,10 +308,8 @@ void LinuxHostSession::HandleData(const char* data, std::size_t size, const char
         if (label == kControlStream) {
             if (const auto command = DecodeInputCommand(bytes)) {
                 const std::lock_guard ilock(input_mutex_);
-                if (connected_.load(std::memory_order_acquire) && frame_sent_ && capturer_->InputAvailable() &&
-                    input_state_.AcceptCommand(*command, MonotonicMs())) {
-                    last_input_ms_ = MonotonicMs();
-                    injector_.ApplyCommand(*command);
+                if (connected_.load(std::memory_order_acquire) && DesktopCurrentLocked()) {
+                    desktop_access_.Apply(*command, MonotonicMs());
                 }
             }
         }
@@ -356,25 +357,25 @@ void LinuxHostSession::HandleData(const char* data, std::size_t size, const char
     if (label == kPointerStream && packet->kind != InputKind::move) return;
 
     const std::lock_guard ilock(input_mutex_);
-    if (!connected_.load(std::memory_order_acquire) || !frame_sent_ || !capturer_->InputAvailable()) return;
-    const auto accepted = input_state_.Accept(*packet, now);
-    if (!accepted) return;
-    last_input_ms_ = now;
-    if (accepted->kind == InputKind::heartbeat) return;
-    injector_.Apply(*accepted);
+    if (connected_.load(std::memory_order_acquire) && DesktopCurrentLocked()) desktop_access_.Apply(*packet, now);
 }
 
-unsigned LinuxHostSession::ClipboardVt() {
+bool LinuxHostSession::DesktopCurrentLocked() const {
+    return desktop_access_.Target().valid() && desktop_access_.Matches(desktop_->State(), desktop_->Target());
+}
+
+std::optional<DesktopTarget> LinuxHostSession::ClipboardTarget() {
     const std::lock_guard lock(input_mutex_);
-    return connected_.load() && frame_sent_ ? capturer_->ActiveFrameVt() : 0;
+    if (!connected_.load() || !SupportsControl() || !DesktopCurrentLocked() ||
+        !desktop_->Capabilities().clipboard_control) return {};
+    return desktop_access_.UserTarget();
 }
 
 std::optional<DesktopAudioState> LinuxHostSession::AudioState() {
     const std::lock_guard lock(input_mutex_);
-    if (!connected_.load(std::memory_order_acquire) || !frame_sent_ || !speaker_enabled_) return std::nullopt;
-    const auto vt = capturer_->ActiveFrameVt();
-    if (!vt) return std::nullopt;
-    return DesktopAudioState{audio_revision_, vt};
+    if (!connected_.load() || !speaker_enabled_ || !DesktopCurrentLocked()) return {};
+    if (auto target = desktop_access_.UserTarget()) return DesktopAudioState{audio_revision_, std::move(*target)};
+    return {};
 }
 
 void LinuxHostSession::SendDesktopAudio(DesktopAudioState state, const char* data, std::size_t size) {
@@ -392,12 +393,14 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
     std::uint64_t frames_sent = 0;
     std::uint64_t previous_generation = 0;
     bool logged_first_frame = false;
+    std::string_view waiting_status = "display";
 
     while (!stop.stop_requested()) {
         const auto generation = peer_generation_.load(std::memory_order_acquire);
         if (previous_generation != generation) {
             previous_generation = generation;
             logged_first_frame = false;
+            waiting_status = "display";
             frames_sent = 0;
             cadence.Reset();
         }
@@ -409,21 +412,27 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
 
         const auto tick_start = std::chrono::steady_clock::now();
 
-        {
+        const auto recheck_desktop = [&] {
+            const auto state = desktop_->State();
+            const auto status = WaitingDesktopStatus(state);
             const std::lock_guard ilock(input_mutex_);
-            const bool display_lost = frame_sent_ && !capturer_->InputAvailable();
-            if (display_lost || (last_input_ms_ > 0 && MonotonicMs() - last_input_ms_ > input_lease_ms)) {
-                injector_.ReleaseAll();
-                last_input_ms_ = 0;
-            }
+            const bool display_lost = desktop_access_.Recheck(state, desktop_->Target(), MonotonicMs());
             if (display_lost) {
-                frame_sent_ = false;
                 cadence.Reset();
-                PublishState("display");
+                force_cursor_.store(true, std::memory_order_release);
             }
-        }
+            if (display_lost || (!desktop_access_.Target().valid() && status != waiting_status)) {
+                waiting_status = status;
+                PublishState(status);
+            }
+            return state != DesktopSessionState::waiting_permission && state != DesktopSessionState::revoked &&
+                state != DesktopSessionState::error;
+        };
 
-        if (const auto frame = capturer_->GrabFrame()) {
+        const bool can_capture = recheck_desktop();
+        const auto frame = can_capture ? desktop_->AcquireLatestFrame() : std::nullopt;
+        const bool desktop_allowed = can_capture && recheck_desktop();
+        if (frame && desktop_allowed && ValidFrame(*frame)) {
             const int cap_h = max_height_.load(std::memory_order_acquire);
             int dst_w = frame->width;
             int dst_h = frame->height;
@@ -436,41 +445,26 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
 
             const auto submission = dst_w >= 64 && dst_h >= 64
                 ? cadence.Next(*frame, dst_w, dst_h, tick_start) : FrameSubmission::skip;
-            if (submission != FrameSubmission::skip) {
-                if (submission == FrameSubmission::convert) {
-                    const std::uint8_t* src_bgra = frame->bgra;
-                    int src_stride = frame->stride;
-                    if (dst_w != frame->width || dst_h != frame->height) {
-                        scaled_bgra_.resize(static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h) * 4u);
-                        libyuv::ARGBScale(frame->bgra, frame->stride, frame->width, frame->height,
-                            scaled_bgra_.data(), dst_w * 4, dst_w, dst_h, libyuv::kFilterBilinear);
-                        src_bgra = scaled_bgra_.data();
-                        src_stride = dst_w * 4;
-                    }
-
-                    const auto luma = static_cast<std::size_t>(dst_w) * dst_h;
-                    nv12_.resize(luma + luma / 2);
-                    libyuv::ARGBToNV12(src_bgra, src_stride,
-                        nv12_.data(), dst_w, nv12_.data() + luma, dst_w, dst_w, dst_h);
-                }
-
+            const bool converted = submission != FrameSubmission::convert || nv12_.Convert(*frame, dst_w, dst_h);
+            if (!converted) cadence.Reset();
+            if (converted && submission != FrameSubmission::skip) {
                 MiniRtcVideoFrame vf{};
-                vf.data = reinterpret_cast<const char*>(nv12_.data());
-                vf.size = nv12_.size();
+                vf.data = reinterpret_cast<const char*>(nv12_.Pixels().data());
+                vf.size = nv12_.Pixels().size();
                 vf.width = static_cast<std::uint32_t>(dst_w);
                 vf.height = static_cast<std::uint32_t>(dst_h);
 
                 const std::lock_guard lock(peer_mutex_);
                 if (peer_ && connected_.load(std::memory_order_acquire) && generation == peer_generation_.load() &&
+                    desktop_->IsFrameCurrent(*frame) &&
                     api_->send_video(peer_, &vf, kVideoStream) == 0) {
                     cadence.Submitted(tick_start);
-                    capturer_->MarkFrameSent();
+                    desktop_->MarkFrameSent();
                     {
                         const std::lock_guard ilock(input_mutex_);
-                        if (!frame_sent_ && connected_.load(std::memory_order_acquire) && capturer_->InputAvailable()) {
-                            frame_sent_ = true;
-                            injector_.WakeDisplay();
-                            PublishState("streaming");
+                        if (connected_.load(std::memory_order_acquire) &&
+                            desktop_access_.Activate(desktop_->Target())) {
+                            PublishState(SupportsControl() ? "streaming" : "viewing");
                         }
                     }
                     ++frames_sent;
@@ -478,16 +472,14 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
                         logged_first_frame = true;
                         last_stats_log = tick_start;
                         std::cout << "[host] first frame submitted: " << dst_w << "x" << dst_h
-                                  << " (" << capturer_->Describe() << ")\n" << std::flush;
+                                  << " (" << desktop_->Describe() << ")\n" << std::flush;
                     } else if (tick_start - last_stats_log >= std::chrono::seconds(10)) {
                         last_stats_log = tick_start;
                         std::cout << "[host] streaming: " << frames_sent << " frames sent, "
-                                  << dst_w << "x" << dst_h << " (" << capturer_->Describe() << ")\n" << std::flush;
+                                  << dst_w << "x" << dst_h << " (" << desktop_->Describe() << ")\n" << std::flush;
                     }
                 }
             }
-        } else {
-            cadence.Reset();
         }
 
         if (cursor_ready_.load(std::memory_order_acquire) &&
@@ -495,7 +487,7 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
              force_cursor_.load(std::memory_order_acquire))) {
             last_cursor_poll = tick_start;
             const bool force = force_cursor_.exchange(false, std::memory_order_acq_rel);
-            if (const auto cursor = capturer_->PollCursor(force)) {
+            if (const auto cursor = desktop_->PollCursor(force)) {
                 const std::lock_guard lock(peer_mutex_);
                 if (peer_ && connected_.load(std::memory_order_acquire) && generation == peer_generation_.load()) {
                     api_->send_reliable(peer_, cursor->packet.data(), cursor->packet.size(), kCursorStream);
@@ -505,7 +497,7 @@ void LinuxHostSession::CaptureLoop(std::stop_token stop) {
 
         const auto elapsed = std::chrono::steady_clock::now() - tick_start;
         if (elapsed < frame_interval) {
-            std::this_thread::sleep_for(frame_interval - elapsed);
+            desktop_->WaitForActivity(std::chrono::ceil<std::chrono::microseconds>(frame_interval - elapsed), stop);
         }
     }
 }

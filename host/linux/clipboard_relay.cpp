@@ -8,9 +8,24 @@
 #include <unistd.h>
 
 namespace p2premote::linux_host {
+namespace {
 
-ClipboardRelay::ClipboardRelay(FrameVt vt, Send send)
-    : worker_([this, vt = std::move(vt), send = std::move(send)](std::stop_token stop) { Run(stop, vt, send); }) {}
+class ClipboardRelay final : public ClipboardBridge {
+public:
+    ClipboardRelay(ActiveTarget target, Send send);
+    void Receive(std::string_view bytes) override;
+
+private:
+    void Run(std::stop_token stop, const ActiveTarget& target, const Send& send);
+    std::mutex mutex_;
+    std::deque<std::string> pending_;
+    size_t queued_bytes_{};
+    bool attached_{}, failed_{};
+    std::jthread worker_; // join before destroying the queue
+};
+
+ClipboardRelay::ClipboardRelay(ActiveTarget target, Send send)
+    : worker_([this, target = std::move(target), send = std::move(send)](std::stop_token stop) { Run(stop, target, send); }) {}
 
 void ClipboardRelay::Receive(std::string_view bytes) {
     if (!ClipboardFrame(bytes)) return;
@@ -29,33 +44,34 @@ void ClipboardRelay::Receive(std::string_view bytes) {
     queued_bytes_ += bytes.size();
 }
 
-void ClipboardRelay::Run(std::stop_token stop, const FrameVt& vt, const Send& send) {
+void ClipboardRelay::Run(std::stop_token stop, const ActiveTarget& target, const Send& send) {
     using namespace std::chrono_literals;
     std::error_code ec;
     const auto dir = std::filesystem::read_symlink("/proc/self/exe", ec).parent_path();
     if (ec) return;
     const auto helper = dir / "p2premote_clipboard";
     int fd = -1;
-    std::optional<ClipboardDesktop> desktop;
+    std::optional<DesktopTarget> desktop;
     auto check_at = std::chrono::steady_clock::time_point{};
     std::array<char, plugin_frame_limit> buffer;
     std::string outgoing;
     while (!stop.stop_requested()) {
-        const unsigned frame_vt = vt();
-        if (desktop && desktop->vt != frame_vt) break;
+        const auto frame_target = target();
+        if (desktop && desktop != frame_target) break;
         const auto now = std::chrono::steady_clock::now();
-        if (frame_vt && now >= check_at) {
+        if (frame_target && now >= check_at) {
             check_at = now + 200ms;
-            const auto active = ActiveClipboardDesktop();
-            if (desktop && desktop != active) break;
-            if (!desktop && active && active->vt == frame_vt) {
+            const auto active = ActiveUserDesktop();
+            const bool accessible = active && active->valid() && frame_target->SameLogin(*active);
+            if (desktop && !accessible) break;
+            if (!desktop && accessible) {
                 fd = OpenClipboardEndpoint(*active, false);
                 if (fd >= 0 && !ClipboardPeer(fd, active->uid, helper.string())) {
                     close(fd);
                     fd = -1;
                 }
                 if (fd >= 0) {
-                    desktop = active;
+                    desktop = frame_target;
                     const std::lock_guard lock(mutex_);
                     attached_ = true;
                 }
@@ -78,7 +94,7 @@ void ClipboardRelay::Run(std::stop_token stop, const FrameVt& vt, const Send& se
             if (failed_) break;
         }
         if (!outgoing.empty()) {
-            if (send(frame_vt, outgoing)) outgoing.clear();
+            if (send(*desktop, outgoing)) outgoing.clear();
             else std::this_thread::sleep_for(5ms);
             continue;
         }
@@ -89,12 +105,18 @@ void ClipboardRelay::Run(std::stop_token stop, const FrameVt& vt, const Send& se
         if (n <= 0 || static_cast<size_t>(n) > buffer.size()) break;
         const std::string_view packet(buffer.data(), n);
         if (!ClipboardFrame(packet)) break;
-        if (!send(frame_vt, packet)) outgoing.assign(packet);
+        if (!send(*desktop, packet)) outgoing.assign(packet);
     }
     if (fd >= 0) close(fd);
     const std::lock_guard lock(mutex_);
     failed_ = true;
     pending_.clear();
+}
+
+} // namespace
+
+std::unique_ptr<ClipboardBridge> CreateClipboardBridge(ClipboardBridge::ActiveTarget target, ClipboardBridge::Send send) {
+    return std::make_unique<ClipboardRelay>(std::move(target), std::move(send));
 }
 
 } // namespace p2premote::linux_host

@@ -4,7 +4,7 @@
 #include "host_session.h"
 #include "service_support.h"
 #include "update/update_archive.h"
-#include "x11_shm_capturer.h"
+#include "backend_factory.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -203,7 +203,7 @@ private:
             }, Qt::QueuedConnection);
         };
         media_ = std::make_unique<LinuxHostSession>(
-            media_config_, std::make_unique<X11ShmCapturer>(), std::move(callbacks));
+            media_config_, CreateDesktopSession(media_config_.backend), std::move(callbacks));
         if (!media_->Valid()) media_.reset();
         return media_ != nullptr;
     }
@@ -321,7 +321,7 @@ private:
             state_ = State::session;
             Publish("negotiating");
             deadline_.start(25000);
-            if (!send("accept", "control")) reconnect(false);
+            if (!send("accept", media_->SupportsControl() ? "control" : "view")) reconnect(false);
             return;
         }
         if (type != "minirtc" || state_ != State::session) {
@@ -542,7 +542,7 @@ int RunSystemService(int argc, char** argv, HostConfig lan_base) {
 
     std::unique_ptr<LinuxHostSession> lan_session;
     auto start_lan = [&]() -> bool {
-        auto next = std::make_unique<LinuxHostSession>(lan_cfg, std::make_unique<X11ShmCapturer>());
+        auto next = std::make_unique<LinuxHostSession>(lan_cfg, CreateDesktopSession(lan_cfg.backend));
         if (!next->Valid()) return false;
         lan_session = std::move(next);
         return true;

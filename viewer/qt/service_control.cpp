@@ -67,11 +67,11 @@ bool isProcessElevated() {
     return ok && elevation.TokenIsElevated != 0;
 }
 
-bool serviceExecutableExists() {
+bool HostServiceAdapter::available() {
     return QFileInfo::exists(QString::fromStdWString(serviceExePath()));
 }
 
-HostServiceInfo queryHostServiceInfo() {
+std::optional<HostServiceInfo> HostServiceAdapter::query() {
     HostServiceInfo info;
     if (SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT)) {
         if (SC_HANDLE svc = OpenServiceW(scm, kServiceName, SERVICE_QUERY_STATUS)) {
@@ -88,7 +88,7 @@ HostServiceInfo queryHostServiceInfo() {
     return info;
 }
 
-HostServiceInfo queryHostWorkerStatus(HostServiceInfo info) {
+HostServiceInfo HostServiceAdapter::queryWorker(HostServiceInfo info) {
     bool trusted{};
     if (const auto reply = ReadServiceStatus(250, &trusted)) {
         const auto doc = QJsonDocument::fromJson(QByteArray::fromStdString(*reply));
@@ -128,7 +128,7 @@ HostServiceInfo queryHostWorkerStatus(HostServiceInfo info) {
     return info;
 }
 
-bool installHostService(const HostServiceConfig& config, HostConfigUpdate update, QString* error) {
+static bool installHostService(const HostServiceConfig& config, HostConfigUpdate update, QString* error) {
     const auto exe = serviceExePath();
     if (!QFileInfo::exists(QString::fromStdWString(exe))) {
         if (error) *error = QStringLiteral("未找到 p2premote_service.exe，请重新解压完整客户端。");
@@ -141,6 +141,9 @@ bool installHostService(const HostServiceConfig& config, HostConfigUpdate update
     case HostConfigUpdate::cloud: obj.insert(QStringLiteral("update"), QStringLiteral("cloud")); break;
     case HostConfigUpdate::monitor: obj.insert(QStringLiteral("update"), QStringLiteral("monitor")); break;
     case HostConfigUpdate::install: break;
+    case HostConfigUpdate::unattended:
+    case HostConfigUpdate::upgrade:
+        return false;
     }
     if (!config.server.isEmpty() && !config.user.isEmpty() && !config.password.empty()
             && !config.installation_id.isEmpty() && !config.device_id.isEmpty()) {
@@ -179,25 +182,41 @@ bool installHostService(const HostServiceConfig& config, HostConfigUpdate update
     return ok;
 }
 
-bool upgradeHostService(QString* error) {
-    return runElevatedAndWait(serviceExePath(), L"--upgrade", error);
-}
-
-bool updateHostUnattended(bool enabled, QString* error) {
-    return runElevatedAndWait(serviceExePath(), enabled ? L"--enable-unattended" : L"--disable-unattended", error);
-}
-
-bool disableHostCloud(QString* error) {
-    return runElevatedAndWait(serviceExePath(), L"--disable-cloud", error);
-}
-
-bool uninstallHostService(QString* error) {
+static bool uninstallHostService(QString* error) {
     const auto exe = serviceExePath();
     if (!QFileInfo::exists(QString::fromStdWString(exe))) {
         if (error) *error = QStringLiteral("未找到 p2premote_service.exe。");
         return false;
     }
     return runElevatedAndWait(exe, L"--uninstall", error);
+}
+
+bool HostServiceAdapter::configureSync(HostConfigUpdate update, bool enabled, const HostServiceConfig& config,
+    QString* error) {
+    switch (update) {
+    case HostConfigUpdate::install:
+        return enabled ? installHostService(config, update, error) : uninstallHostService(error);
+    case HostConfigUpdate::cloud:
+        return enabled ? installHostService(config, update, error)
+                       : runElevatedAndWait(serviceExePath(), L"--disable-cloud", error);
+    case HostConfigUpdate::unattended:
+        return runElevatedAndWait(serviceExePath(), enabled ? L"--enable-unattended" : L"--disable-unattended", error);
+    case HostConfigUpdate::upgrade:
+        return runElevatedAndWait(serviceExePath(), L"--upgrade", error);
+    case HostConfigUpdate::lan:
+    case HostConfigUpdate::monitor:
+        return installHostService(config, update, error);
+    }
+    return false;
+}
+
+void HostServiceAdapter::configure(QObject*, HostConfigUpdate update, bool enabled, const HostServiceConfig& config,
+    std::function<void(QString)> completed) {
+    QString error;
+    if (!configureSync(update, enabled, config, &error) && error.isEmpty()) {
+        error = QStringLiteral("无法更新被控服务");
+    }
+    if (completed) completed(std::move(error));
 }
 
 bool relaunchClientElevated(QString* error) {

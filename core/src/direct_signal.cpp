@@ -1,4 +1,7 @@
+#include <p2premote/session_policy.h>
+
 #include "direct_signal.h"
+#include "winrt_apartment.h"
 
 #include "stream_events.h"
 
@@ -130,7 +133,7 @@ std::string HmacSha256Hex(const std::array<std::uint8_t, 32>& key, std::string_v
 
 std::array<std::uint8_t, 32> DeriveAccessKey(const std::wstring& access_code) {
     const auto utf8 = winrt::to_string(access_code);
-    return Sha256Bytes("p2premote-lan-v1:" + utf8);
+    return Sha256Bytes(lan_access_key_prefix + utf8);
 }
 
 bool ConstantTimeEquals(std::string_view a, std::string_view b) noexcept {
@@ -198,26 +201,26 @@ std::string RelayMiniRtc(std::string_view payload, bool from_host) {
     if (payload.size() > 64 * 1024) throw std::runtime_error("局域网媒体信令过长");
     const auto request = JsonObject::Parse(winrt::to_hstring(payload));
     const auto kind = request.GetNamedString(L"type", L"");
+    const auto relay = ClassifyLanMedia(winrt::to_string(kind), from_host);
     JsonObject notice;
     notice.SetNamedValue(L"transmission_id", JsonValue::CreateStringValue(L"host"));
-    if (!from_host && (kind == L"join_transmission" || kind == L"user_join_transmission")) {
+    if (relay == LanMediaSignal::join) {
         notice.SetNamedValue(L"type", JsonValue::CreateStringValue(L"user_join_transmission"));
         notice.SetNamedValue(L"status", JsonValue::CreateStringValue(L"success"));
         notice.SetNamedValue(L"user_id", JsonValue::CreateStringValue(L"viewer"));
-    } else if ((from_host && kind == L"offer") || (!from_host && kind == L"answer") ||
-            kind == L"new_candidate" || kind == L"new_candidate_mid") {
+    } else if (relay != LanMediaSignal::invalid) {
         notice.SetNamedValue(L"type", JsonValue::CreateStringValue(kind));
         notice.SetNamedValue(L"remote_user_id", JsonValue::CreateStringValue(from_host ? L"host" : L"viewer"));
         const auto copy_string = [&](const wchar_t* name) {
             notice.SetNamedValue(name, JsonValue::CreateStringValue(request.GetNamedString(name)));
         };
-        if (kind == L"new_candidate_mid") {
+        if (relay == LanMediaSignal::candidate_mid) {
             copy_string(L"mid");
             copy_string(L"candidate");
         } else {
             copy_string(L"sdp");
         }
-        if ((kind == L"new_candidate" || kind == L"new_candidate_mid") && request.HasKey(L"ufrag")) {
+        if ((relay == LanMediaSignal::candidate || relay == LanMediaSignal::candidate_mid) && request.HasKey(L"ufrag")) {
             copy_string(L"ufrag");
         }
     } else {
@@ -384,14 +387,8 @@ DirectSignalServer::DirectSignalServer(std::shared_ptr<StreamEvents> events, std
       worker_([this, bind_address = std::move(bind_address), port, access_code = std::move(access_code),
                discovery_port](std::stop_token stop) {
           try {
-              winrt::init_apartment();
-              try {
-                  Run(stop, bind_address, port, access_code, discovery_port);
-              } catch (...) {
-                  winrt::uninit_apartment();
-                  throw;
-              }
-              winrt::uninit_apartment();
+              const WinrtApartment apartment;
+              Run(stop, bind_address, port, access_code, discovery_port);
           } catch (const std::exception& error) {
               if (!stop.stop_requested()) {
                   events_->Push({StreamEventType::error, {}, error.what()});
@@ -580,10 +577,10 @@ void DirectSignalServer::Run(std::stop_token stop, std::wstring bind_address, st
                         winrt::to_string(auth_msg.GetNamedString(L"type", L"")) == "auth") {
                         const auto viewer_nonce = winrt::to_string(auth_msg.GetNamedString(L"nonce", L""));
                         const auto viewer_hmac = winrt::to_string(auth_msg.GetNamedString(L"hmac", L""));
-                        const auto expected = HmacSha256Hex(key, host_nonce + ":" + viewer_nonce + ":viewer");
-                        if (!viewer_nonce.empty() && ConstantTimeEquals(viewer_hmac, expected)) {
+                        if (VerifyLanProof(host_nonce, viewer_nonce, LanProofRole::viewer, viewer_hmac,
+                                [&](std::string_view bytes) { return HmacSha256Hex(key, bytes); }, ConstantTimeEquals)) {
                             fail_state = {};
-                            active_host_mac = HmacSha256Hex(key, host_nonce + ":" + viewer_nonce + ":host");
+                            active_host_mac = HmacSha256Hex(key, LanProofMessage(host_nonce, viewer_nonce, LanProofRole::host));
                             client_sock = std::move(incoming);
                             client_reader.Clear();
                             {
@@ -649,14 +646,8 @@ DirectSignalClient::DirectSignalClient(std::shared_ptr<StreamEvents> events, std
       worker_([this, host_address = std::move(host_address), port, access_code = std::move(access_code)](
                   std::stop_token stop) {
           try {
-              winrt::init_apartment();
-              try {
-                  Run(stop, host_address, port, access_code);
-              } catch (...) {
-                  winrt::uninit_apartment();
-                  throw;
-              }
-              winrt::uninit_apartment();
+              const WinrtApartment apartment;
+              Run(stop, host_address, port, access_code);
           } catch (const std::exception& error) {
               if (!stop.stop_requested()) {
                   events_->Push({StreamEventType::signal_lost, {}, error.what()});
@@ -740,14 +731,14 @@ void DirectSignalClient::Run(std::stop_token stop, std::wstring host_address, st
         return;
     }
     const auto host_nonce = winrt::to_string(first.GetNamedString(L"nonce", L""));
-    if (first_type != "challenge" || host_nonce.empty()) {
+    if (ClassifyViewerSignal(ViewerSignalStage::challenge, first_type) != ViewerSignal::challenge || host_nonce.empty()) {
         events_->Push({StreamEventType::error, {}, "目标主机返回了无效的握手消息"});
         return;
     }
 
     const auto viewer_nonce = RandomHex(32);
-    const auto viewer_mac = HmacSha256Hex(key, host_nonce + ":" + viewer_nonce + ":viewer");
-    const auto expected_host_mac = HmacSha256Hex(key, host_nonce + ":" + viewer_nonce + ":host");
+    const auto viewer_mac = HmacSha256Hex(key, LanProofMessage(host_nonce, viewer_nonce, LanProofRole::viewer));
+    const auto expected_host_mac = HmacSha256Hex(key, LanProofMessage(host_nonce, viewer_nonce, LanProofRole::host));
 
     JsonObject auth;
     auth.SetNamedValue(L"type", JsonValue::CreateStringValue(L"auth"));
@@ -765,7 +756,8 @@ void DirectSignalClient::Run(std::stop_token stop, std::wstring host_address, st
         return;
     }
     const auto host_mac = winrt::to_string(reply.GetNamedString(L"hmac", L""));
-    if (reply_type != "accepted" || !ConstantTimeEquals(host_mac, expected_host_mac)) {
+    if (ClassifyViewerSignal(ViewerSignalStage::authentication, reply_type) != ViewerSignal::accepted ||
+        !ConstantTimeEquals(host_mac, expected_host_mac)) {
         events_->Push({StreamEventType::error, {}, "被控端身份校验失败"});
         return;
     }
@@ -814,14 +806,8 @@ void DirectSignalClient::Run(std::stop_token stop, std::wstring host_address, st
 LanDiscoveryScanner::LanDiscoveryScanner(std::uint16_t discovery_port)
     : worker_([this, discovery_port](std::stop_token stop) {
           try {
-              winrt::init_apartment();
-              try {
-                  Run(stop, discovery_port);
-              } catch (...) {
-                  winrt::uninit_apartment();
-                  throw;
-              }
-              winrt::uninit_apartment();
+              const WinrtApartment apartment;
+              Run(stop, discovery_port);
           } catch (...) {}
       }) {}
 

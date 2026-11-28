@@ -1,10 +1,10 @@
 #include "core_api_internal.h"
 
 #include <p2premote/service_identity.h>
+#include <p2premote/core_api_v2.h>
 
 #include <algorithm>
 #include <array>
-#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -13,8 +13,6 @@ using namespace p2premote::abi;
 
 namespace {
 thread_local wchar_t error_text[1024]{};
-std::mutex apartment_mutex;
-unsigned apartments{};
 
 struct AccountResult {
     int32_t status{P2P_OK};
@@ -35,7 +33,7 @@ struct p2p_account {
         result = {};
         worker = std::jthread([this, job = std::move(job)](std::stop_token stop) mutable {
             {
-                std::optional<Apartment> apartment;
+                std::optional<WinrtApartment> apartment;
                 try {
                     apartment.emplace(winrt::apartment_type::multi_threaded);
                     job(stop, result);
@@ -64,23 +62,57 @@ struct p2p_account {
     std::jthread worker;
 };
 
-Apartment::Apartment(winrt::apartment_type type) {
-    winrt::init_apartment(type);
-    const std::lock_guard lock(apartment_mutex);
-    ++apartments;
-}
-
-Apartment::~Apartment() {
-    {
-        const std::lock_guard lock(apartment_mutex);
-        // A shell may have no other WinRT apartment once its last worker exits.
-        if (--apartments == 0) winrt::clear_factory_cache();
-    }
-    winrt::uninit_apartment();
-}
-
 void p2premote::abi::SetError(const wchar_t* message) noexcept {
     wcsncpy_s(error_text, message, _TRUNCATE);
+}
+
+std::wstring p2premote::abi::FromUtf8(const char* text) {
+    if (!text) return {};
+    const auto length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nullptr, 0);
+    if (!length) throw std::invalid_argument("输入必须使用有效的 UTF-8");
+    std::wstring result(static_cast<std::size_t>(length), L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, result.data(), length)) {
+        throw std::invalid_argument("输入必须使用有效的 UTF-8");
+    }
+    result.pop_back();
+    return result;
+}
+
+const char* p2p_last_error_utf8() {
+    thread_local std::string result;
+    try {
+        result = winrt::to_string(std::wstring_view(p2p_last_error()));
+        return result.c_str();
+    } catch (...) {
+        return "Core error";
+    }
+}
+
+const char* p2p_default_server_utf8() {
+    try {
+        static const auto result = winrt::to_string(std::wstring_view(p2p_default_server()));
+        return result.c_str();
+    } catch (...) {
+        return "";
+    }
+}
+
+int32_t p2p_account_login_v2(p2p_account* account, const char* server, const char* user, const char* password,
+    int32_t create, int32_t compatible_http, int32_t relay_only) {
+    try {
+        const auto url = FromUtf8(server), username = FromUtf8(user);
+        auto secret = FromUtf8(password);
+        const auto result = p2p_account_login(account, server ? url.c_str() : nullptr, user ? username.c_str() : nullptr,
+            password ? secret.c_str() : nullptr, create, compatible_http, relay_only);
+        SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+        return result;
+    } catch (...) {
+        return ReportException();
+    }
+}
+
+int32_t p2p_account_poll_events(p2p_account* account) {
+    return p2p_account_complete(account);
 }
 
 int32_t p2premote::abi::ReportException() noexcept {

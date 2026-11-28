@@ -29,12 +29,23 @@
 
 namespace {
 
+using p2premote::ClassifySignalTermination;
+using p2premote::ClassifyViewerSignal;
+using p2premote::DecodeInput;
 using p2premote::InputKind;
+using p2premote::IsLanNonce;
+using p2premote::LanProofMessage;
+using p2premote::LanProofRole;
+using p2premote::ParseSessionMode;
+using p2premote::ReconnectWindow;
+using p2premote::SessionMode;
+using p2premote::SignalTermination;
+using p2premote::ViewerSignal;
+using p2premote::ViewerSignalStage;
 
 constexpr qsizetype max_frame_bytes = 256 * 1024;
 constexpr qsizetype max_signal_bytes = 64 * 1024;
 constexpr qsizetype frame_prefix_bytes = sizeof(quint32);
-constexpr qint64 reconnect_window_ms = 30'000;
 constexpr int ws_ping_interval_ms = 15'000;
 constexpr char video_stream[] = "desktop";
 constexpr char control_stream[] = "control-v3";
@@ -46,14 +57,6 @@ constexpr char microphone_stream[] = "mic_audio";
 
 QByteArray authenticationMac(const QByteArray& key, const QByteArray& message) {
     return QMessageAuthenticationCode::hash(message, key, QCryptographicHash::Sha256).toHex();
-}
-
-bool isNonce(const QByteArray& nonce) {
-    if (nonce.size() != 64) return false;
-    for (const char ch : nonce) {
-        if ((ch < '0' || ch > '9') && (ch < 'a' || ch > 'f')) return false;
-    }
-    return true;
 }
 
 bool supportsSession(const QString& sdp, bool diagnostics) {
@@ -187,7 +190,7 @@ void ViewerSession::open(const QString& host, quint16 port, const QString& code)
         return;
     }
 
-    const auto key = QCryptographicHash::hash("p2premote-lan-v1:" + code.toUtf8(), QCryptographicHash::Sha256);
+    const auto key = QCryptographicHash::hash(p2premote::lan_access_key_prefix + code.toUtf8(), QCryptographicHash::Sha256);
     openWithKey(address, port, key, false);
 }
 
@@ -304,13 +307,10 @@ void ViewerSession::teardownTransport() {
     plugin_channel_ = plugin_ready_ = false;
     workspace_attempts_ = 0;
     workspace_retry_.invalidate();
-    sent_buttons_.reset();
-    drag_checkpoint_.reset();
+    input_send_.Reset();
     sequence_ = 0;
-    video_request_ = confirmed_bitrate_ = 0;
-    video_acknowledged_ = false;
-    video_attempts_ = 0;
-    video_retry_.invalidate();
+    confirmed_bitrate_ = 0;
+    video_settings_.Reset();
     cursor_separate_ = false;
     cursor_retry_.invalidate();
     active_bitrate_ = requested_bitrate_;
@@ -362,14 +362,14 @@ void ViewerSession::recover(const QString& reason) {
             next.lan_port = lan_port_;
             next.lan_key = lan_key_;
         }
-        next.window.start();
+        next.window = ReconnectWindow(monotonicMilliseconds());
         reconnect_ = std::move(next);
     }
-    if (reconnect_->window.elapsed() >= reconnect_window_ms) {
+    if (reconnect_->window.Expired(monotonicMilliseconds())) {
         stop(QStringLiteral("自动重连超时 · %1").arg(reason));
         return;
     }
-    const int delay_sec = 1 << std::min(reconnect_->attempts, 2);
+    const int delay_sec = reconnect_->window.Schedule(monotonicMilliseconds());
     reconnect_->reason = reason;
     state_ = State::reconnecting;
     teardownTransport();
@@ -381,13 +381,13 @@ void ViewerSession::recover(const QString& reason) {
 
 void ViewerSession::attemptReconnect() {
     if (!reconnect_ || state_ != State::reconnecting) return;
-    if (reconnect_->window.elapsed() >= reconnect_window_ms) {
+    if (reconnect_->window.Expired(monotonicMilliseconds())) {
         stop(QStringLiteral("自动重连超时 · %1").arg(reconnect_->reason));
         return;
     }
-    ++reconnect_->attempts;
+    reconnect_->window.BeginAttempt();
     if (statusChanged) {
-        statusChanged(QStringLiteral("自动重连第 %1 次 · %2").arg(reconnect_->attempts).arg(reconnect_->reason));
+        statusChanged(QStringLiteral("自动重连第 %1 次 · %2").arg(reconnect_->window.Attempts()).arg(reconnect_->reason));
     }
     if (reconnect_->is_cloud) {
         openCloudInternal(reconnect_->cloud, reconnect_->cloud_device, reconnect_->diagnostics, true);
@@ -436,10 +436,8 @@ void ViewerSession::handleFrame(const QJsonObject& message) {
     const auto payload = message.value("payload").toString();
     if (type == "error" || type == "ended") {
         const bool retryable = message.value("retryable").toBool();
-        const bool transient_error = reconnect_.has_value() && type == "error"
-            && (retryable || payload == QStringLiteral("设备不可连接")
-                || payload == QStringLiteral("设备未在线或正在使用中"));
-        if ((type == "ended" && retryable) || transient_error) {
+        if (ClassifySignalTermination(type.toStdString(), payload.toStdString(), retryable, reconnect_.has_value())
+                == SignalTermination::reconnect) {
             recover(payload.isEmpty() ? QStringLiteral("对端信令连接中断") : payload);
         } else {
             stop(payload.isEmpty() ? QStringLiteral("被控端已关闭连接。") : payload);
@@ -447,28 +445,37 @@ void ViewerSession::handleFrame(const QJsonObject& message) {
         return;
     }
 
-    if (cloud_ && state_ == State::approval) {
-        if (type == "waiting") {
-            if (statusChanged) statusChanged(QStringLiteral("等待被控端授权…"));
-            timeout_.start(60000);
-            return;
-        }
-        if (type == "accepted") {
-            accept(payload);
-            return;
-        }
+    auto stage = ViewerSignalStage::inactive;
+    switch (state_) {
+    case State::challenge: stage = ViewerSignalStage::challenge; break;
+    case State::authentication: stage = ViewerSignalStage::authentication; break;
+    case State::approval: if (cloud_) stage = ViewerSignalStage::approval; break;
+    case State::negotiation:
+    case State::streaming: stage = ViewerSignalStage::media; break;
+    default: break;
     }
-    if (state_ == State::challenge && type == "challenge") {
+    const auto action = ClassifyViewerSignal(stage, type.toStdString());
+    if (action == ViewerSignal::waiting) {
+        if (statusChanged) statusChanged(QStringLiteral("等待被控端授权…"));
+        timeout_.start(60000);
+        return;
+    }
+    if (action == ViewerSignal::accepted && stage == ViewerSignalStage::approval) {
+        accept(payload);
+        return;
+    }
+    if (action == ViewerSignal::challenge) {
         const auto host_nonce = message.value("nonce").toString().toLatin1();
         QByteArray random(32, Qt::Uninitialized);
-        if (!isNonce(host_nonce) || RAND_bytes(reinterpret_cast<unsigned char*>(random.data()), random.size()) != 1) {
+        if (!IsLanNonce(host_nonce.toStdString()) || RAND_bytes(reinterpret_cast<unsigned char*>(random.data()), random.size()) != 1) {
             stop(QStringLiteral("无法完成验证码挑战。"));
             return;
         }
         const auto viewer_nonce = random.toHex();
-        const auto prefix = host_nonce + ':' + viewer_nonce + ':';
-        const auto proof = authenticationMac(key_, prefix + "viewer");
-        expected_host_mac_ = authenticationMac(key_, prefix + "host");
+        const auto host = host_nonce.toStdString();
+        const auto viewer = viewer_nonce.toStdString();
+        const auto proof = authenticationMac(key_, QByteArray::fromStdString(LanProofMessage(host, viewer, LanProofRole::viewer)));
+        expected_host_mac_ = authenticationMac(key_, QByteArray::fromStdString(LanProofMessage(host, viewer, LanProofRole::host)));
         key_.fill('\0');
         key_.clear();
         state_ = State::authentication;
@@ -478,7 +485,7 @@ void ViewerSession::handleFrame(const QJsonObject& message) {
         }
         return;
     }
-    if (state_ == State::authentication && type == "accepted") {
+    if (action == ViewerSignal::accepted) {
         const auto mac = message.value("hmac").toString().toLatin1();
         if (mac.size() != expected_host_mac_.size() || CRYPTO_memcmp(mac.data(), expected_host_mac_.data(), mac.size())) {
             stop(QStringLiteral("被控端身份校验失败。"));
@@ -488,7 +495,7 @@ void ViewerSession::handleFrame(const QJsonObject& message) {
         accept(payload);
         return;
     }
-    if ((state_ == State::negotiation || state_ == State::streaming) && type == "minirtc") {
+    if (action == ViewerSignal::minirtc) {
         receiveSignal(payload.toUtf8());
         return;
     }
@@ -496,11 +503,12 @@ void ViewerSession::handleFrame(const QJsonObject& message) {
 }
 
 void ViewerSession::accept(const QString& mode) {
-    if ((diagnostics_ && mode != "diagnostics") || (!diagnostics_ && mode != "control" && mode != "view")) {
+    const auto accepted = ParseSessionMode(mode.toStdString());
+    if (accepted == SessionMode::invalid || diagnostics_ != (accepted == SessionMode::diagnostics)) {
         stop(QStringLiteral("被控端未接受请求的会话类型。"));
         return;
     }
-    control_allowed_ = mode == "control";
+    control_allowed_ = accepted == SessionMode::control;
     state_ = State::negotiation;
     if (statusChanged) statusChanged(QStringLiteral("认证成功，正在协商连接…"));
     timeout_.start(20000);
@@ -753,27 +761,13 @@ void ViewerSession::recordFrameSwapped(double wait_ms, double draw_to_swap_ms) {
 bool ViewerSession::sendInput(InputKind kind, std::uint16_t code, std::uint16_t x, std::uint16_t y) {
     if (!canControl()) return false;
     const p2premote::InputPacket packet{kind, code, x, y, ++sequence_, monotonicMilliseconds()};
-    const auto input = p2premote::EncodeInput(packet);
-    const std::string_view bytes(reinterpret_cast<const char*>(input.data()), input.size());
-    if (kind == InputKind::move) {
-        if (sent_buttons_.any()) drag_checkpoint_ = packet;
-        return api_->send_data(peer_, bytes.data(), bytes.size(), pointer_stream) == 0;
-    }
-    if (kind == InputKind::heartbeat && drag_checkpoint_) {
-        const auto copy = p2premote::EncodeInput(*drag_checkpoint_);
-        if (sendReliable({reinterpret_cast<const char*>(copy.data()), copy.size()}, control_stream)) drag_checkpoint_.reset();
-    }
-    if (!sendReliable(bytes, control_stream)) return false;
-    if (kind == InputKind::reset) {
-        sent_buttons_.reset();
-        drag_checkpoint_.reset();
-    } else if ((kind == InputKind::button_down || kind == InputKind::button_up) && code < sent_buttons_.size()) {
-        sent_buttons_.set(code, kind == InputKind::button_down);
-        drag_checkpoint_.reset();
-    } else if (kind == InputKind::wheel) {
-        drag_checkpoint_.reset();
-    }
-    return true;
+    return input_send_.Send(packet,
+        [this](const p2premote::InputBytes& bytes) {
+            return api_->send_data(peer_, reinterpret_cast<const char*>(bytes.data()), bytes.size(), pointer_stream) == 0;
+        },
+        [this](const p2premote::InputBytes& bytes) {
+            return sendReliable({reinterpret_cast<const char*>(bytes.data()), bytes.size()}, control_stream);
+        });
 }
 
 bool ViewerSession::updateKeyboardLocks(bool caps_lock, bool num_lock) {
@@ -816,12 +810,11 @@ void ViewerSession::processData(QByteArray data, const QByteArray& label) {
     if (state_ != State::streaming) return;
     if (label == control_stream && !diagnostics_) {
         const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(data.constData()), data.size());
-        if (const auto packet = p2premote::DecodeInput(bytes); packet && packet->kind == InputKind::video_settings_reply &&
-            packet->sequence == video_request_) {
-            confirmed_bitrate_ = p2premote::VideoSettingsBitrate(*packet);
-            const bool newly_acknowledged = !video_acknowledged_;
-            video_acknowledged_ = true;
-            if (newly_acknowledged) sendAudioSettings();
+        if (const auto packet = DecodeInput(bytes)) {
+            if (const auto reply = video_settings_.Acknowledge(*packet)) {
+                confirmed_bitrate_ = reply->applied_bitrate;
+                sendAudioSettings();
+            }
         }
     } else if (label == cursor_stream && !diagnostics_ && control_allowed_) {
         if (auto cursor = decodeRemoteCursor({data.constData(), static_cast<std::size_t>(data.size())})) {
@@ -881,8 +874,7 @@ void ViewerSession::setQuality(int resolution, int bitrate) {
     requested_quality_ = resolution;
     requested_bitrate_ = bitrate;
     active_bitrate_ = bitrate;
-    video_attempts_ = 0;
-    video_acknowledged_ = false;
+    video_settings_.Reset();
     if (isViewable()) sendVideoSettings();
 }
 
@@ -904,14 +896,12 @@ void ViewerSession::sendCursorReady() {
 
 void ViewerSession::sendVideoSettings() {
     using namespace p2premote;
-    ++video_attempts_;
-    video_retry_.start();
-    const auto packet = VideoSettingsPacket(InputKind::set_video_settings, static_cast<StreamQuality>(requested_quality_),
-        VideoBitrateLimit(static_cast<VideoBitratePreset>(active_bitrate_)), ++sequence_, monotonicMilliseconds());
-    const auto bytes = EncodeInput(packet);
-    if (sendReliable({reinterpret_cast<const char*>(bytes.data()), bytes.size()}, control_stream)) {
-        video_request_ = packet.sequence;
-    }
+    video_settings_.Update({static_cast<StreamQuality>(requested_quality_),
+            VideoBitrateLimit(static_cast<VideoBitratePreset>(active_bitrate_))}, monotonicMilliseconds(), sequence_,
+        [this](const InputPacket& packet) {
+            const auto bytes = EncodeInput(packet);
+            return sendReliable({reinterpret_cast<const char*>(bytes.data()), bytes.size()}, control_stream);
+        });
 }
 
 void ViewerSession::sendAudioSettings() {
@@ -933,10 +923,7 @@ void ViewerSession::tick() {
     const auto wait_sum = std::exchange(frame_wait_sum_ms_, 0.0);
     if (wait_samples > 0) metrics_.frame_wait_ms = wait_sum / static_cast<double>(wait_samples);
     if (!notice_.isEmpty() && notice_age_.elapsed() >= 3500) notice_.clear();
-    if (isViewable() && !video_acknowledged_ && video_attempts_ < 12 &&
-        video_retry_.isValid() && video_retry_.hasExpired(1000)) {
-        sendVideoSettings();
-    }
+    if (isViewable()) sendVideoSettings();
     const auto cursor_retry_ms = connected_since_.elapsed() < 12'000 ? 1000 : 4000;
     if (canControl() && !cursor_separate_ && cursor_retry_.isValid() && cursor_retry_.hasExpired(cursor_retry_ms)) {
         sendCursorReady();
@@ -965,8 +952,7 @@ void ViewerSession::processPluginActions() {
             const auto requested = static_cast<int>(action.bitrate);
             if (active_bitrate_ == requested) continue;
             active_bitrate_ = requested;
-            video_attempts_ = 0;
-            video_acknowledged_ = false;
+            video_settings_.Reset();
             sendVideoSettings();
         } else if (action.kind == Kind::input && canControl() && plugin_ready_) {
             action.input.sent_ms = monotonicMilliseconds();

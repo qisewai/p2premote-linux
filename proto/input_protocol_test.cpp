@@ -1,4 +1,6 @@
 #include <p2premote/input_protocol.h>
+#include <p2premote/input_state.h>
+#include <p2premote/session_policy.h>
 
 #include <iostream>
 
@@ -97,5 +99,85 @@ int main() {
         && EncodeInputCommand({InputCommandKind::text, std::vector<std::uint16_t>(input_text_limit + 1, 'x'), 0}).empty(),
         "Accepted malformed or oversized Unicode text");
     passed &= check(!input.AcceptCommand(text, 2300), "Accepted stale macro text");
+
+    ReconnectWindow reconnect(100);
+    passed &= check(reconnect.Schedule(110) == 1 && !reconnect.Due(1109) && reconnect.Due(1110),
+        "Initial reconnect delay was not one second");
+    passed &= check(reconnect.BeginAttempt() == 1 && reconnect.Schedule(1110) == 2 &&
+        reconnect.SecondsRemaining(2111) == 1 && reconnect.Due(3110), "Second reconnect delay or countdown was wrong");
+    reconnect.BeginAttempt();
+    passed &= check(reconnect.Schedule(3110) == 4 && reconnect.Expired(30100) && !reconnect.Due(30100),
+        "Reconnect did not honor the capped delay and deadline");
+    passed &= check(ClassifySignalTermination("ended", "", true, false) == SignalTermination::reconnect &&
+        ClassifySignalTermination("error", "设备不可连接", false, true) == SignalTermination::reconnect &&
+        ClassifySignalTermination("error", "连接验证码错误", false, true) == SignalTermination::stop &&
+        ClassifySignalTermination("error", "", true, false) == SignalTermination::stop &&
+        ParseSessionMode("view") == SessionMode::view && ParseSessionMode("invalid") == SessionMode::invalid,
+        "Misclassified a signaling result");
+    passed &= check(ClassifyViewerSignal(ViewerSignalStage::challenge, "accepted") == ViewerSignal::unexpected &&
+        ClassifyViewerSignal(ViewerSignalStage::authentication, "accepted") == ViewerSignal::accepted &&
+        ClassifyViewerSignal(ViewerSignalStage::approval, "waiting") == ViewerSignal::waiting &&
+        ClassifyViewerSignal(ViewerSignalStage::approval, "minirtc") == ViewerSignal::unexpected &&
+        ClassifyViewerSignal(ViewerSignalStage::media, "minirtc") == ViewerSignal::minirtc &&
+        ClassifyLanMedia("offer", true) == LanMediaSignal::description &&
+        ClassifyLanMedia("offer", false) == LanMediaSignal::invalid &&
+        ClassifyLanMedia("new_candidate_mid", false) == LanMediaSignal::candidate_mid,
+        "Accepted signaling outside the correct phase or direction");
+
+    const std::string host_nonce(64, 'a'), viewer_nonce(64, 'b');
+    const auto fake_mac = [&](std::string_view bytes) {
+        return std::string(64, bytes == host_nonce + ":" + viewer_nonce + ":viewer" ? 'c' : 'd');
+    };
+    const auto compare = [](std::string_view lhs, std::string_view rhs) { return lhs == rhs; };
+    const auto proof = fake_mac(LanProofMessage(host_nonce, viewer_nonce, LanProofRole::viewer));
+    passed &= check(IsLanNonce(host_nonce) && !IsLanNonce("short") &&
+        VerifyLanProof(host_nonce, viewer_nonce, LanProofRole::viewer, proof, fake_mac, compare) &&
+        !VerifyLanProof(host_nonce, viewer_nonce, LanProofRole::host, proof, fake_mac, compare) &&
+        !VerifyLanProof("", viewer_nonce, LanProofRole::viewer, proof, fake_mac, compare),
+        "LAN challenge did not bind the nonce order and proof to the peer role");
+
+    VideoSettingsNegotiation settings{{1'500, 3'000, 2}};
+    std::vector<InputPacket> sends;
+    const auto send = [&](const InputPacket& packet) { sends.push_back(packet); return true; };
+    std::uint32_t sequence{};
+    const VideoSettings desired{hd, 8'000'000};
+    settings.Update(desired, 100, sequence, send);
+    settings.Update(desired, 1599, sequence, send);
+    passed &= check(sends.size() == 1 && sends.front().sequence == 1, "Settings retransmitted early");
+    settings.Update(desired, 1600, sequence, send);
+    passed &= check(sends.size() == 2 && sends.back().sequence == 1, "Settings retry replaced the request sequence");
+    passed &= check(!settings.Acknowledge(VideoSettingsPacket(InputKind::video_settings_reply, StreamQuality::p720,
+        8'000'000, 1, 100)), "Accepted a reply for a different resolution");
+    const auto confirmed = settings.Acknowledge(VideoSettingsPacket(InputKind::video_settings_reply, hd, 7'850'000, 1, 100));
+    passed &= check(confirmed && confirmed->settings == desired && confirmed->applied_bitrate == 7'850'000,
+        "Settings acknowledgement lost the selected or applied bitrate");
+    settings.Update(desired, 1700, sequence, send);
+    passed &= check(sends.size() == 2, "Acknowledged settings were sent again");
+    const VideoSettings changed{StreamQuality::p720, 2'000'000};
+    settings.Update(changed, 1700, sequence, send);
+    passed &= check(settings.Update(changed, 4700, sequence, send) && sends.size() == 3,
+        "Unacknowledged settings did not settle at their timeout");
+
+    InputSendState pointer;
+    std::vector<InputPacket> reliable;
+    const auto unreliable = [](const InputBytes&) { return false; };
+    const auto control = [&](const InputBytes& bytes) { reliable.push_back(*DecodeInput(bytes)); return true; };
+    pointer.Send({InputKind::button_down, 1, 0, 0, 1, 100}, unreliable, control);
+    pointer.Send({InputKind::move, 0, 10, 5, 2, 103}, unreliable, control);
+    pointer.Send({InputKind::heartbeat, 0, 0, 0, 3, 108}, unreliable, control);
+    pointer.Send({InputKind::move, 0, 12, 8, 4, 111}, unreliable, control);
+    pointer.Send({InputKind::reset, 0, 0, 0, 5, 120}, unreliable, control);
+    pointer.Send({InputKind::heartbeat, 0, 0, 0, 6, 130}, unreliable, control);
+    passed &= check(reliable.size() == 5 && reliable[1].kind == InputKind::move && reliable[1].sequence == 2 &&
+        reliable[3].kind == InputKind::reset && reliable[4].sequence == 6,
+        "Drag recovery lost the final pointer sequence or resent it after a reset");
+    PressedInput<> held;
+    held.keys.set(52);
+    held.buttons.set(1);
+    held.ReleaseKeys([](std::uint16_t) { return false; });
+    held.ReleaseButtons([](std::uint16_t code) { return code == 1; });
+    passed &= check(held.Any() && !held.Dragging() && held.keys.test(52), "Failed key release was lost");
+    held.ReleaseKeys([](std::uint16_t code) { return code == 52; });
+    passed &= check(!held.Any(), "Key remained held after release");
     return passed ? 0 : 1;
 }

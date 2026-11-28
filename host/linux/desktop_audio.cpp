@@ -1,7 +1,6 @@
 #include "desktop_audio.h"
 
 #include <pulse/pulseaudio.h>
-#include <systemd/sd-login.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -31,38 +30,6 @@ using namespace std::chrono_literals;
 constexpr pa_sample_spec kSampleSpec{PA_SAMPLE_S16LE, 48'000, 2};
 constexpr std::size_t kFrameBytes = 480 * 2 * sizeof(std::int16_t); // 10 ms of stereo PCM
 using PcmFrame = std::array<char, kFrameBytes>;
-using LoginString = std::unique_ptr<char, decltype(&std::free)>;
-
-struct ConsoleSession {
-    std::string id;
-    uid_t uid{};
-
-    bool operator==(const ConsoleSession&) const = default;
-};
-
-std::optional<ConsoleSession> ActiveConsoleSession() {
-    char* id{};
-    uid_t uid{};
-    const int result = sd_seat_get_active("seat0", &id, &uid);
-    const LoginString session(id, std::free);
-    if (result < 0 || !session || uid == 0) return std::nullopt;
-    return ConsoleSession{session.get(), uid};
-}
-
-bool IsUserDesktop(const ConsoleSession& session, unsigned vt) {
-    char* value{};
-    const int class_result = sd_session_get_class(session.id.c_str(), &value);
-    const LoginString session_class(value, std::free);
-    if (class_result < 0 || !session_class || std::string_view(session_class.get()) != "user") return false;
-
-    value = nullptr;
-    const int type_result = sd_session_get_type(session.id.c_str(), &value);
-    const LoginString type(value, std::free);
-    unsigned session_vt{};
-    return type_result >= 0 && type && std::string_view(type.get()) == "x11" &&
-        sd_session_get_vt(session.id.c_str(), &session_vt) >= 0 && session_vt == vt;
-}
-
 class AudioProcess {
 public:
     AudioProcess() = default;
@@ -70,9 +37,9 @@ public:
     AudioProcess(const AudioProcess&) = delete;
     AudioProcess& operator=(const AudioProcess&) = delete;
 
-    void Start(const ConsoleSession& session, std::string executable) {
+    void Start(const DesktopTarget& session, std::string executable) {
         if (executable.empty()) return;
-        auto runtime = "XDG_RUNTIME_DIR=/run/user/" + std::to_string(session.uid);
+        auto runtime = "XDG_RUNTIME_DIR=" + session.runtime_dir;
         char* env[]{runtime.data(), nullptr};
         std::string capture_arg = "--capture-desktop-audio";
         char* user_args[]{executable.data(), capture_arg.data(), nullptr};
@@ -146,7 +113,9 @@ class PulseMonitor {
 public:
     int Run() {
         if (!context_) return 1;
-        const auto socket = "unix:/run/user/" + std::to_string(geteuid()) + "/pulse/native";
+        const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+        if (!runtime || runtime[0] != '/') return 1;
+        const auto socket = std::string("unix:") + runtime + "/pulse/native";
         if (pa_context_connect(context_.get(), socket.c_str(), PA_CONTEXT_NOAUTOSPAWN, nullptr) < 0) return 1;
         while (pa_context_get_state(context_.get()) != PA_CONTEXT_READY) {
             if (!Iterate()) return 1;
@@ -263,32 +232,37 @@ private:
     bool finished_{};
 };
 
-} // namespace
+class PulseDesktopAudio final : public AudioBackend {
+public:
+    void Capture(std::stop_token stop, const ActiveTarget& state, const Send& send) override;
+};
 
-void StreamDesktopAudio(std::stop_token stop,
-    const std::function<std::optional<DesktopAudioState>()>& state,
-    const std::function<void(DesktopAudioState, const char*, std::size_t)>& send) {
+void PulseDesktopAudio::Capture(std::stop_token stop, const ActiveTarget& state, const Send& send) {
     std::error_code error;
     const auto executable = std::filesystem::read_symlink("/proc/self/exe", error).string();
     AudioProcess process;
     std::optional<DesktopAudioState> current_state;
-    std::optional<ConsoleSession> current_session;
+    std::optional<DesktopTarget> active;
+    std::chrono::steady_clock::time_point check_at{};
     std::chrono::steady_clock::time_point retry_at{};
     std::array<char, kFrameBytes> frame{};
     while (!stop.stop_requested()) {
         const auto wanted = state();
-        const auto session = wanted ? ActiveConsoleSession() : std::nullopt;
-        if (wanted != current_state || session != current_session) {
+        const auto now = std::chrono::steady_clock::now();
+        if (wanted != current_state || now >= check_at) {
+            active = wanted ? ActiveUserDesktop() : std::nullopt;
+            check_at = now + 200ms;
+        }
+        const bool accessible = wanted && active && active->valid() && wanted->target.SameLogin(*active);
+        if (wanted != current_state || !accessible) {
             process.Stop();
             current_state = wanted;
-            current_session = session;
             retry_at = {};
         }
         if (process.fd() < 0) {
-            const auto now = std::chrono::steady_clock::now();
-            if (session && now >= retry_at) {
+            if (accessible && now >= retry_at) {
                 retry_at = now + 1s;
-                if (IsUserDesktop(*session, wanted->vt)) process.Start(*session, executable);
+                process.Start(wanted->target, executable);
             }
             if (process.fd() < 0) {
                 std::this_thread::sleep_for(50ms);
@@ -305,11 +279,16 @@ void StreamDesktopAudio(std::stop_token stop,
             continue;
         }
         // Each process writes one whole PCM frame atomically to its nonblocking pipe.
-        if (read(process.fd(), frame.data(), frame.size()) == static_cast<ssize_t>(frame.size()) &&
-            ActiveConsoleSession() == session) {
+        if (read(process.fd(), frame.data(), frame.size()) == static_cast<ssize_t>(frame.size()) && state() == wanted) {
             send(*wanted, frame.data(), frame.size());
         }
     }
+}
+
+} // namespace
+
+std::unique_ptr<AudioBackend> CreateDesktopAudio() {
+    return std::make_unique<PulseDesktopAudio>();
 }
 
 int RunDesktopAudioCapture() {

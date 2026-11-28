@@ -1,6 +1,6 @@
 #include "cloud_connection.h"
 
-#include <p2premote/core_api.h>
+#include <p2premote/core_api_v2.h>
 #include <p2premote/service_identity.h>
 
 #include <QCryptographicHash>
@@ -26,7 +26,7 @@
 
 namespace {
 
-thread_local std::wstring last_error;
+thread_local QString last_error;
 constexpr qsizetype max_response_size = 4 * 1024 * 1024;
 
 struct Device {
@@ -108,38 +108,73 @@ struct p2p_account {
     }
 };
 
-void setCoreError(const QString& message) { last_error = message.toStdWString(); }
+void setCoreError(const QString& message) { last_error = message; }
 
 const CloudConnection* cloudConnection(const p2p_account* account) {
     return account && account->connection ? &*account->connection : nullptr;
 }
 
 uint32_t p2p_core_abi_version() { return P2P_CORE_ABI_VERSION; }
-const wchar_t* p2p_last_error() { return last_error.c_str(); }
+const wchar_t* p2p_last_error() {
+    thread_local std::wstring result;
+    result = last_error.toStdWString();
+    return result.c_str();
+}
+const char* p2p_last_error_utf8() {
+    thread_local QByteArray result;
+    result = last_error.toUtf8();
+    return result.constData();
+}
+const char* p2p_default_server_utf8() {
+    static const auto result = QString::fromWCharArray(p2p_default_server()).toUtf8();
+    return result.constData();
+}
 const wchar_t* p2p_default_server() { return p2premote::wuhan_service_address; }
 
 p2p_account* p2p_account_create() { return new p2p_account; }
 void p2p_account_destroy(p2p_account* account) { delete account; }
 
-int32_t p2p_account_login(p2p_account* account, const wchar_t* server, const wchar_t* user,
-    const wchar_t* password, int32_t create, int32_t, int32_t relay_only) {
-    if (!account || account->reply || account->connection || !server || !user || !password) {
+namespace {
+
+int32_t login(p2p_account* account, const QString& server, const QString& user, const QString& password,
+    int32_t create, int32_t relay_only) {
+    if (!account || account->reply || account->connection) {
         return badRequest(QStringLiteral("无法开始登录"));
     }
-    auto origin = QUrl(QString::fromWCharArray(server).trimmed(), QUrl::StrictMode);
+    auto origin = QUrl(server.trimmed(), QUrl::StrictMode);
     if (!isCloudOrigin(origin)) {
         return badRequest(QStringLiteral("请填写 HTTPS 服务根地址。本机测试可使用 http://127.0.0.1:8788"));
     }
     const auto installation = installationId();
     if (installation.isEmpty()) return badRequest(QStringLiteral("无法保存客户端标识"));
-    const QJsonObject payload{{"username", QString::fromWCharArray(user)},
-        {"password", QString::fromWCharArray(password)}, {"installationId", installation},
+    const QJsonObject payload{{"username", user},
+        {"password", password}, {"installationId", installation},
         {"deviceName", QSysInfo::machineHostName()}, {"platform", QStringLiteral("Linux x64")}};
     account->origin = std::move(origin);
     account->installation_id = installation.toStdWString();
     account->relay_only = relay_only != 0;
     return account->request(p2p_account::Operation::login, create ? "/api/v2/register" : "/api/v2/login",
         "POST", QJsonDocument(payload).toJson(QJsonDocument::Compact));
+}
+
+} // namespace
+
+int32_t p2p_account_login(p2p_account* account, const wchar_t* server, const wchar_t* user,
+    const wchar_t* password, int32_t create, int32_t, int32_t relay_only) {
+    if (!server || !user || !password) return badRequest(QStringLiteral("无法开始登录"));
+    return login(account, QString::fromWCharArray(server), QString::fromWCharArray(user),
+        QString::fromWCharArray(password), create, relay_only);
+}
+
+int32_t p2p_account_login_v2(p2p_account* account, const char* server, const char* user,
+    const char* password, int32_t create, int32_t, int32_t relay_only) {
+    if (!server || !user || !password) return badRequest(QStringLiteral("无法开始登录"));
+    if (!QByteArrayView(server).isValidUtf8() || !QByteArrayView(user).isValidUtf8() ||
+        !QByteArrayView(password).isValidUtf8()) {
+        return badRequest(QStringLiteral("输入必须使用有效的 UTF-8"));
+    }
+    return login(account, QString::fromUtf8(server), QString::fromUtf8(user), QString::fromUtf8(password),
+        create, relay_only);
 }
 
 int32_t p2p_account_add_local_device(p2p_account* account) {
@@ -256,4 +291,8 @@ int32_t p2p_account_device(const p2p_account* account, size_t index, p2p_device*
     const auto& item = account->devices[index];
     *device = {item.id.c_str(), item.name.c_str(), item.platform.c_str(), item.state.c_str()};
     return P2P_OK;
+}
+
+int32_t p2p_account_poll_events(p2p_account* account) {
+    return p2p_account_complete(account);
 }
